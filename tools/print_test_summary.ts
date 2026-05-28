@@ -21,25 +21,24 @@ function managedExists(id: string): boolean {
 
 const requireFull = process.env.ZINC_REQUIRE_FULL_TESTS === "1";
 
-const qwen8bReady = hasEnv("ZINC_QWEN3_8B_MODEL") || managedExists("qwen3-8b-q4k-m");
-const qwen35bReady = hasEnv("ZINC_QWEN35_35B_MODEL") || managedExists("qwen35-35b-a3b-q4k-xl");
+const qwen8bReady = hasEnv("ZINC_QWEN3_8B_MODEL") || managedExists("qwen35-9b-q4k-m");
 const qwen36bReady = hasEnv("ZINC_QWEN36_35B_MODEL") || managedExists("qwen36-35b-a3b-q4k-xl");
-const hasQwenSmoke = qwen8bReady && qwen35bReady;
+const hasQwenSmoke = qwen8bReady && qwen36bReady;
 
-const apiServerReady = managedExists("qwen3-8b-q4k-m")
-  || managedExists("gemma4-12b-q4k-m")
-  || managedExists("gpt-oss-20b-q4k-m");
+const apiServerReady = managedExists("qwen35-9b-q4k-m")
+  || managedExists("gemma4-26b-a4b-q4k-m")
+  || managedExists("gemma4-31b-q4k-m");
 const hasApiSmoke = hasEnv("ZINC_API_BASE_URL") || apiServerReady;
 
 function qwenDetail(): string {
   if (hasQwenSmoke) {
     return hasEnv("ZINC_QWEN3_8B_MODEL")
       ? (process.env.ZINC_QWEN3_8B_MODEL as string)
-      : `managed:${managedExists("qwen35-35b-a3b-q4k-xl") ? (qwen36bReady ? "qwen3-8b + 35b + 36b" : "qwen3-8b + 35b") : "qwen3-8b only"}`;
+      : "managed:qwen3.5-9b + qwen3.6-35b";
   }
   const missing: string[] = [];
-  if (!qwen8bReady) missing.push("qwen3-8b-q4k-m");
-  if (!qwen35bReady) missing.push("qwen35-35b-a3b-q4k-xl");
+  if (!qwen8bReady) missing.push("qwen35-9b-q4k-m");
+  if (!qwen36bReady) missing.push("qwen36-35b-a3b-q4k-xl");
   return `install or set env for: ${missing.join(", ")}`;
 }
 

@@ -24,7 +24,9 @@ import {
   introducesRuntimeFlag,
   isMeasuredDeadRevert,
   passesNoiseAwareOverride,
+  relativeSampleSpread,
   sampleStdev,
+  shouldCollectExtraBenchSample,
   isResumeStateCompatible,
   isMaterialImprovement,
   loadPreviousRun,
@@ -35,9 +37,27 @@ import {
   shouldRunPivotCycle,
   summarizeCoherenceRegression,
   type ClaudeStreamState,
+  zincCliArgs,
 } from "./optimize_perf";
 
 // -- Codex stream formatter ---------------------------------------------------
+
+describe("zincCliArgs", () => {
+  test("pins RDNA benchmark runs to the discrete Vulkan device by default", () => {
+    const args = zincCliArgs({ path: "/root/models/model.gguf", promptMode: "raw" }, "hello", 8);
+
+    expect(args).toContain("-m '/root/models/model.gguf'");
+    expect(args).toContain("-d 1");
+    expect(args).toContain("--prompt 'hello'");
+    expect(args).toContain("-n 8");
+  });
+
+  test("keeps chat mode alongside the explicit device selection", () => {
+    const args = zincCliArgs({ path: "/root/models/model.gguf", promptMode: "chat" }, "hello", 8);
+
+    expect(args).toContain("-d 1 --chat");
+  });
+});
 
 describe("formatCodexStreamLine", () => {
   test("formats shell command", () => {
@@ -65,6 +85,30 @@ describe("formatCodexStreamLine", () => {
     const line = JSON.stringify({ type: "message", content: "I will now edit the file." });
     const out = formatCodexStreamLine(line);
     expect(out).toContain("I will now edit the file.");
+  });
+
+  test("formats current Codex agent message events", () => {
+    const line = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "DONE" } });
+    const out = formatCodexStreamLine(line);
+    expect(out).toContain("DONE");
+  });
+
+  test("formats current Codex command execution start events", () => {
+    const line = JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", command: "/bin/zsh -lc pwd", status: "in_progress" },
+    });
+    const out = formatCodexStreamLine(line);
+    expect(out).toContain("shell");
+    expect(out).toContain("/bin/zsh -lc pwd");
+  });
+
+  test("skips successful current Codex command execution output", () => {
+    const line = JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", command: "/bin/zsh -lc pwd", aggregated_output: "lots of text", exit_code: 0 },
+    });
+    expect(formatCodexStreamLine(line)).toBeNull();
   });
 
   test("skips tool output", () => {
@@ -228,13 +272,15 @@ describe("run artifact cleanup", () => {
 });
 
 describe("codexExecArgs", () => {
-  test("pins the configured reasoning effort", () => {
+  test("pins the configured model and reasoning effort", () => {
     expect(codexExecArgs("optimize")).toEqual([
       "exec",
       "-c",
       'model_reasoning_effort="xhigh"',
       "--dangerously-bypass-approvals-and-sandbox",
       "--json",
+      "--model",
+      "gpt-5.5",
       "optimize",
     ]);
   });
@@ -373,7 +419,7 @@ describe("controller helpers", () => {
       currentBest,
       2,
       "\nCycle 1: KEPT — 38.52 tok/s",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: ["descriptor plumbing variant regressed 0.2 tok/s"],
@@ -400,6 +446,7 @@ describe("controller helpers", () => {
     expect(prompt).toContain("37.28 tok/s [37.00, 37.30, 37.40]");
     expect(prompt).toContain("must beat the best accepted performance checkpoint");
     expect(prompt).toContain("Failed Approaches");
+    expect(prompt).toContain("coherence tested with 3 prompts on 5 models");
     expect(prompt).toContain("@@@DESCRIPTION:");
   });
 
@@ -426,7 +473,7 @@ describe("controller helpers", () => {
       baseline,
       1,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: spec?.primaryMetricLabel,
@@ -439,13 +486,28 @@ describe("controller helpers", () => {
     expect(prompt).toContain("long-context prefill benchmark");
   });
 
-  test("RDNA Qwen35 prefill effort is registered with the flagship benchmark contract", () => {
+  test("RDNA Qwen36 prefill effort is registered with the flagship benchmark contract", () => {
     const spec = getEffortSpec(6);
     expect(spec).not.toBeNull();
-    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md");
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md");
     expect(spec?.primaryMetricLabel).toBe("prefill tok/s");
-    expect(spec?.summary).toContain("RDNA Qwen35 prefill");
-    expect(spec?.benchmarkMethod).toContain("Qwen3.5-35B flagship workload");
+    expect(spec?.summary).toContain("RDNA Qwen36 prefill");
+    expect(spec?.benchmarkMethod).toContain("Qwen3.6-35B flagship workload");
+  });
+
+  test("RDNA Qwen36 27B effort uses the site context-medium benchmark contract", () => {
+    const spec = getEffortSpec(15);
+    expect(spec).not.toBeNull();
+    expect(spec?.doc).toBe("MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md");
+    expect(spec?.primaryMetricLabel).toBe("Qwen3.6-27B prefill tok/s");
+    expect(spec?.defaultModel).toBe("qwen3627b");
+    expect(spec?.benchmarkMethod).toContain("context-medium Coding Review");
+    expect(spec?.benchmarkPrompt).toContain("Code review request");
+    expect(spec?.benchmarkPrompt).toContain("src/cache.ts");
+    expect(spec?.benchmarkPrompt).not.toContain("capital of France");
+    expect(spec?.minHealthyTokPerSec).toBe(10);
+    expect(spec?.knownFlatCategories?.join("\n")).toContain("PARTIAL_ATTN_NORM_STORE");
+    expect(spec?.structuralSwingIdeas?.join("\n")).toContain("shaderstats");
   });
 
   test("resume compatibility rejects state from older benchmark regimes", () => {
@@ -489,6 +551,33 @@ describe("controller helpers", () => {
       reviewSummaries: [],
     }, spec!);
     expect(legacyStateCompatible).toBe(false);
+  });
+
+  test("resume compatibility includes the selected model key and path", () => {
+    const spec = getEffortSpec(15);
+    expect(spec).not.toBeNull();
+    const saved = {
+      effort: 15,
+      planDoc: "MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+      benchmarkSignature: benchmarkSignatureForSpec(spec!, "qwen3627b", "/root/models/Qwen3.6-27B-Q4_K_M.gguf"),
+      runStartedAt: "2026-05-20T00:00:00.000Z",
+      lastUpdatedAt: "2026-05-20T00:00:00.000Z",
+      lastCycle: 16,
+      bestTokPerSec: 38.55,
+      bestCycle: 16,
+      bestCommitHash: "d1b4033",
+      bestResult: null,
+      stalledCycles: 0,
+      consecutiveFoundationKeeps: 0,
+      cycles: [],
+      failedApproaches: [],
+      ideas: [],
+      reviewSummaries: [],
+    };
+
+    expect(isResumeStateCompatible(saved, spec!, "qwen3627b", "/root/models/Qwen3.6-27B-Q4_K_M.gguf")).toBe(true);
+    expect(isResumeStateCompatible(saved, spec!, "qwen36b", "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe(false);
+    expect(isResumeStateCompatible(saved, spec!, "qwen3627b", "/root/models/other.gguf")).toBe(false);
   });
 });
 
@@ -665,9 +754,9 @@ describe("controller memory helpers", () => {
           kind: "crash" as const,
         },
         {
-          id: "Gemma4-12B::What is 2+2?",
-          label: "Gemma4-12B [What is 2+2?]",
-          model: "Gemma4-12B",
+          id: "Gemma4-26B-A4B::What is 2+2?",
+          label: "Gemma4-26B-A4B [What is 2+2?]",
+          model: "Gemma4-26B-A4B",
           prompt: "What is 2+2?",
           outputText: "What is 5-3?",
           kind: "mismatch" as const,
@@ -675,7 +764,7 @@ describe("controller memory helpers", () => {
       ],
       failureIds: [
         "Qwen3-8B::The capital of France is",
-        "Gemma4-12B::What is 2+2?",
+        "Gemma4-26B-A4B::What is 2+2?",
       ],
     };
 
@@ -694,9 +783,9 @@ describe("controller memory helpers", () => {
           kind: "crash" as const,
         },
         {
-          id: "Qwen3.5-35B::What is 2+2?",
-          label: "Qwen3.5-35B [What is 2+2?]",
-          model: "Qwen3.5-35B",
+          id: "Qwen3.6-35B::What is 2+2?",
+          label: "Qwen3.6-35B [What is 2+2?]",
+          model: "Qwen3.6-35B",
           prompt: "What is 2+2?",
           outputText: "five",
           kind: "mismatch" as const,
@@ -704,7 +793,7 @@ describe("controller memory helpers", () => {
       ],
       failureIds: [
         "Qwen3-8B::The capital of France is",
-        "Qwen3.5-35B::What is 2+2?",
+        "Qwen3.6-35B::What is 2+2?",
       ],
     };
 
@@ -712,7 +801,7 @@ describe("controller memory helpers", () => {
       "Qwen3-8B::The capital of France is",
     ]);
     expect(regression).toContain("New coherence failures vs accepted baseline");
-    expect(regression).toContain("Qwen3.5-35B [What is 2+2?]");
+    expect(regression).toContain("Qwen3.6-35B [What is 2+2?]");
   });
 
   test("coherence failure formatter renders crashes and mismatches", () => {
@@ -722,13 +811,13 @@ describe("controller memory helpers", () => {
         label: "Qwen3-8B [The capital of France is]",
         model: "Qwen3-8B",
         prompt: "The capital of France is",
-        outputText: "",
+        outputText: "run failed: timeout after 120000ms",
         kind: "crash" as const,
       },
       {
-        id: "Gemma4-12B::What is 2+2?",
-        label: "Gemma4-12B [What is 2+2?]",
-        model: "Gemma4-12B",
+        id: "Gemma4-26B-A4B::What is 2+2?",
+        label: "Gemma4-26B-A4B [What is 2+2?]",
+        model: "Gemma4-26B-A4B",
         prompt: "What is 2+2?",
         outputText: "What is 5-3?",
         kind: "mismatch" as const,
@@ -736,7 +825,8 @@ describe("controller memory helpers", () => {
     ]);
 
     expect(formatted).toContain("Qwen3-8B [The capital of France is]: crashed");
-    expect(formatted).toContain('Gemma4-12B [What is 2+2?]: "What is 5-3?"');
+    expect(formatted).toContain("timeout after 120000ms");
+    expect(formatted).toContain('Gemma4-26B-A4B [What is 2+2?]: "What is 5-3?"');
   });
 
   test("buildAnalysisReport summarizes kept and reverted cycles", () => {
@@ -826,12 +916,11 @@ describe("config", () => {
     expect(src).toContain("ZINC_HOST");
     expect(src).toContain("ZINC_PORT");
     expect(src).toContain("ZINC_USER");
-    expect(src).toContain("ZINC_RDNA_QWEN35_35B_MODEL");
     expect(src).toContain("ZINC_RDNA_QWEN36_35B_MODEL");
+    expect(src).toContain("ZINC_RDNA_QWEN36_27B_MODEL");
     expect(src).toContain("ZINC_RDNA_QWEN3_8B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_31B_MODEL");
     expect(src).toContain("ZINC_RDNA_GEMMA4_12B_MODEL");
-    expect(src).toContain("ZINC_RDNA_GPT_OSS_20B_MODEL");
   });
 
   test("coherence checks include multiple prompts", async () => {
@@ -841,21 +930,20 @@ describe("config", () => {
     expect(src).toContain("first four planets");
   });
 
-  test("all six models are listed for coherence", async () => {
+  test("all five models are listed for coherence", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
-    expect(src).toContain("Qwen3.5-35B");
     expect(src).toContain("Qwen3.6-35B");
+    expect(src).toContain("Qwen3.6-27B");
     expect(src).toContain("Qwen3-8B");
     expect(src).toContain("Gemma4-31B");
-    expect(src).toContain("Gemma4-12B");
-    expect(src).toContain("GPT-OSS-20B");
+    expect(src).toContain("Gemma4-26B-A4B");
   });
 
-  test("GPT-OSS coherence sweep gets extra token budget", async () => {
+  test("coherence sweep supports a per-model token budget", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
-    expect(src).toContain("coherenceMaxTokens: 96");
+    expect(src).toContain("coherenceMaxTokens?: number");
     expect(src).toContain("coherenceMaxTokensForModel");
-    expect(src).toContain("zincRemoteCommand(modelTarget, prompt, maxTokens, promptMode)");
+    expect(src).toContain("zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode)");
   });
 
   test("Qwen coherence sweep uses chat prompts without changing benchmark mode", async () => {
@@ -863,6 +951,14 @@ describe("config", () => {
     expect(src).toContain('promptMode: "raw"');
     expect(src).toContain('coherencePromptMode: "chat"');
     expect(src).toContain("coherencePromptModeForModel");
+  });
+
+  test("coherence crashes are retried with diagnostic details", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain("runCoherenceCase");
+    expect(src).toContain("cleaning RDNA node and retrying crashed cases once");
+    expect(src).toContain("String(e).slice(-500)");
+    expect(src).toContain("240_000");
   });
 
   test("codex uses exec with sandbox bypass and json", async () => {
@@ -881,6 +977,22 @@ describe("config", () => {
   test("startup banner shows cycles for the current run", async () => {
     const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
     expect(src).toContain("Cycles this run:");
+  });
+
+  test("remote benchmark cleanup is enabled with an escape hatch", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain("cleanRemoteBenchmarkNode");
+    expect(src).toContain("ZINC_SKIP_REMOTE_CLEAN");
+    expect(src).toContain("pkill -f '[z]ig-out/bin/zinc'");
+    expect(src).toContain("pkill -f '[l]lama-server'");
+  });
+
+  test("remote rsync excludes local env and editor swap files", async () => {
+    const src = await Bun.file(import.meta.dir + "/optimize_perf.ts").text();
+    expect(src).toContain('"--exclude", ".env"');
+    expect(src).toContain('"--exclude", ".env.*"');
+    expect(src).toContain('"--exclude", "*.swp"');
+    expect(src).toContain("--exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo'");
   });
 
   test("claude invocations pin the 1M-context Opus model and max effort", async () => {
@@ -907,6 +1019,7 @@ describe("formatPhaseBudget", () => {
       perTokenMs: { attn: 4.5, moe: 10.4, ssm: 11.8, tail: 0.9 },
       totalsMs: { attn: 693.0, moe: 1601.6, ssm: 1817.2, tail: 138.6, embed: 0.3 },
       moeTotalsMs: { router: 301, topk: 120, gate_up: 480, swiglu: 80, down: 540, weighted_acc: 80 },
+      denseTotalsMs: { gateup: 1200, gate: 550, up: 500, down: 617 },
       ssmTotalsMs: { proj: 1300, conv: 150, delta: 210, gnorm: 90, out: 67 },
       biggestBucket: { name: "ssm", totalMs: 1817.2 },
     }, 0);
@@ -921,6 +1034,7 @@ describe("formatPhaseBudget", () => {
     expect(out).not.toContain("embed:");
     expect(out).toContain("Biggest top-level bucket: ssm");
     expect(out).toContain("MoE sub-buckets");
+    expect(out).toContain("Dense FFN sub-buckets");
     expect(out).toContain("SSM sub-buckets");
   });
 });
@@ -945,7 +1059,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       25,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -958,13 +1072,14 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
           perTokenMs: { attn: 4.5, moe: 10.4, ssm: 11.8, tail: 0.9 },
           totalsMs: { attn: 693, moe: 1601.6, ssm: 1817.2, tail: 138.6 },
           moeTotalsMs: {},
+          denseTotalsMs: { gateup: 1200, down: 600 },
           ssmTotalsMs: { proj: 1300 },
           biggestBucket: { name: "ssm", totalMs: 1817.2 },
         },
         phaseBudgetCycle: 20,
       },
       {
-        primaryMetricLabel: "prefill tok/s",
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         knownFlatCategories: ["narrowing compute→compute barriers is flat on RDNA4"],
         structuralSwingIdeas: ["wire recordBatchDispatch into SSM proj with num_cols=2"],
@@ -972,6 +1087,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     );
     expect(prompt).toContain("Current Prefill Phase Budget");
     expect(prompt).toContain("Biggest top-level bucket: ssm");
+    expect(prompt).toContain("Dominant Bucket Directive");
     expect(prompt).toContain("Known Flat Territory");
     expect(prompt).toContain("narrowing compute→compute barriers is flat on RDNA4");
     expect(prompt).toContain("Structural Swing Ideas");
@@ -986,7 +1102,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       26,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: ["micro barrier narrowing again"],
@@ -1010,6 +1126,44 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
     expect(prompt).toContain("known-flat pattern");
   });
 
+  test("dominant bucket directive steers custom 27B prefill labels toward dense FFN", () => {
+    const prompt = buildAgentPrompt(
+      "Step 1",
+      baseline,
+      baseline,
+      37,
+      "",
+      "qwen3627b",
+      {
+        cycles: [],
+        failedApproaches: [],
+        ideas: [],
+        stalledCycles: 4,
+        consecutiveFoundationKeeps: 0,
+        reviewSummary: null,
+        bestPerf: null,
+        phaseBudget: {
+          perTokenMs: { dense_ffn: 8.87, ssm: 6.54, attn: 1.11 },
+          totalsMs: { dense_ffn: 3087, ssm: 2274.5, attn: 387, tail: 1.9 },
+          moeTotalsMs: {},
+          denseTotalsMs: { gateup: 1900, down: 1187 },
+          ssmTotalsMs: { proj: 982.1, delta: 804.6 },
+          biggestBucket: { name: "dense_ffn", totalMs: 3087 },
+        },
+        phaseBudgetCycle: 34,
+      },
+      {
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
+        benchmarkMethod: "site-aligned context-medium Coding Review",
+        structuralSwingIdeas: ["dense down+acc fusion"],
+      },
+    );
+    expect(prompt).toContain("Dominant Bucket Directive");
+    expect(prompt).toContain("largest top-level bucket is dense_ffn");
+    expect(prompt).toContain("Avoid SSM-only work");
+    expect(prompt).toContain("Dense FFN sub-buckets");
+  });
+
   test("a freshly-banked foundation keep still demands a swing next cycle", () => {
     const prompt = buildAgentPrompt(
       "Step 1",
@@ -1017,7 +1171,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       27,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1045,7 +1199,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       1,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: "decode tok/s",
@@ -1062,7 +1216,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       5,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1088,7 +1242,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       6,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [],
         failedApproaches: [],
@@ -1117,7 +1271,7 @@ describe("buildAgentPrompt — effort-6 controller hints", () => {
       baseline,
       5,
       "",
-      "qwen35b",
+      "qwen36b",
       null,
       {
         primaryMetricLabel: "prefill tok/s",
@@ -1234,6 +1388,18 @@ describe("introducesRuntimeFlag / hasFlagOnMeasurementEvidence", () => {
 describe("sampleStdev + passesNoiseAwareOverride", () => {
   test("sampleStdev returns 0 for a single sample", () => {
     expect(sampleStdev([42])).toBe(0);
+  });
+
+  test("relativeSampleSpread reports spread around the median", () => {
+    expect(relativeSampleSpread([100, 101, 99])).toBeCloseTo(0.02, 4);
+    expect(relativeSampleSpread([100])).toBe(0);
+  });
+
+  test("shouldCollectExtraBenchSample requests extra samples only for noisy runs", () => {
+    expect(shouldCollectExtraBenchSample([38.55, 38.56], 3, 5)).toBe(true);
+    expect(shouldCollectExtraBenchSample([38.55, 38.56, 38.54], 3, 5)).toBe(false);
+    expect(shouldCollectExtraBenchSample([38.00, 38.80, 38.40], 3, 5)).toBe(true);
+    expect(shouldCollectExtraBenchSample([38.00, 38.80, 38.40, 38.35, 38.50], 3, 5)).toBe(false);
   });
 
   test("sampleStdev on cycle-16-like samples is near zero", () => {
@@ -1653,7 +1819,7 @@ describe("buildAgentPrompt pivot mode", () => {
       baseline,
       10,
       "",
-      "qwen35b",
+      "qwen36b",
       {
         cycles: [
           {
@@ -1685,9 +1851,18 @@ describe("buildAgentPrompt pivot mode", () => {
         consecutiveFoundationKeeps: 1,
         reviewSummary: null,
         bestPerf: null,
+        phaseBudget: {
+          perTokenMs: { attn: 4.5, ssm: 11.8 },
+          totalsMs: { attn: 693, ssm: 1817.2 },
+          moeTotalsMs: {},
+          denseTotalsMs: {},
+          ssmTotalsMs: { proj: 1300 },
+          biggestBucket: { name: "ssm", totalMs: 1817.2 },
+        },
+        phaseBudgetCycle: 8,
       },
       {
-        primaryMetricLabel: "prefill tok/s",
+        primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
         benchmarkMethod: "long-context prefill on RDNA",
         knownFlatCategories: ["barrier narrowing is flat"],
         structuralSwingIdeas: ["port llama.cpp 8-variant DMMV"],
@@ -1701,6 +1876,9 @@ describe("buildAgentPrompt pivot mode", () => {
     expect(prompt).toContain("Dead-end audit");
     expect(prompt).toContain("Pivot proposal");
     expect(prompt).toContain("Committed Foundations");
+    expect(prompt).toContain("Current Prefill Phase Budget");
+    expect(prompt).toContain("Dominant Bucket Directive");
+    expect(prompt).toContain("Biggest top-level bucket: ssm");
     expect(prompt).toContain("20c0ea8f");
     expect(prompt).toContain("llama.cpp");
     expect(prompt).toContain("barrier narrowing is flat");

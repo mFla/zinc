@@ -445,13 +445,37 @@ and pointed at the sampler.
 | model | supported? | output |
 |---|---|---|
 | qwen3-8b-q4k-m          | yes, batched path   | "The capital of France is **Paris**." |
-| qwen35-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
 | qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
-| gpt-oss-20b-q4k-m       | no (architecture gate) | falls back, `<\|channel\|>analysis...`  |
-| gemma4-31b-q4k-m        | no (architecture gate) | falls back, `Paris<turn\|>`            |
-| gemma4-12b-q4k-m        | no (architecture gate) | falls back, correct                   |
+| qwen36-35b-a3b-q4k-xl   | no (MoE+SSM gate)   | falls back to per-token, same output  |
+| gemma4-31b-q4k-m        | yes, batched path      | "The capital of France is **Paris**."  |
+| gemma4-26b-a4b-q4k-m        | no (MoE gate)          | falls back, correct                   |
 
-All 6 still coherent, no regressions.
+All 5 still coherent, no regressions.
+
+**Gemma-4 31B dense update:** the architecture gate came off in `0cc4c3c`
+after two Gemma-specific bugs landed. (1) Gemma 4 applies a plain
+unit-weight RMS norm to V on every attention layer — per-token and Metal
+both did it; batched had skipped it. (2) On full-attention layers Gemma
+omits `attn_v` and expects V to be the raw K projection; the batched body
+was feeding `scratch_k` after K norm + K RoPE as V, which is wrong. Fix
+mirrored per-token: project Q and K, then feed `scratch_k` through the V
+unit-norm dispatch (writing to `scratch_v`) before K norm touches
+`scratch_k`. One extra RMS-norm dispatch per layer, zero extra DMMVs.
+
+On R9700:
+
+| prompt | baseline | batched | speedup |
+|---|---:|---:|---:|
+| 18 tokens   | 4.96 tok/s | 31.23 tok/s | 6.3× |
+| 43 tokens   | 4.96 tok/s | 35.46 tok/s | 7.1× |
+| 113 tokens  | 4.96 tok/s | 42.98 tok/s | 8.7× |
+| 313 tokens  | 4.96 tok/s | 44.50 tok/s | 9.0× |
+| **613 tokens** | **4.96 tok/s** | **57.58 tok/s** | **11.6×** |
+
+Validate delta: `max_abs_diff=0.000064` — float noise. Gemma keeps
+amortizing the big FFN weights better as the prompt grows; at 613
+tokens the per-layer re-read amortization matches what Qwen3-8B sees
+at shorter prompts.
 
 ## How the debugging actually went, in rough order
 
@@ -544,20 +568,18 @@ The reason the per-token kpar shader beats the serial batched shader
 in the first place is this instruction; the reason the kpar *batched*
 shader compounds the win is the weight-read-once + subgroupAdd combo.
 
-## What's next for the other 5 catalog models
+## What's next for the other 4 catalog models
 
-Four of the six catalog entries still hit the gate's other guards
-(MoE, SSM, Gemma architecture, gpt-oss architecture) and fall back to
+Three of the five catalog entries still hit the gate's other guards
+(MoE, SSM, Gemma architecture) and fall back to
 per-token:
 
 - Qwen3.5/3.6 35B-A3B: MoE+SSM hybrid. Needs batched MoE router +
   batched per-expert GEMM + batched SSM — distinct, substantial ports.
-- Gemma-4 31B dense: gated out by `architecture == .gemma`. Probably
-  a one-line gate relaxation plus a validate run; the per-token
-  decode path already handles Gemma normalization quirks.
+- ~~Gemma-4 31B dense~~: **shipped in `0cc4c3c`**. See the update above —
+  took more than a one-line gate relaxation, because V had to be projected
+  independently of K on the use_k_as_v layers and unit-normed per head.
 - Gemma-4 12B MoE: same MoE situation as Qwen.
-- gpt-oss-20B: gated out by `architecture == .gpt_oss`. Has attention
-  sinks that need special handling in the batched flash-attn path.
 
 **Update:** `dmmv_q6k_batch_kpar.comp` landed in `b12b511` and does
 exactly this. 3-run median went from 143.1 → **172.9 tok/s** — the

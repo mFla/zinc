@@ -1,4 +1,10 @@
 const std = @import("std");
+
+fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 const support = @import("zinc_bench_support");
 const metal_device = support.metal_device;
 const metal_loader = support.metal_loader;
@@ -52,6 +58,26 @@ const MoeDmmvPush = extern struct {
     y_offset: u32,
 };
 
+const MoeColsDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    x_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    use_active_blocks: u32,
+};
+
+const MoeRoutePackPush = extern struct {
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
+};
+
 const CaseId = enum {
     all,
     lm_head,
@@ -71,6 +97,9 @@ const CaseId = enum {
     moe_gate,
     moe_up,
     moe_down,
+    moe_gate_cols,
+    moe_up_cols,
+    moe_down_cols,
 };
 
 const PipelineMode = enum {
@@ -87,6 +116,7 @@ const Config = struct {
     case_id: CaseId = .all,
     pipeline_mode: PipelineMode = .both,
     threadgroup_size: ?u32 = null,
+    route_tokens: u32 = 64,
     show_help: bool = false,
 };
 
@@ -176,28 +206,30 @@ const CompareSummary = struct {
 };
 
 fn helpText() []const u8 {
-    return
-        \\Usage: zinc-bench-metal-shapes -m <model.gguf> [options]
-        \\
-        \\Benchmarks the exact local hot q8_0 Metal shapes from the real GGUF model.
-        \\
-        \\Options:
-        \\  -m, --model <path>         GGUF model path (required)
-        \\  -d, --device <index>       Metal device index (default: 0)
-        \\  --case <name>              all | lm_head | attn_q | attn_k | attn_v | attn_out
-        \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
-        \\                            | router | shared_gate | shared_up | shared_down | shared_dual
-        \\                            | moe_gate | moe_up | moe_down
-        \\  --pipeline <mode>          runtime | k2048 | both (default: both)
-        \\  --iterations <n>           Timed dispatches per case (default: 200)
-        \\  --warmup <n>               Warmup dispatches per case (default: 25)
-        \\  --tg <threads>             Override threadgroup size
-        \\  -h, --help                 Show this help text
-        \\
-        \\Examples:
-        \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
-        \\  zig build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
-        \\
+    return 
+    \\Usage: zinc-bench-metal-shapes -m <model.gguf> [options]
+    \\
+    \\Benchmarks the exact local hot q8_0 Metal shapes from the real GGUF model.
+    \\
+    \\Options:
+    \\  -m, --model <path>         GGUF model path (required)
+    \\  -d, --device <index>       Metal device index (default: 0)
+    \\  --case <name>              all | lm_head | attn_q | attn_k | attn_v | attn_out
+    \\                            | ssm_qkv | ssm_gate | ssm_dual | ssm_out
+    \\                            | router | shared_gate | shared_up | shared_down | shared_dual
+    \\                            | moe_gate | moe_up | moe_down
+    \\                            | moe_gate_cols | moe_up_cols | moe_down_cols
+    \\  --pipeline <mode>          runtime | k2048 | both (default: both)
+    \\  --route-tokens <n>         Prompt tokens for route-packed MoE cols cases (default: 64)
+    \\  --iterations <n>           Timed dispatches per case (default: 200)
+    \\  --warmup <n>               Warmup dispatches per case (default: 25)
+    \\  --tg <threads>             Override threadgroup size
+    \\  -h, --help                 Show this help text
+    \\
+    \\Examples:
+    \\  zig build bench-metal-shapes -- -m /Users/zolotukhin/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+    \\  zig build bench-metal-shapes -- -m model.gguf --case lm_head --pipeline both
+    \\
     ;
 }
 
@@ -224,7 +256,17 @@ fn parseCaseId(arg: []const u8) !CaseId {
     if (std.mem.eql(u8, arg, "moe_gate")) return .moe_gate;
     if (std.mem.eql(u8, arg, "moe_up")) return .moe_up;
     if (std.mem.eql(u8, arg, "moe_down")) return .moe_down;
+    if (std.mem.eql(u8, arg, "moe_gate_cols")) return .moe_gate_cols;
+    if (std.mem.eql(u8, arg, "moe_up_cols")) return .moe_up_cols;
+    if (std.mem.eql(u8, arg, "moe_down_cols")) return .moe_down_cols;
     return error.InvalidCase;
+}
+
+fn isMoeColsCase(case_id: CaseId) bool {
+    return switch (case_id) {
+        .moe_gate_cols, .moe_up_cols, .moe_down_cols => true,
+        else => false,
+    };
 }
 
 fn parsePipelineMode(arg: []const u8) !PipelineMode {
@@ -269,6 +311,10 @@ fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingThreadgroupSize;
             config.threadgroup_size = try parseU32(args[i]);
+        } else if (std.mem.eql(u8, arg, "--route-tokens")) {
+            i += 1;
+            if (i >= args.len) return error.MissingRouteTokens;
+            config.route_tokens = try parseU32(args[i]);
         } else {
             return error.UnknownArgument;
         }
@@ -276,19 +322,20 @@ fn parseArgs(args: []const [:0]const u8) !Config {
 
     if (!config.show_help and config.model_path == null) return error.MissingModelPath;
     if (config.iterations == 0) return error.InvalidIterations;
+    if (config.route_tokens == 0) return error.InvalidRouteTokens;
     return config;
 }
 
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{name}) catch return error.PathTooLong;
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
+    const file = std.Io.Dir.cwd().openFile(path, .{}) catch return error.ShaderNotFound;
     defer file.close();
     const stat = try file.stat();
     if (stat.size > 1024 * 1024) return error.ShaderTooLarge;
 
     var source_buf: [1024 * 1024 + 1]u8 = undefined;
-    const bytes_read = try file.readAll(source_buf[0..source_buf.len - 1]);
+    const bytes_read = try file.readAll(source_buf[0 .. source_buf.len - 1]);
     source_buf[bytes_read] = 0;
 
     var fn_buf: [16]u8 = undefined;
@@ -471,6 +518,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             const inter_dim = model.config.shared_expert_intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_gate_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_gate.weight", .q8_0, inter_dim, hidden_dim) orelse
                 return error.MissingSharedGateTensor;
             break :blk .{
                 .key = "shared_gate",
@@ -484,6 +532,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             const inter_dim = model.config.shared_expert_intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_up_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_up.weight", .q8_0, inter_dim, hidden_dim) orelse
                 return error.MissingSharedUpTensor;
             break :blk .{
                 .key = "shared_up",
@@ -497,6 +546,7 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             const inter_dim = model.config.shared_expert_intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_down_shexp.weight", .q8_0, hidden_dim, inter_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_down.weight", .q8_0, hidden_dim, inter_dim) orelse
                 return error.MissingSharedDownTensor;
             break :blk .{
                 .key = "shared_down",
@@ -510,8 +560,10 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
             const inter_dim = model.config.shared_expert_intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const gate = findTensorBySuffixAndShape(model, "ffn_gate_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_gate.weight", .q8_0, inter_dim, hidden_dim) orelse
                 return error.MissingSharedGateTensor;
             const up = findTensorBySuffixAndShape(model, "ffn_up_shexp.weight", .q8_0, inter_dim, hidden_dim) orelse
+                findTensorBySuffixAndShape(model, "ffn_up.weight", .q8_0, inter_dim, hidden_dim) orelse
                 return error.MissingSharedUpTensor;
             break :blk .{
                 .key = "shared_dual",
@@ -523,7 +575,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .cols = hidden_dim,
             };
         },
-        .moe_gate => blk: {
+        .moe_gate, .moe_gate_cols => blk: {
+            const cols_case = case_id == .moe_gate_cols;
             const inter_dim = model.config.intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_gate_exps.weight", .q4_k, inter_dim, hidden_dim) orelse
@@ -531,8 +584,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 findTensorBySuffixAndShape(model, "ffn_gate_exps.weight", .q6_k, inter_dim, hidden_dim) orelse
                 return error.MissingMoeGateTensor;
             break :blk .{
-                .key = "moe_gate",
-                .label = "MoE gate experts",
+                .key = if (cols_case) "moe_gate_cols" else "moe_gate",
+                .label = if (cols_case) "MoE gate experts route-packed cols" else "MoE gate experts",
                 .tensor0 = tensor,
                 .rows0 = inter_dim,
                 .cols = hidden_dim,
@@ -540,7 +593,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .x_expert_stride = 0,
             };
         },
-        .moe_up => blk: {
+        .moe_up, .moe_up_cols => blk: {
+            const cols_case = case_id == .moe_up_cols;
             const inter_dim = model.config.intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_up_exps.weight", .q4_k, inter_dim, hidden_dim) orelse
@@ -548,8 +602,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 findTensorBySuffixAndShape(model, "ffn_up_exps.weight", .q6_k, inter_dim, hidden_dim) orelse
                 return error.MissingMoeUpTensor;
             break :blk .{
-                .key = "moe_up",
-                .label = "MoE up experts",
+                .key = if (cols_case) "moe_up_cols" else "moe_up",
+                .label = if (cols_case) "MoE up experts route-packed cols" else "MoE up experts",
                 .tensor0 = tensor,
                 .rows0 = inter_dim,
                 .cols = hidden_dim,
@@ -557,7 +611,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 .x_expert_stride = 0,
             };
         },
-        .moe_down => blk: {
+        .moe_down, .moe_down_cols => blk: {
+            const cols_case = case_id == .moe_down_cols;
             const inter_dim = model.config.intermediate_dim;
             const hidden_dim = model.config.hidden_dim;
             const tensor = findTensorBySuffixAndShape(model, "ffn_down_exps.weight", .q4_k, hidden_dim, inter_dim) orelse
@@ -565,8 +620,8 @@ fn resolveHotCase(model: *const metal_loader.Model, case_id: CaseId) !HotCase {
                 findTensorBySuffixAndShape(model, "ffn_down_exps.weight", .q6_k, hidden_dim, inter_dim) orelse
                 return error.MissingMoeDownTensor;
             break :blk .{
-                .key = "moe_down",
-                .label = "MoE down experts",
+                .key = if (cols_case) "moe_down_cols" else "moe_down",
+                .label = if (cols_case) "MoE down experts route-packed cols" else "MoE down experts",
                 .tensor0 = tensor,
                 .rows0 = hidden_dim,
                 .cols = inter_dim,
@@ -621,6 +676,30 @@ fn fillRoutingBuffer(buf: *MetalBuffer, n_experts: u32, expert_slots: u32) void 
     const ptr: [*]u32 = @ptrCast(@alignCast(buf.cpu_ptr.?));
     for (0..expert_slots) |slot| {
         ptr[slot] = @intCast((slot * 37 + 11) % n_experts);
+    }
+}
+
+fn fillRoutePackRoutingBuffer(buf: *MetalBuffer, n_tokens: u32, n_experts: u32, k: u32) void {
+    const ptr: [*]u32 = @ptrCast(@alignCast(buf.cpu_ptr.?));
+    const routing_stride = k * 2;
+    const weight_bits: u32 = @bitCast(@as(f32, 1.0) / @as(f32, @floatFromInt(k)));
+    for (0..n_tokens) |token| {
+        const base = token * routing_stride;
+        for (0..k) |slot| {
+            ptr[base + slot] = @intCast((token * k + slot) % n_experts);
+            ptr[base + k + slot] = weight_bits;
+        }
+    }
+}
+
+fn fillRouteColsInputBuffer(buf: *MetalBuffer, cols: u32, route_slots: u32) void {
+    const ptr: [*]f32 = @ptrCast(@alignCast(buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        const base = route * cols;
+        for (0..cols) |i| {
+            const raw: i32 = @intCast((route * 19 + i * 13 + 7) % 41);
+            ptr[base + i] = 0.0625 * @as(f32, @floatFromInt(raw - 20));
+        }
     }
 }
 
@@ -721,7 +800,7 @@ fn selectFusedDualPipeline(ctx: ?*shim.MetalCtx, cols: u32, threadgroup_override
         .variant_label = "fused",
         .pipe = pipe,
         .push_idx = 0,
-        .rows_per_wg = block_size / simd_width,
+        .rows_per_wg = (block_size / simd_width) * 2,
         .block_size = block_size,
     };
 }
@@ -784,7 +863,14 @@ fn selectMoePipeline(
             },
         },
         .q5_k => switch (variant) {
-            .runtime => if (cols <= 2048) .{
+            .runtime => if (cols == 512 and rows >= 1024) .{
+                .shader_name = "dmmv_q5k_moe_k512",
+                .variant_label = "runtime",
+                .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512"),
+                .push_idx = 1,
+                .rows_per_wg = 16,
+                .block_size = 512,
+            } else if (cols <= 2048) .{
                 .shader_name = "dmmv_q5k_moe_k2048",
                 .variant_label = "runtime",
                 .pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048"),
@@ -825,6 +911,24 @@ fn selectMoePipeline(
             .block_size = 256,
         },
         else => error.ExpectedExpertQuantTensor,
+    };
+}
+
+fn selectMoeColsPipeline(ctx: ?*shim.MetalCtx, quant_type: GGMLType) !PipelineSelection {
+    const shader_name = switch (quant_type) {
+        .q4_k => "dmmv_q4k_moe_cols",
+        .q5_1 => "dmmv_q5_1_moe_cols",
+        .q5_k => "dmmv_q5k_moe_cols",
+        .q6_k => "dmmv_q6k_moe_cols",
+        else => return error.ExpectedExpertQuantTensor,
+    };
+    return .{
+        .shader_name = shader_name,
+        .variant_label = "route-cols",
+        .pipe = try loadShaderPipeline(ctx, shader_name),
+        .push_idx = 1,
+        .rows_per_wg = 2,
+        .block_size = 64,
     };
 }
 
@@ -901,6 +1005,72 @@ fn runMoeDispatchBatch(
             &bufs,
             &push,
             @sizeOf(MoeDmmvPush),
+            selection.push_idx,
+        );
+    }
+    cmd.commitAndWait();
+}
+
+fn runMoeColsDispatchBatch(
+    ctx: ?*shim.MetalCtx,
+    route_pack_pipe: *const MetalPipeline,
+    selection: *const PipelineSelection,
+    tensor: *const metal_loader.LoadedTensor,
+    model: *const metal_loader.Model,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    dispatches: u32,
+) !void {
+    if (dispatches == 0) return;
+    const route_push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+    };
+    const dmmv_push = MoeColsDmmvPush{
+        .M = rows,
+        .K = cols,
+        .a_offset = tensorPageOffset(model, tensor),
+        .expert_stride = @intCast(weightBytesPerIter(tensor.info.type_, rows, cols)),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = n_tokens,
+        .x_route_divisor = 1,
+        .use_active_blocks = 0,
+    };
+    const route_bufs = [_]*const MetalBuffer{ routing_buf, counts_buf, packed_ids_buf };
+    const dmmv_bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf, packed_ids_buf, counts_buf };
+    const cols_per_wg: u32 = 4;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    for (0..dispatches) |_| {
+        cmd.dispatchV2(
+            route_pack_pipe,
+            .{ 1, 1, 1 },
+            .{ 256, 1, 1 },
+            &route_bufs,
+            &route_push,
+            @sizeOf(MoeRoutePackPush),
+            0,
+        );
+        cmd.barrier();
+        cmd.dispatchV2(
+            &selection.pipe,
+            .{ (rows + selection.rows_per_wg - 1) / selection.rows_per_wg, n_experts, (n_tokens + cols_per_wg - 1) / cols_per_wg },
+            .{ selection.block_size, 1, 1 },
+            &dmmv_bufs,
+            &dmmv_push,
+            @sizeOf(MoeColsDmmvPush),
             selection.push_idx,
         );
     }
@@ -1173,9 +1343,9 @@ fn benchmarkVariant(
     try runDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, hot_case.rows0, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1245,9 +1415,9 @@ fn benchmarkMoeVariant(
     try runMoeDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, hot_case.rows0, hot_case.cols, hot_case.expert_slots, hot_case.x_expert_stride, warmup_iterations);
     @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runMoeDispatchBatch(device.ctx, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, hot_case.rows0, hot_case.cols, hot_case.expert_slots, hot_case.x_expert_stride, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1264,6 +1434,84 @@ fn benchmarkMoeVariant(
         .cols = hot_case.cols,
         .expert_slots = hot_case.expert_slots,
         .x_expert_stride = hot_case.x_expert_stride,
+        .iterations = iterations,
+        .block_size = selection.block_size,
+        .rows_per_wg = selection.rows_per_wg,
+        .thread_execution_width = selection.pipe.thread_execution_width,
+        .static_threadgroup_memory_length = selection.pipe.static_threadgroup_memory_length,
+        .weight_bytes_per_iter = weight_bytes,
+        .total_ms = elapsed_ms,
+        .ms_per_iter = ms_per_iter,
+        .gbps = (@as(f64, @floatFromInt(total_bytes)) / seconds) / 1_000_000_000.0,
+        .checksum = checksumOutput(output_copy),
+        .output = output_copy,
+    };
+}
+
+fn benchmarkMoeColsVariant(
+    allocator: std.mem.Allocator,
+    device: *const metal_device.MetalDevice,
+    model: *const metal_loader.Model,
+    hot_case: HotCase,
+    route_tokens: u32,
+    warmup_iterations: u32,
+    iterations: u32,
+) !BenchResult {
+    if (!hot_case.isMoe()) return error.ExpectedMoeCase;
+    if (model.config.n_experts == 0 or model.config.n_experts_used == 0) return error.ExpectedMoeCase;
+
+    var route_pack_pipe = try loadShaderPipeline(device.ctx, "moe_route_pack");
+    defer metal_pipeline.freePipeline(&route_pack_pipe);
+    var selection = try selectMoeColsPipeline(device.ctx, hot_case.tensor0.info.type_);
+    defer metal_pipeline.freePipeline(&selection.pipe);
+
+    const n_experts = model.config.n_experts;
+    const k = model.config.n_experts_used;
+    const route_slots = route_tokens * k;
+    const routing_stride = k * 2;
+    const input_elems = @as(usize, route_slots) * @as(usize, hot_case.cols);
+    const output_elems = @as(usize, route_slots) * @as(usize, hot_case.rows0);
+
+    var input_buf = try metal_buffer.createBuffer(device.ctx, input_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(device.ctx, output_elems * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, route_tokens) * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var packed_ids_buf = try metal_buffer.createBuffer(device.ctx, @as(usize, n_experts) * @as(usize, route_tokens) * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&packed_ids_buf);
+
+    fillRouteColsInputBuffer(&input_buf, hot_case.cols, route_slots);
+    fillRoutePackRoutingBuffer(&routing_buf, route_tokens, n_experts, k);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(packed_ids_buf.cpu_ptr.?[0..packed_ids_buf.size], 0);
+
+    try runMoeColsDispatchBatch(device.ctx, &route_pack_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, warmup_iterations);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const start_ns = nanoTimestamp();
+    try runMoeColsDispatchBatch(device.ctx, &route_pack_pipe, &selection, hot_case.tensor0, model, &input_buf, &output_buf, &routing_buf, &counts_buf, &packed_ids_buf, hot_case.rows0, hot_case.cols, route_tokens, n_experts, k, iterations);
+    const elapsed_ns = nanoTimestamp() - start_ns;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
+    const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    const active_experts = @min(n_experts, route_slots);
+    const weight_bytes = weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols) * active_experts;
+    const total_bytes = weight_bytes * iterations;
+    const output_copy = try copyOutput(allocator, &output_buf, @intCast(output_elems));
+
+    return .{
+        .case_key = hot_case.key,
+        .variant_label = selection.variant_label,
+        .shader_name = selection.shader_name,
+        .tensor_name = hot_case.tensor0.info.name,
+        .rows = hot_case.rows0,
+        .cols = hot_case.cols,
+        .expert_slots = route_slots,
+        .x_expert_stride = hot_case.cols,
         .iterations = iterations,
         .block_size = selection.block_size,
         .rows_per_wg = selection.rows_per_wg,
@@ -1306,9 +1554,9 @@ fn benchmarkSeparateDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runSeparateDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &input_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1370,9 +1618,9 @@ fn benchmarkDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &input_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1443,9 +1691,9 @@ fn benchmarkRmsNormDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runRmsNormDualDispatchBatch(device.ctx, &rms_norm_pipe, &dual_selection, hot_case.tensor0, tensor1, model, &hidden_buf, &norm_buf, &norm_weight_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1510,9 +1758,9 @@ fn benchmarkFusedDualVariant(
     @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
     @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = nanoTimestamp();
     try runFusedDualDispatchBatch(device.ctx, &selection, hot_case.tensor0, tensor1, model, &hidden_buf, &norm_weight_buf, &output0_buf, &output1_buf, hot_case.rows0, hot_case.rows1, hot_case.cols, iterations);
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     const ms_per_iter = elapsed_ms / @as(f64, @floatFromInt(iterations));
     const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
@@ -1602,16 +1850,16 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const config = parseArgs(args) catch |err| {
-        std.fs.File.stderr().writeAll(helpText()) catch {};
+        std.Io.File.stderr().writeAll(helpText()) catch {};
         return err;
     };
     if (config.show_help) {
-        try std.fs.File.stdout().writeAll(helpText());
+        try std.Io.File.stdout().writeAll(helpText());
         return;
     }
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(&stdout_buffer);
 
     var device = try metal_device.MetalDevice.init(allocator, config.device_index);
     defer device.deinit();
@@ -1624,7 +1872,7 @@ pub fn main() !void {
     var model = try metal_loader.load(config.model_path.?, device.ctx, allocator);
     defer model.deinit();
 
-    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down };
+    const hot_case_ids = [_]CaseId{ .lm_head, .attn_q, .attn_k, .attn_v, .attn_out, .ssm_qkv, .ssm_gate, .ssm_dual, .ssm_out, .router, .shared_gate, .shared_up, .shared_down, .shared_dual, .moe_gate, .moe_up, .moe_down, .moe_gate_cols, .moe_up_cols, .moe_down_cols };
 
     try stdout.interface.print("Metal q8 exact-shape benchmark\n", .{});
     try stdout.interface.print("Model: {s}\n", .{config.model_path.?});
@@ -1638,12 +1886,13 @@ pub fn main() !void {
         },
     );
     try stdout.interface.print(
-        "Warmup={d} | iterations={d} | pipeline={s} | tg_override={s}\n\n",
+        "Warmup={d} | iterations={d} | pipeline={s} | tg_override={s} | route_tokens={d}\n\n",
         .{
             config.warmup_iterations,
             config.iterations,
             @tagName(config.pipeline_mode),
             if (config.threadgroup_size) |_| "set" else "auto",
+            config.route_tokens,
         },
     );
 
@@ -1651,7 +1900,42 @@ pub fn main() !void {
         if (config.case_id != .all and case_id != config.case_id) continue;
 
         const hot_case = try resolveHotCase(&model, case_id);
-        if (hot_case.isDual()) {
+        if (isMoeColsCase(case_id)) {
+            const k = model.config.n_experts_used;
+            const route_slots = config.route_tokens * k;
+            const active_experts = @min(model.config.n_experts, route_slots);
+            try stdout.interface.print(
+                "Case {s}: {s} | tensor={s} | quant={s} | M={d} K={d} | tokens={d} k={d} routes={d} active_experts={d}/{d} | weight {d:.2} MiB/iter\n",
+                .{
+                    hot_case.key,
+                    hot_case.label,
+                    hot_case.tensor0.info.name,
+                    @tagName(hot_case.tensor0.info.type_),
+                    hot_case.rows0,
+                    hot_case.cols,
+                    config.route_tokens,
+                    k,
+                    route_slots,
+                    active_experts,
+                    model.config.n_experts,
+                    @as(f64, @floatFromInt(weightBytesPerIter(hot_case.tensor0.info.type_, hot_case.rows0, hot_case.cols) * active_experts)) / (1024.0 * 1024.0),
+                },
+            );
+
+            var route_cols_result: ?BenchResult = null;
+            defer if (route_cols_result) |*result| allocator.free(result.output);
+
+            route_cols_result = try benchmarkMoeColsVariant(
+                allocator,
+                &device,
+                &model,
+                hot_case,
+                config.route_tokens,
+                config.warmup_iterations,
+                config.iterations,
+            );
+            try printBenchResult(&stdout, route_cols_result.?);
+        } else if (hot_case.isDual()) {
             const tensor1 = hot_case.tensor1.?;
             try stdout.interface.print(
                 "Case {s}: {s} | tensors={s} + {s} | quant={s} + {s} | M0={d} M1={d} K={d} | weight {d:.2} MiB/iter\n",

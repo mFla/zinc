@@ -30,8 +30,17 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 64) in;
+
+// Specialization constant for blocks-per-row. When non-zero the shader uses
+// this compile-time value, allowing the inner block loop to be unrolled and
+// arithmetic on `i` (block stride math, x_v4 indexing) folded by the SPIR-V
+// → AMDGPU compiler. Cycle 154 swing: pre-compile a SPEC_BLOCKS_PER_ROW=8
+// variant for Qwen 3.5/3.6 hidden_dim=2048 (=8 256-element Q4_K blocks per
+// expert row); fall back to the runtime path for other K values.
+layout(constant_id = 0) const uint SPEC_BLOCKS_PER_ROW = 0u;
 
 layout(push_constant) uniform PushConstants {
     uint M;                // output rows per expert (gate and up share M)
@@ -98,7 +107,10 @@ void main() {
     uint x_global_base_v4 = (x_offset / 16u) + (expert_slot * x_expert_stride) / 4u;
 
     uint a_base_u32 = a_offset_bytes / 4u;
-    uint blocks_per_row = K / 256u;
+    // SPEC_BLOCKS_PER_ROW != 0 → known at pipeline-spec time (cycle 154).
+    // Resolves to a constant for the inner loop bound, enabling unroll +
+    // arithmetic folding on the per-block strides.
+    uint blocks_per_row = (SPEC_BLOCKS_PER_ROW != 0u) ? SPEC_BLOCKS_PER_ROW : (K / 256u);
 
     uint y_base = y_offset / 4u + expert_slot * M;
 
@@ -115,7 +127,7 @@ void main() {
         float sum_gate = 0.0;
         float sum_up = 0.0;
 
-        for (uint i = ix; i < blocks_per_row; i += it_size) {
+        [[unroll]] for (uint i = ix; i < blocks_per_row; i += it_size) {
             uint blk_u32 = row_u32 + i * Q4K_BLOCK_U32;
 
             // ── Load the B-vector tile once; both projections reuse it.

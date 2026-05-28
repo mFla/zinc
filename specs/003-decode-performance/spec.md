@@ -13,11 +13,11 @@ A user runs ZINC with a prompt and receives generated text at a speed comparable
 
 **Why this priority**: Decode throughput is the single metric that determines whether ZINC is usable as a real inference engine. At 4 tok/s, a 256-token response takes over a minute. At 107+ tok/s, it takes ~2.4 seconds. This is the difference between a demo and a product.
 
-**Independent Test**: Run `zinc --prompt "The capital of France is" --max-tokens 256` on the target hardware (AMD Radeon AI PRO R9700) with Qwen3.5-35B-A3B Q4_K_XL and measure reported decode tok/s. Target: ≥107 tok/s.
+**Independent Test**: Run `zinc --prompt "The capital of France is" --max-tokens 256` on the target hardware (AMD Radeon AI PRO R9700) with Qwen3.6-35B-A3B Q4_K_XL and measure reported decode tok/s. Target: ≥107 tok/s.
 
 **Acceptance Scenarios**:
 
-1. **Given** ZINC is loaded with Qwen3.5-35B-A3B Q4_K_XL on RDNA4 hardware, **When** a user runs a 256-token generation, **Then** decode throughput is ≥107 tok/s as reported by the built-in timing output.
+1. **Given** ZINC is loaded with Qwen3.6-35B-A3B Q4_K_XL on RDNA4 hardware, **When** a user runs a 256-token generation, **Then** decode throughput is ≥107 tok/s as reported by the built-in timing output.
 2. **Given** the same model and hardware, **When** a user generates text, **Then** the output is coherent English identical in quality to the current 4 tok/s output (no correctness regression).
 3. **Given** the same model and hardware, **When** a user runs a 256-token generation, **Then** GPU memory bandwidth utilization is ≥80% during the decode phase.
 
@@ -89,7 +89,7 @@ After moving SSM computation, MoE routing, and shared expert gating from CPU to 
 
 ### Measurable Outcomes
 
-- **SC-001**: Decode throughput ≥107 tok/s on the reference hardware and model (Qwen3.5-35B-A3B Q4_K_XL on AMD Radeon AI PRO R9700), matching the llama.cpp baseline.
+- **SC-001**: Decode throughput ≥107 tok/s on the reference hardware and model (Qwen3.6-35B-A3B Q4_K_XL on AMD Radeon AI PRO R9700), matching the llama.cpp baseline.
 - **SC-002**: GPU memory bandwidth utilization ≥80% during decode, up from the current 0.4%.
 - **SC-003**: Number of GPU-CPU synchronization points per decode token ≤10, down from ~151.
 - **SC-004**: Generated text is identical (token-for-token with greedy sampling) to pre-optimization output for the reference prompt over 256 tokens.
@@ -99,7 +99,7 @@ After moving SSM computation, MoE routing, and shared expert gating from CPU to 
 ## Assumptions
 
 - Target hardware is AMD Radeon AI PRO R9700 (RDNA4, 32 GB VRAM, 576 GB/s bandwidth). Performance targets are specific to this GPU.
-- Target model is Qwen3.5-35B-A3B-UD-Q4_K_XL (21 GB, hybrid attention+SSM+MoE, 40 layers, 256 experts top-8, full_attn_interval=4).
+- Target model is Qwen3.6-35B-A3B-UD-Q4_K_XL (21 GB, hybrid attention+SSM+MoE, 40 layers, 256 experts top-8, full_attn_interval=4).
 - Greedy sampling (argmax) is the only sampling mode that needs correctness validation. Other sampling modes (temperature, top-p) are non-deterministic and don't require token-exact matching.
 - The existing Vulkan 1.3 infrastructure (device init, buffer allocation, pipeline creation, SPIR-V compilation) is stable and does not need changes.
 - VRAM is sufficient to hold persistent SSM state buffers alongside the model weights and KV cache. Estimated additional VRAM: ~80 MB for conv state + ~320 MB for recurrent state across 40 layers.

@@ -20,16 +20,17 @@ const breadcrumbItems = [
 const docMeta: Record<string, { label: string; description: string; order: number }> = {
   'development': { label: 'Development Guide', description: 'Build, test, debug, benchmark, and contribute.', order: 5 },
   'getting-started': { label: 'Getting Started', description: 'Build ZINC, verify Vulkan, and run the first prompt.', order: 1 },
-  'hardware-requirements': { label: 'Hardware Requirements', description: 'Linux, AMD GPU, Vulkan, VRAM, and system expectations.', order: 2 },
+  'hardware-requirements': { label: 'Hardware Requirements', description: 'Linux, AMD/Intel GPUs, Vulkan, VRAM, macOS, and Apple Silicon expectations.', order: 2 },
   'running-zinc': { label: 'Running ZINC', description: 'CLI usage, server mode, KV quantization, and graph exports.', order: 3 },
   api: { label: 'Serving HTTP API', description: 'OpenAI-compatible request and response shapes.', order: 4 },
   spec: { label: 'Technical Specification', description: 'Architecture, kernels, model support, and scheduler behavior.', order: 10 },
   'rdna4-tuning': { label: 'RDNA4 Tuning Guide', description: 'Cooperative matrix, bandwidth tuning, and toolchain notes.', order: 11 },
-  'gpu-reference': { label: 'GPU Reference', description: 'RDNA3 and RDNA4 hardware specs, ISA, and memory hierarchy.', order: 12 },
-  'turboquant-spec': { label: 'TurboQuant Compression', description: 'Two-stage vector quantization and KV cache reduction.', order: 13 },
-  'apple-silicon-reference': { label: 'Apple Silicon Reference', description: 'M1–M5 generations, Metal GPU families, and capability progression.', order: 14 },
-  'apple-metal-reference': { label: 'Apple Metal Reference', description: 'MSL kernels, simdgroup ops, threadgroup memory, and pipeline optimization.', order: 15 },
-  'apple-silicon-metal-enablement': { label: 'Metal Enablement Notes', description: 'Implementation notes for the Vulkan-to-Metal port.', order: 16 },
+  'amd-gpu-reference': { label: 'AMD GPU Reference', description: 'RDNA3 and RDNA4 hardware specs, ISA, and memory hierarchy.', order: 12 },
+  'intel-gpu-reference': { label: 'Intel GPU Reference', description: 'Arc B-series specs, Xe2 opcodes, memory bandwidth, and inference tuning notes.', order: 13 },
+  'turboquant-spec': { label: 'TurboQuant Compression', description: 'Two-stage vector quantization and KV cache reduction.', order: 14 },
+  'apple-silicon-reference': { label: 'Apple Silicon Reference', description: 'M1–M5 generations, Metal GPU families, and capability progression.', order: 15 },
+  'apple-metal-reference': { label: 'Apple Metal Reference', description: 'MSL kernels, simdgroup ops, threadgroup memory, and pipeline optimization.', order: 16 },
+  'apple-silicon-metal-enablement': { label: 'Metal Enablement Notes', description: 'Implementation notes for the Vulkan-to-Metal port.', order: 17 },
 };
 
 const orderedDocs = [...docs].sort((a, b) => (docMeta[a.slug]?.order ?? 99) - (docMeta[b.slug]?.order ?? 99));
@@ -48,7 +49,7 @@ const jsonLd = {
     {
       '@type': 'CollectionPage',
       name: 'ZINC Documentation',
-      description: 'Documentation for using ZINC on AMD GPUs: getting started, hardware requirements, running the engine, then deeper tuning and reference material.',
+      description: 'Documentation for using ZINC on consumer GPUs and Apple Silicon: getting started, hardware requirements, running the engine, then deeper tuning and reference material.',
       url: `${siteUrl}/zinc/docs`,
       mainEntity: {
         '@type': 'ItemList',
@@ -67,8 +68,8 @@ const jsonLd = {
 
 <BaseLayout
   title="ZINC Documentation"
-  description="Documentation for using ZINC on AMD GPUs: getting started, hardware requirements, running the CLI and server, plus architecture, tuning, and API reference."
-  keywords="ZINC docs, ZINC getting started, ZINC hardware requirements, how to run ZINC, AMD GPU inference docs, Vulkan GGUF docs, ZINC API, RDNA4 tuning"
+  description="Documentation for using ZINC on consumer GPUs and Apple Silicon: getting started, hardware requirements, running the CLI and server, plus architecture, tuning, and API reference."
+  keywords="ZINC docs, ZINC getting started, ZINC hardware requirements, how to run ZINC, consumer GPU inference docs, Vulkan GGUF docs, ZINC API, RDNA4 tuning"
   jsonLd={jsonLd}
 >
   <Breadcrumbs items={breadcrumbItems} />

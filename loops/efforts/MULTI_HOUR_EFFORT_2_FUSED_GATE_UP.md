@@ -2,7 +2,7 @@
 
 ## Current State (2026-04-05)
 
-- **Qwen3.5-35B-A3B**: 62.4 tok/s (16.0 ms/tok) on RX 9070 RDNA4
+- **Qwen3.6-35B-A3B**: 62.4 tok/s (16.0 ms/tok) on RX 9070 RDNA4
 - **MoE gate+up**: 1.56 ms (40 layers, Q4_K, M=512, K=2048, 8 experts)
 - **Shared expert proj**: 0.93 ms (40 layers, Q8_0, gate+up+gate_scalar)
 - **Dense FFN gate+up**: used by Gemma4-31B (Q4_K, M=12288, K=3072)
@@ -265,7 +265,7 @@ After each step, run:
 
 ```bash
 # On RDNA node:
-./zig-out/bin/zinc -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf --prompt 'The capital of France is' -n 20
+./zig-out/bin/zinc -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --prompt 'The capital of France is' -n 20
 # → Must output "Paris."
 
 ./zig-out/bin/zinc -m /root/models/Qwen3-8B-Q4_K_M.gguf --prompt 'The capital of France is' -n 20
@@ -277,7 +277,7 @@ After each step, run:
 
 Profile to verify gate_up time decreased:
 ```bash
-./zig-out/bin/zinc -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf --profile -n 200 --prompt 'Write an essay.'
+./zig-out/bin/zinc -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --profile -n 200 --prompt 'Write an essay.'
 # Check: avg MoE subphases gate_up should decrease
 ```
 

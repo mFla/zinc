@@ -3,6 +3,33 @@
 //! ZINC still loads one model into memory at a time. This manager keeps the
 //! current engine/tokenizer/model bundle together and handles serialized swaps.
 const std = @import("std");
+
+const FutexMutex = struct {
+    state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+
+    fn lock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        while (@cmpxchgWeak(i32, &self.state.raw, 0, 1, .acquire, .monotonic) != null) {
+            _ = linux.futex_4arg(
+                @ptrCast(&self.state.raw),
+                .{ .cmd = .WAIT, .private = true },
+                1,
+                null,
+            );
+        }
+    }
+
+    fn unlock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        @atomicStore(i32, &self.state.raw, 0, .release);
+        _ = linux.futex_3arg(
+            @ptrCast(&self.state.raw),
+            .{ .cmd = .WAKE, .private = true },
+            1,
+        );
+    }
+};
+
 const loader_mod = @import("../model/loader.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
 const catalog_mod = @import("../model/catalog.zig");
@@ -37,6 +64,15 @@ pub const ModelSummary = struct {
     supported_on_current_gpu: bool,
     fits_current_gpu: bool,
     required_vram_bytes: u64,
+    /// VRAM required when MoE expert tensors are offloaded to host RAM under
+    /// `ZINC_OFFLOAD_MOE_EXPERTS=1`. Equal to required_vram_bytes for dense
+    /// models. Lets clients show users that a too-large model would fit with
+    /// the offload escape hatch.
+    required_vram_with_offload_bytes: u64,
+    /// True when the model doesn't fit in VRAM but does fit if MoE expert
+    /// tensors are offloaded to host RAM. Mutually exclusive with
+    /// `fits_current_gpu`.
+    requires_offload_to_fit: bool,
     size_bytes: u64,
     exact_fit: bool,
     status_label: []const u8,
@@ -84,12 +120,13 @@ pub const LoadedResources = struct {
 
 /// Thread-safe owner of the currently active model, providing load, swap, and catalog queries.
 pub const ModelManager = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     instance: *const Instance,
     gpu_config: gpu_detect.GpuConfig,
     vram_budget_bytes: u64,
     shader_dir: []const u8,
-    state_mutex: std.Thread.Mutex = .{},
+    state_mutex: FutexMutex = .{},
     gpu_process_lock: process_lock_mod.ProcessLock = .{},
     requested_context_length: ?u32 = null,
     current: ?*LoadedResources,
@@ -103,18 +140,20 @@ pub const ModelManager = struct {
 
     /// Creates a manager and immediately loads the model described by `spec`.
     pub fn init(
+        io: std.Io,
         spec: LoadSpec,
         instance: *const Instance,
         gpu_config_value: gpu_detect.GpuConfig,
         shader_dir: []const u8,
         allocator: std.mem.Allocator,
     ) !ModelManager {
-        var gpu_process_lock = try process_lock_mod.acquire(.vulkan, instance.selected_device_index);
+        var gpu_process_lock = try process_lock_mod.acquire(io, .vulkan, instance.selected_device_index);
         errdefer gpu_process_lock.deinit();
         const current = try allocator.create(LoadedResources);
         errdefer allocator.destroy(current);
-        try loadResourcesInto(current, spec, instance, gpu_config_value, shader_dir, allocator);
+        try loadResourcesInto(io, current, spec, instance, gpu_config_value, shader_dir, allocator);
         return .{
+            .io = io,
             .allocator = allocator,
             .instance = instance,
             .gpu_config = gpu_config_value,
@@ -128,6 +167,7 @@ pub const ModelManager = struct {
 
     /// Creates a manager with no model loaded (server starts idle).
     pub fn initEmpty(
+        io: std.Io,
         instance: *const Instance,
         gpu_config_value: gpu_detect.GpuConfig,
         shader_dir: []const u8,
@@ -135,6 +175,7 @@ pub const ModelManager = struct {
         allocator: std.mem.Allocator,
     ) ModelManager {
         return .{
+            .io = io,
             .allocator = allocator,
             .instance = instance,
             .gpu_config = gpu_config_value,
@@ -235,17 +276,19 @@ pub const ModelManager = struct {
         const active_display_name = if (self.current) |current| current.display_name else "none";
         const active_supports_thinking_toggle = if (self.current) |current| current.tokenizer.supportsThinkingToggle() else false;
 
-        var list: std.ArrayList(ModelSummary) = .{};
+        var list: std.ArrayList(ModelSummary) = .empty;
         defer list.deinit(allocator);
 
         for (catalog_mod.entries) |entry| {
             const tested_profile_match = catalog_mod.supportsProfile(entry, profile);
 
-            const installed = managed_mod.isInstalled(entry.id, allocator);
-            const fit = managed_mod.describeFit(entry, self.vram_budget_bytes, allocator) catch managed_mod.ModelFit{
+            const installed = managed_mod.isInstalled(self.io, entry.id, allocator);
+            const fit = managed_mod.describeFit(self.io, entry, self.vram_budget_bytes, allocator) catch managed_mod.ModelFit{
                 .required_vram_bytes = entry.required_vram_bytes,
                 .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
                 .exact = false,
+                .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+                .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
             };
             // Currently-active entries are kept even when the catalog's
             // conservative required_vram_bytes exceeds the live budget —
@@ -275,6 +318,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = supported_now,
                 .fits_current_gpu = fit.fits_current_gpu,
                 .required_vram_bytes = fit.required_vram_bytes,
+                .required_vram_with_offload_bytes = fit.required_vram_with_offload_bytes,
+                .requires_offload_to_fit = fit.fit_state == .fits_with_offload,
                 .size_bytes = entry.size_bytes,
                 .exact_fit = fit.exact,
                 .status_label = status_label,
@@ -296,6 +341,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = true,
                 .fits_current_gpu = true,
                 .required_vram_bytes = 0,
+                .required_vram_with_offload_bytes = 0,
+                .requires_offload_to_fit = false,
                 .size_bytes = 0,
                 .exact_fit = true,
                 .status_label = "raw",
@@ -311,10 +358,12 @@ pub const ModelManager = struct {
 
     /// Returns true if the given catalog entry is compatible with and fits the current GPU.
     pub fn supportsManagedEntry(self: *ModelManager, entry: catalog_mod.CatalogEntry, allocator: std.mem.Allocator) bool {
-        const fit = managed_mod.describeFit(entry, self.vram_budget_bytes, allocator) catch managed_mod.ModelFit{
+        const fit = managed_mod.describeFit(self.io, entry, self.vram_budget_bytes, allocator) catch managed_mod.ModelFit{
             .required_vram_bytes = entry.required_vram_bytes,
             .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
             .exact = false,
+            .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+            .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
         };
         return catalog_mod.supportsProfile(entry, self.catalogProfile()) and fit.fits_current_gpu;
     }
@@ -323,9 +372,9 @@ pub const ModelManager = struct {
     pub fn activateManagedModel(self: *ModelManager, model_id: []const u8, persist_active: bool) !void {
         const entry = catalog_mod.find(model_id) orelse return error.UnknownManagedModel;
         if (!catalog_mod.supportsProfile(entry.*, self.catalogProfile())) return error.ModelUnsupportedOnThisGpu;
-        if (!managed_mod.isInstalled(model_id, self.allocator)) return error.ModelNotInstalled;
+        if (!managed_mod.isInstalled(self.io, model_id, self.allocator)) return error.ModelNotInstalled;
 
-        const fit = try managed_mod.verifyActiveSelectionFits(model_id, self.vram_budget_bytes, self.allocator);
+        const fit = try managed_mod.verifyActiveSelectionFits(self.io, model_id, self.vram_budget_bytes, self.allocator);
         if (!fit.fits_current_gpu) return error.ModelDoesNotFit;
 
         self.state_mutex.lock();
@@ -334,7 +383,7 @@ pub const ModelManager = struct {
         if (self.current) |current| {
             if (current.managed_id) |active_id| {
                 if (std.mem.eql(u8, active_id, model_id)) {
-                    if (persist_active) try managed_mod.writeActiveSelection(model_id, self.allocator);
+                    if (persist_active) try managed_mod.writeActiveSelection(self.io, model_id, self.allocator);
                     return;
                 }
             }
@@ -344,13 +393,13 @@ pub const ModelManager = struct {
         defer self.allocator.free(new_path);
         var acquired_gpu_lock = false;
         if (!self.gpu_process_lock.isHeld()) {
-            self.gpu_process_lock = try process_lock_mod.acquire(.vulkan, self.instance.selected_device_index);
+            self.gpu_process_lock = try process_lock_mod.acquire(self.io, .vulkan, self.instance.selected_device_index);
             acquired_gpu_lock = true;
             errdefer if (acquired_gpu_lock) self.gpu_process_lock.deinit();
         }
         const switched = try self.allocator.create(LoadedResources);
         errdefer self.allocator.destroy(switched);
-        loadResourcesInto(switched, .{
+        loadResourcesInto(self.io, switched, .{
             .model_path = new_path,
             .managed_id = model_id,
             .requested_context_length = self.requested_context_length,
@@ -366,7 +415,7 @@ pub const ModelManager = struct {
             self.allocator.destroy(old);
         }
 
-        if (persist_active) try managed_mod.writeActiveSelection(model_id, self.allocator);
+        if (persist_active) try managed_mod.writeActiveSelection(self.io, model_id, self.allocator);
     }
 
     /// Caller must already hold the shared generation lock.
@@ -398,8 +447,8 @@ pub const ModelManager = struct {
             self.gpu_process_lock.deinit();
         }
 
-        const removed = try managed_mod.removeInstalledModel(model_id, self.allocator);
-        const cleared_active_selection = try managed_mod.clearActiveSelectionIfMatches(model_id, self.allocator);
+        const removed = try managed_mod.removeInstalledModel(self.io, model_id, self.allocator);
+        const cleared_active_selection = try managed_mod.clearActiveSelectionIfMatches(self.io, model_id, self.allocator);
 
         return .{
             .unloaded_from_gpu = unloaded_from_gpu,
@@ -410,6 +459,7 @@ pub const ModelManager = struct {
 };
 
 fn loadResourcesInto(
+    io: std.Io,
     resources: *LoadedResources,
     spec: LoadSpec,
     instance: *const Instance,
@@ -421,7 +471,7 @@ fn loadResourcesInto(
     defer cmd_pool.deinit();
 
     resources.* = undefined;
-    resources.model = try loader_mod.load(spec.model_path, instance, &cmd_pool, allocator);
+    resources.model = try loader_mod.load(io, spec.model_path, instance, &cmd_pool, allocator);
     errdefer resources.model.deinit(instance);
 
     // Derive a context length from the Vulkan device's VRAM budget when the
@@ -440,7 +490,7 @@ fn loadResourcesInto(
 
     // Important: the engine stores a Model pointer. Initialize it against the
     // stable model field inside the final LoadedResources storage.
-    resources.engine = try forward_mod.InferenceEngine.init(&resources.model, instance, gpu_config_value, shader_dir, allocator);
+    resources.engine = try forward_mod.InferenceEngine.init(io, &resources.model, instance, gpu_config_value, shader_dir, allocator);
     errdefer resources.engine.deinit();
 
     resources.model_path = try allocator.dupe(u8, spec.model_path);
@@ -468,8 +518,12 @@ fn loadResourcesInto(
 }
 
 fn tensorBytes(model: *const loader_mod.Model) u64 {
+    // Only count device-local tensors against the VRAM budget. MoE expert
+    // tensors offloaded to host-visible memory live in system RAM and do
+    // not consume VRAM. See loader.shouldOffloadToHost for the rule.
     var total: u64 = 0;
     for (model.gguf_file.tensors.items) |tensor_info| {
+        if (loader_mod.shouldOffloadToHost(tensor_info.name)) continue;
         total += tensor_info.sizeBytes();
     }
     return total;
@@ -497,6 +551,7 @@ fn modelDisplayName(model: *const loader_mod.Model) []const u8 {
 
 test "collectCatalogView marks active managed model" {
     var fake = ModelManager{
+        .io = std.testing.io,
         .allocator = std.testing.allocator,
         .instance = undefined,
         .gpu_config = .{
@@ -545,8 +600,8 @@ test "collectCatalogView marks active managed model" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/test.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen3-8b-q4k-m"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3 8B Q4_K_M"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-9b-q4k-m"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 9B Q4_K_M"),
         .weights_bytes = 20 * 1024 * 1024 * 1024,
         .runtime_device_local_bytes = 1024 * 1024 * 1024,
         .context_reserved_bytes = 768 * 1024 * 1024,
@@ -571,11 +626,11 @@ test "collectCatalogView marks active managed model" {
     try std.testing.expect(view.data.len >= 1);
     var saw_active = false;
     for (view.data) |entry| {
-        if (std.mem.eql(u8, entry.id, "qwen3-8b-q4k-m")) {
+        if (std.mem.eql(u8, entry.id, "qwen35-9b-q4k-m")) {
             saw_active = true;
             try std.testing.expect(entry.active);
             try std.testing.expect(entry.supports_thinking_toggle);
-            try std.testing.expectEqualStrings("2025-04-29", entry.release_date);
+            try std.testing.expectEqualStrings("2026-02-28", entry.release_date);
         }
     }
     try std.testing.expect(saw_active);
@@ -583,6 +638,7 @@ test "collectCatalogView marks active managed model" {
 
 test "collectCatalogView preserves qwen36 thinking toggle for raw matched path" {
     var fake = ModelManager{
+        .io = std.testing.io,
         .allocator = std.testing.allocator,
         .instance = undefined,
         .gpu_config = .{
@@ -667,6 +723,7 @@ test "collectCatalogView preserves qwen36 thinking toggle for raw matched path" 
 
 test "currentMemoryUsage reports empty state when no model is loaded" {
     var fake = ModelManager{
+        .io = std.testing.io,
         .allocator = std.testing.allocator,
         .instance = undefined,
         .gpu_config = .{
@@ -705,6 +762,7 @@ test "currentMemoryUsage reports empty state when no model is loaded" {
 
 test "removeManagedModel refuses loaded active model without force" {
     var fake = ModelManager{
+        .io = std.testing.io,
         .allocator = std.testing.allocator,
         .instance = undefined,
         .gpu_config = .{
@@ -744,8 +802,8 @@ test "removeManagedModel refuses loaded active model without force" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/test.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-35b-a3b-q4k-xl"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 35B-A3B UD Q4_K_XL"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen36-35b-a3b-q4k-xl"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.6 35B-A3B UD Q4_K_XL"),
         .weights_bytes = 20 * 1024 * 1024 * 1024,
         .runtime_device_local_bytes = 1024 * 1024 * 1024,
         .context_reserved_bytes = 768 * 1024 * 1024,
@@ -762,6 +820,6 @@ test "removeManagedModel refuses loaded active model without force" {
         std.testing.allocator.free(fake.current.?.display_name);
     }
 
-    try std.testing.expectError(error.ModelLoadedInGpu, fake.removeManagedModel("qwen35-35b-a3b-q4k-xl", false));
+    try std.testing.expectError(error.ModelLoadedInGpu, fake.removeManagedModel("qwen36-35b-a3b-q4k-xl", false));
     try std.testing.expect(fake.current == &current);
 }

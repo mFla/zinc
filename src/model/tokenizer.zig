@@ -4,8 +4,18 @@
 //! embedded in GGUF model files, eliminating external tokenizer dependencies.
 const std = @import("std");
 const gguf = @import("gguf.zig");
+const tool_format_mod = @import("../server/tool_format.zig");
 
 const log = std.log.scoped(.tokenizer);
+
+fn isQwen35LikeName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "qwen35") or
+        std.mem.eql(u8, name, "qwen3_5") or
+        std.mem.eql(u8, name, "qwen3_5_text") or
+        std.mem.eql(u8, name, "qwen36") or
+        std.mem.eql(u8, name, "qwen3_6") or
+        std.mem.eql(u8, name, "qwen3_6_text");
+}
 
 /// A native BPE tokenizer backed by vocabulary and merge tables from GGUF metadata.
 pub const Tokenizer = struct {
@@ -104,7 +114,7 @@ pub const Tokenizer = struct {
         }
 
         // Read BPE merges if available
-        var merges_list: std.ArrayListAligned(Merge, null) = .{};
+        var merges_list: std.ArrayListAligned(Merge, null) = .empty;
         errdefer merges_list.deinit(allocator);
 
         if (gf.metadata.get("tokenizer.ggml.merges")) |merges_val| {
@@ -136,12 +146,14 @@ pub const Tokenizer = struct {
         const eos_id = gf.getU32("tokenizer.ggml.eos_token_id") orelse 2;
         const model_type = gf.getString("tokenizer.ggml.model") orelse "unknown";
         const architecture = gf.getString("general.architecture") orelse "";
+        const pre_name = gf.getString("tokenizer.ggml.pre") orelse "";
         const prepend_bos = gf.getBool("tokenizer.ggml.add_bos_token") orelse blk: {
             // Default: prepend BOS when a BOS token ID is defined.
             // Llama 3 uses GPT2 tokenizer format but requires BOS (128000).
             // Qwen3/3.5 explicitly omit BOS metadata — do NOT prepend.
             // GPT-OSS defines a BOS token but llama.cpp does not prepend it for prompts.
             if (std.mem.eql(u8, architecture, "gpt-oss")) break :blk false;
+            if (isQwen35LikeName(architecture) or isQwen35LikeName(pre_name)) break :blk false;
             break :blk bos_id != null;
         };
         const add_eos_token = gf.getBool("tokenizer.ggml.add_eos_token") orelse false;
@@ -164,13 +176,12 @@ pub const Tokenizer = struct {
 
         const chat_template = gf.getString("tokenizer.chat_template");
         if (chat_template) |tmpl| log.debug("Chat template: {d} chars", .{tmpl.len});
-        const pre_name = gf.getString("tokenizer.ggml.pre") orelse "";
         const pretokenizer: Pretokenizer = if (std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, pre_name, "gemma4"))
             .gemma4_bpe
         else if (scores == null and merges_list.items.len > 0 and
             (std.mem.eql(u8, model_type, "gpt2") or
                 std.mem.eql(u8, pre_name, "qwen2") or
-                std.mem.eql(u8, pre_name, "qwen35")))
+                isQwen35LikeName(pre_name)))
             .gpt2_ascii
         else
             .legacy;
@@ -189,7 +200,7 @@ pub const Tokenizer = struct {
             merge_ranks.deinit();
         }
         try merge_ranks.ensureTotalCapacity(@intCast(merges_owned.len));
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(allocator);
         for (merges_owned) |merge| {
             key_buf.clearRetainingCapacity();
@@ -270,10 +281,10 @@ pub const Tokenizer = struct {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
 
         // Start with GPT-2 byte-level encoding: each raw byte maps to a Unicode char
-        var symbols: std.ArrayList([]const u8) = .{};
+        var symbols: std.ArrayList([]const u8) = .empty;
         defer symbols.deinit(self.allocator);
 
-        var owned_symbols: std.ArrayList([]u8) = .{};
+        var owned_symbols: std.ArrayList([]u8) = .empty;
         defer {
             for (owned_symbols.items) |sym| self.allocator.free(sym);
             owned_symbols.deinit(self.allocator);
@@ -328,7 +339,7 @@ pub const Tokenizer = struct {
         }
 
         // Convert symbol strings to token IDs
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         for (symbols.items) |sym| {
@@ -448,7 +459,7 @@ pub const Tokenizer = struct {
     pub fn encode(self: *const Tokenizer, text: []const u8) ![]u32 {
         if (text.len == 0) return try self.allocator.alloc(u32, 0);
         if (self.pretokenizer == .gemma4_bpe) {
-            var tokens: std.ArrayList(u32) = .{};
+            var tokens: std.ArrayList(u32) = .empty;
             errdefer tokens.deinit(self.allocator);
 
             var pos: usize = 0;
@@ -472,7 +483,7 @@ pub const Tokenizer = struct {
             return self.encodeChunk(text);
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(self.allocator);
 
         var pos: usize = 0;
@@ -536,7 +547,7 @@ pub const Tokenizer = struct {
             return out;
         }
 
-        var tokens: std.ArrayList(u32) = .{};
+        var tokens: std.ArrayList(u32) = .empty;
         errdefer tokens.deinit(allocator);
 
         var pos: usize = 0;
@@ -622,7 +633,7 @@ pub const Tokenizer = struct {
         const ranks_ptr: *const std.StringHashMap(u32) = merge_ranks orelse blk: {
             fallback_ranks = std.StringHashMap(u32).init(self.allocator);
             fallback_owned = true;
-            var kb: std.ArrayList(u8) = .{};
+            var kb: std.ArrayList(u8) = .empty;
             defer kb.deinit(self.allocator);
             for (self.merges) |merge| {
                 kb.clearRetainingCapacity();
@@ -636,7 +647,7 @@ pub const Tokenizer = struct {
         };
 
         // Pre-allocate merge key buffer
-        var key_buf: std.ArrayList(u8) = .{};
+        var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(self.allocator);
 
         // Repeatedly find and apply the highest-priority (lowest rank) merge
@@ -847,6 +858,13 @@ pub const Tokenizer = struct {
         add_generation_prompt: bool = true,
         /// When true, skip the thinking template entirely even if the tokenizer supports it.
         skip_thinking_template: bool = false,
+        /// Tool definitions to render into the system message. Empty slice = no tools.
+        tools: []const tool_format_mod.ToolDefinition = &.{},
+        /// The format renderer to use for tool definitions and tool result messages.
+        tool_format: ?tool_format_mod.ToolFormat = null,
+        /// Allocator used for transient tool-rendering scratch buffers. Required
+        /// when `tool_format` is set or `tools.len > 0`; ignored otherwise.
+        tool_render_allocator: ?std.mem.Allocator = null,
     };
 
     fn appendTrimmed(dst: []u8, pos: *usize, text: []const u8) !void {
@@ -861,7 +879,7 @@ pub const Tokenizer = struct {
         var wrote_any = false;
         while (src_pos < text.len) {
             if (std.mem.indexOfPos(u8, text, src_pos, "<|channel>")) |open_idx| {
-                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimLeft(u8, text[src_pos..open_idx], " \t\r\n");
+                const chunk = if (wrote_any) text[src_pos..open_idx] else std.mem.trimStart(u8, text[src_pos..open_idx], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -873,7 +891,7 @@ pub const Tokenizer = struct {
                     break;
                 }
             } else {
-                const chunk = if (wrote_any) std.mem.trimRight(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
+                const chunk = if (wrote_any) std.mem.trimEnd(u8, text[src_pos..], " \t\r\n") else std.mem.trim(u8, text[src_pos..], " \t\r\n");
                 if (pos.* + chunk.len > dst.len) return error.BufferTooSmall;
                 @memcpy(dst[pos.*..][0..chunk.len], chunk);
                 pos.* += chunk.len;
@@ -905,9 +923,76 @@ pub const Tokenizer = struct {
         const n = @min(roles.len, contents.len);
         switch (template_kind) {
             .chatml => {
-                for (0..n) |i| {
-                    const written = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}<|im_end|>\n", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
-                    pos += written.len;
+                // Tool rendering uses a caller-supplied allocator for transient
+                // scratch buffers. When neither tools nor a tool_format are set
+                // (the common path), tool_alloc is never touched, so the field
+                // is permitted to be null in that case.
+                const needs_tool_alloc = options.tool_format != null or options.tools.len > 0;
+                const tool_alloc: std.mem.Allocator = if (needs_tool_alloc)
+                    options.tool_render_allocator orelse return error.MissingToolRenderAllocator
+                else
+                    undefined;
+
+                var tools_rendered = false;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    const is_tool = std.mem.eql(u8, roles[i], "tool");
+
+                    if (is_tool and options.tool_format != null) {
+                        // Aggregate consecutive tool results into a single user turn.
+                        const prev_was_tool = i > 0 and std.mem.eql(u8, roles[i - 1], "tool");
+                        if (!prev_was_tool) {
+                            const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>user\n", .{}) catch return error.BufferTooSmall;
+                            pos += open.len;
+                        }
+
+                        var trbuf: std.ArrayList(u8) = .empty;
+                        defer trbuf.deinit(tool_alloc);
+                        try options.tool_format.?.renderToolResultMessage("", contents[i], &trbuf, tool_alloc);
+                        if (pos + trbuf.items.len > buf.len) return error.BufferTooSmall;
+                        @memcpy(buf[pos .. pos + trbuf.items.len], trbuf.items);
+                        pos += trbuf.items.len;
+
+                        // Close user turn only when next message is not also a tool.
+                        const next_is_tool = (i + 1 < n) and std.mem.eql(u8, roles[i + 1], "tool");
+                        if (!next_is_tool) {
+                            const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                            pos += close.len;
+                        }
+                        continue;
+                    }
+
+                    const header = std.fmt.bufPrint(buf[pos..], "<|im_start|>{s}\n{s}", .{ roles[i], contents[i] }) catch return error.BufferTooSmall;
+                    pos += header.len;
+
+                    // Inject tool definitions into the first system/developer message.
+                    if (!tools_rendered and options.tools.len > 0 and options.tool_format != null and
+                        (std.mem.eql(u8, roles[i], "system") or std.mem.eql(u8, roles[i], "developer")))
+                    {
+                        var tool_buf: std.ArrayList(u8) = .empty;
+                        defer tool_buf.deinit(tool_alloc);
+                        try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
+                        if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
+                        @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
+                        pos += tool_buf.items.len;
+                        tools_rendered = true;
+                    }
+
+                    const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                    pos += close.len;
+                }
+                // If no system message but tools provided, add a synthetic system turn.
+                if (!tools_rendered and options.tools.len > 0 and options.tool_format != null) {
+                    const open = std.fmt.bufPrint(buf[pos..], "<|im_start|>system", .{}) catch return error.BufferTooSmall;
+                    pos += open.len;
+                    var tool_buf: std.ArrayList(u8) = .empty;
+                    defer tool_buf.deinit(tool_alloc);
+                    try options.tool_format.?.renderToolDefinitions(options.tools, &tool_buf, tool_alloc);
+                    if (pos + tool_buf.items.len > buf.len) return error.BufferTooSmall;
+                    @memcpy(buf[pos .. pos + tool_buf.items.len], tool_buf.items);
+                    pos += tool_buf.items.len;
+                    const close = std.fmt.bufPrint(buf[pos..], "<|im_end|>\n", .{}) catch return error.BufferTooSmall;
+                    pos += close.len;
                 }
                 if (options.add_generation_prompt) {
                     const suffix = if (supports_thinking and !options.skip_thinking_template) blk: {
@@ -999,8 +1084,8 @@ pub const Tokenizer = struct {
                     pos += written.len;
                 }
                 if (options.add_generation_prompt) {
-                    // Match llama.cpp: omit <|message|> — model generates it
-                    const suffix = std.fmt.bufPrint(buf[pos..], "<|start|>assistant", .{}) catch return error.BufferTooSmall;
+                    const channel = if (options.enable_thinking orelse false) "analysis" else "final";
+                    const suffix = std.fmt.bufPrint(buf[pos..], "<|start|>assistant<|channel|>{s}<|message|>", .{channel}) catch return error.BufferTooSmall;
                     pos += suffix.len;
                 }
             },
@@ -1014,14 +1099,18 @@ pub const Tokenizer = struct {
         return buf[0..pos];
     }
 
-    const TemplateKind = enum { chatml, llama3, gemma, openai_moe, generic };
+    pub const TemplateKind = enum { chatml, llama3, gemma, openai_moe, generic };
 
     /// Return the detected chat template kind as a human-readable string (e.g. "chatml", "openai_moe").
     pub fn detectTemplateKindName(self: *const Tokenizer) []const u8 {
         return @tagName(self.detectTemplateKind());
     }
 
-    fn detectTemplateKind(self: *const Tokenizer) TemplateKind {
+    /// Classify the embedded chat template into a known family. Used by the
+    /// chat completions path to pick the right special tokens, generation
+    /// suffix, and tool-call format. Returns `.chatml` when no template is
+    /// embedded (the safest default for most Qwen-family GGUFs).
+    pub fn detectTemplateKind(self: *const Tokenizer) TemplateKind {
         const tmpl = self.chat_template orelse return .chatml;
         if (std.mem.indexOf(u8, tmpl, "im_start") != null) return .chatml;
         if (std.mem.indexOf(u8, tmpl, "start_header_id") != null) return .llama3;
@@ -1092,7 +1181,7 @@ test "initFromGGUF populates merge_ranks cache when merges are present" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1127,7 +1216,7 @@ test "initFromGGUF omits BOS for qwen35 family (no BOS in GGUF)" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1150,6 +1239,43 @@ test "initFromGGUF omits BOS for qwen35 family (no BOS in GGUF)" {
     try std.testing.expect(!tok.shouldPrependBos());
 }
 
+test "initFromGGUF omits BOS and uses BPE for qwen3_5 aliases" {
+    const allocator = std.testing.allocator;
+
+    var gf = gguf.GGUFFile{
+        .version = .v3,
+        .tensor_count = 0,
+        .metadata = .{},
+        .tensors = .empty,
+        .tensor_data_offset = 0,
+        .allocator = allocator,
+    };
+    defer gf.deinit();
+
+    const tokens = try allocator.alloc(gguf.MetadataValue, 4);
+    tokens[0] = .{ .string = try allocator.dupe(u8, "a") };
+    tokens[1] = .{ .string = try allocator.dupe(u8, "b") };
+    tokens[2] = .{ .string = try allocator.dupe(u8, "ab") };
+    tokens[3] = .{ .string = try allocator.dupe(u8, "c") };
+
+    const merges = try allocator.alloc(gguf.MetadataValue, 1);
+    merges[0] = .{ .string = try allocator.dupe(u8, "a b") };
+
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.tokens"), .{ .array = tokens });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.merges"), .{ .array = merges });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.model"), .{ .string = try allocator.dupe(u8, "gpt2") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.pre"), .{ .string = try allocator.dupe(u8, "qwen3_5") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "general.architecture"), .{ .string = try allocator.dupe(u8, "qwen3_5") });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.bos_token_id"), .{ .uint32 = 0 });
+    try gf.metadata.put(allocator, try allocator.dupe(u8, "tokenizer.ggml.eos_token_id"), .{ .uint32 = 3 });
+
+    var tok = try Tokenizer.initFromGGUF(&gf, allocator);
+    defer tok.deinit();
+
+    try std.testing.expect(!tok.shouldPrependBos());
+    try std.testing.expectEqual(Tokenizer.Pretokenizer.gpt2_ascii, tok.pretokenizer);
+}
+
 test "initFromGGUF omits BOS for gpt-oss prompts by default" {
     const allocator = std.testing.allocator;
 
@@ -1157,7 +1283,7 @@ test "initFromGGUF omits BOS for gpt-oss prompts by default" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1187,7 +1313,7 @@ test "initFromGGUF respects gemma4 add_bos_token=false" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1218,7 +1344,7 @@ test "initFromGGUF respects gemma4 add_bos_token=true" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -1389,6 +1515,56 @@ test "applyChatTemplate with im_start template uses ChatML" {
     try std.testing.expect(std.mem.indexOf(u8, result, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "You help.") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Hi") != null);
+}
+
+test "applyChatTemplate openai_moe defaults generation to final channel" {
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 200002,
+        .prepend_bos = false,
+        .chat_template = "<|start|>{{ role }}<|message|>{{ content }}<|end|>",
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    var buf: [256]u8 = undefined;
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"Hello"};
+    const result = try tok.applyChatTemplate(&roles, &contents, &buf);
+
+    try std.testing.expectEqualStrings(
+        "<|start|>user<|message|>Hello<|end|><|start|>assistant<|channel|>final<|message|>",
+        result,
+    );
+}
+
+test "applyChatTemplate openai_moe can request analysis channel" {
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 200002,
+        .prepend_bos = false,
+        .chat_template = "<|start|>{{ role }}<|message|>{{ content }}<|end|>",
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    var buf: [256]u8 = undefined;
+    const roles = [_][]const u8{"user"};
+    const contents = [_][]const u8{"Hello"};
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{ .enable_thinking = true }, &buf);
+
+    try std.testing.expectEqualStrings(
+        "<|start|>user<|message|>Hello<|end|><|start|>assistant<|channel|>analysis<|message|>",
+        result,
+    );
 }
 
 test "applyChatTemplate gemma4 defaults to closed thought channel prompt" {
@@ -1939,4 +2115,83 @@ test "encodeWithSpecialTokens handles consecutive special tokens" {
     defer std.testing.allocator.free(tokens);
 
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, tokens);
+}
+
+test "applyChatTemplateWithOptions chatml renders tool definitions in system message" {
+    const tool_format_mod_t = @import("../server/tool_format.zig");
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 2,
+        .prepend_bos = false,
+        .chat_template = null, // null → chatml
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    const tools = [_]tool_format_mod_t.ToolDefinition{.{
+        .name = "get_weather",
+        .description = "Get the weather",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+    }};
+
+    const roles = [_][]const u8{ "system", "user" };
+    const contents = [_][]const u8{ "You are helpful.", "What's the weather?" };
+    var buf: [4096]u8 = undefined;
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{
+        .add_generation_prompt = false,
+        .tools = &tools,
+        .tool_format = tool_format_mod_t.chatmlToolFormat(),
+        .tool_render_allocator = std.testing.allocator,
+    }, &buf);
+
+    // System message should contain the tool definitions header.
+    try std.testing.expect(std.mem.indexOf(u8, result, "# Tools") != null);
+    // The system close tag must come after the tool block.
+    const tools_pos = std.mem.indexOf(u8, result, "# Tools").?;
+    const end_pos = std.mem.indexOfPos(u8, result, tools_pos, "<|im_end|>").?;
+    try std.testing.expect(end_pos > tools_pos);
+}
+
+test "applyChatTemplateWithOptions chatml renders tool result messages aggregated in user turn" {
+    const tool_format_mod_t = @import("../server/tool_format.zig");
+    var tok = Tokenizer{
+        .vocab = &.{},
+        .token_to_id = std.StringHashMap(u32).init(std.testing.allocator),
+        .merges = &.{},
+        .scores = null,
+        .bos_id = null,
+        .eos_id = 2,
+        .prepend_bos = false,
+        .chat_template = null,
+        .allocator = std.testing.allocator,
+    };
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{ "user", "assistant", "tool", "tool" };
+    const contents = [_][]const u8{ "Call weather.", "Sure!", "sunny", "warm" };
+    var buf: [4096]u8 = undefined;
+    const result = try tok.applyChatTemplateWithOptions(&roles, &contents, .{
+        .add_generation_prompt = false,
+        .tool_format = tool_format_mod_t.chatmlToolFormat(),
+        .tool_render_allocator = std.testing.allocator,
+    }, &buf);
+
+    // Both tool results should appear inside a single <|im_start|>user turn.
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_response>") != null);
+    // "sunny" and "warm" should both be present.
+    try std.testing.expect(std.mem.indexOf(u8, result, "sunny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "warm") != null);
+    // Only one <|im_start|>user from the tool aggregation (plus the first user turn).
+    // Consecutive tool messages should produce exactly one extra user start.
+    var user_turn_count: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, result, search_pos, "<|im_start|>user")) |p| {
+        user_turn_count += 1;
+        search_pos = p + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), user_turn_count);
 }

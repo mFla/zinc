@@ -44,6 +44,8 @@ const BENCHMARK_RUNS = 3;
 const REGRESSION_PCT = 0.03; // 3% regression tolerance
 const REGRESSION_FLOOR = 0.5; // minimum tok/s drop to count as regression
 const MAX_RETRIES = 3; // retries before full revert
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -413,11 +415,12 @@ function buildClaudeArgs(prompt: string, model?: string): string[] {
 
 function buildCodexArgs(prompt: string, model?: string): string[] {
   const args = [
-    "exec", "--skip-git-repo-check", "--json",
+    "exec", "-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+    "--skip-git-repo-check", "--json",
     "--color", "never", "--sandbox", "workspace-write",
     "--cd", REPO_ROOT,
   ];
-  if (model) args.push("--model", model);
+  args.push("--model", model ?? CODEX_MODEL);
   args.push(prompt);
   return args;
 }
@@ -795,7 +798,7 @@ async function main() {
   const args = process.argv.slice(2);
   let promptText: string | null = null;
   let promptFile: string | null = null;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let model: string | undefined;
   let extraModelPaths: string[] = [];
 
@@ -829,7 +832,7 @@ async function main() {
           "Options:",
           "  --prompt <text>          Inline prompt",
           "  --prompt-file <path>     Read prompt from file",
-          "  --agent <claude|codex>   Agent to use (default: claude)",
+          "  --agent <claude|codex>   Agent to use (default: codex)",
           "  --model <name>           Model override for the AI agent",
           "  --models <path,path,...>  Explicit GGUF model paths to benchmark",
           "",

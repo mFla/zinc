@@ -29,7 +29,6 @@ import { join, resolve } from "node:path";
 import {
   isGarbageString,
   formatElapsed,
-  extractTextFromStreamJson,
 } from "./optimize_llm_tps";
 
 // ── Color & display ──────────────────────────────────────────────────
@@ -71,7 +70,9 @@ const ZINC_HOST = process.env.ZINC_HOST ?? ENV.ZINC_HOST ?? "127.0.0.1";
 const ZINC_PORT = Number(process.env.ZINC_PORT ?? ENV.ZINC_PORT ?? "22");
 const ZINC_USER = process.env.ZINC_USER ?? ENV.ZINC_USER ?? "root";
 let REMOTE_ZINC_DIR = "/root/zinc";
-const DEFAULT_MODEL = "/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf";
+const DEFAULT_MODEL = "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -172,6 +173,7 @@ export function parseTokPerSec(output: string): number | null {
  *   Prefill GPU phases: per-tok attn=... ms moe=... ms shared=... ms ssm=... ms tail=... ms embed=... ms | totals attn=... moe=... shared=... ssm=... tail=... embed=...
  *   Prefill MoE subphases totals: router=... topk=... gate_up=... swiglu=... down=... weighted_acc=... ms
  *   Prefill SSM subphases totals: proj=... conv=... delta=... gnorm=... out=... ms
+ *   Prefill dense_ffn subphases totals: gateup=... gate=... up=... down=... ms
  */
 export type PrefillPhaseBudget = {
   // Per-token averages in milliseconds (one sample = one prompt token).
@@ -182,6 +184,8 @@ export type PrefillPhaseBudget = {
   moeTotalsMs: Record<string, number>;
   // SSM sub-bucket totals in milliseconds.
   ssmTotalsMs: Record<string, number>;
+  // Dense FFN sub-bucket totals in milliseconds.
+  denseTotalsMs?: Record<string, number>;
   // Cached "biggest top-level bucket" name for quick prompt inclusion.
   biggestBucket: { name: string; totalMs: number } | null;
 };
@@ -216,6 +220,14 @@ export function parsePrefillPhaseBudget(output: string): PrefillPhaseBudget | nu
     }
   }
 
+  const denseLine = cleaned.match(/Prefill dense_ffn subphases totals:\s*([^\n]+)/i);
+  const denseTotalsMs: Record<string, number> = {};
+  if (denseLine) {
+    for (const [, name, value] of denseLine[1].matchAll(/([a-z_]+)\s*=\s*(\d+\.?\d*)/gi)) {
+      denseTotalsMs[name.toLowerCase()] = parseFloat(value);
+    }
+  }
+
   let biggestBucket: { name: string; totalMs: number } | null = null;
   for (const [name, value] of Object.entries(totalsMs)) {
     // "embed" is tiny and not a real optimization target; skip.
@@ -225,7 +237,7 @@ export function parsePrefillPhaseBudget(output: string): PrefillPhaseBudget | nu
     }
   }
 
-  return { perTokenMs, totalsMs, moeTotalsMs, ssmTotalsMs, biggestBucket };
+  return { perTokenMs, totalsMs, moeTotalsMs, ssmTotalsMs, denseTotalsMs, biggestBucket };
 }
 
 /** Parse number of tokens generated from ZINC output. */
@@ -456,14 +468,19 @@ async function remoteTest(): Promise<{ passed: boolean; output: string }> {
     ],
     { streamOutput: false, timeout: 120_000 },
   );
-  const testPassed = stdout.match(/(\d+)\/\d+ tests passed/);
+  const out = stdout + "\n" + stderr;
+  const testPassed = out.match(/(\d+)\/\d+\s+tests\s+passed/i);
+  const skipped = out.match(/(\d+)\s+skipped/i);
   if (testPassed) {
-    console.log(clr("2", `  ✅ ${testPassed[0]}`));
+    const suffix = skipped ? `; ${skipped[0]}` : "";
+    const color = exitCode === 0 ? "2" : "1;31";
+    const marker = exitCode === 0 ? "✅" : "⚠";
+    console.log(clr(color, `  ${marker} ${testPassed[0]}${suffix}`));
   }
   if (exitCode !== 0) {
     console.log(clr("1;31", "  ❌ Tests failed!"));
   }
-  return { passed: exitCode === 0, output: stdout + "\n" + stderr };
+  return { passed: exitCode === 0, output: out };
 }
 
 async function remoteRun(
@@ -604,7 +621,7 @@ function coerceDisplayText(value: unknown): string {
   }
   if (typeof value === "object") {
     const r = value as Record<string, unknown>;
-    const parts = [r.text, r.message, r.output, r.stdout, r.stderr, r.content, r.result]
+    const parts = [r.text, r.message, r.output, r.stdout, r.stderr, r.content, r.result, r.output_text]
       .map((e) => coerceDisplayText(e)).filter((e) => e.trim());
     if (parts.length > 0) return parts.join("\n");
     try { return JSON.stringify(r, null, 2); } catch { return ""; }
@@ -709,6 +726,81 @@ function buildClaudeArgs(prompt: string): string[] {
   ];
 }
 
+function buildCodexArgs(prompt: string): string[] {
+  return [
+    "exec",
+    "-c",
+    `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
+    "--skip-git-repo-check",
+    "--json",
+    "--color", "never",
+    "--sandbox", "workspace-write",
+    "--cd", REPO_ROOT,
+    "--model", CODEX_MODEL,
+    prompt,
+  ];
+}
+
+function formatCodexStreamLine(rawLine: string): string | null {
+  if (!rawLine.trim()) return null;
+  let event: Record<string, unknown>;
+  try {
+    event = JSON.parse(rawLine) as Record<string, unknown>;
+  } catch {
+    return rawLine.trim().startsWith("@@@") ? `${clr("96", rawLine.trim())}\n` : null;
+  }
+
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type === "error") {
+    const text = coerceDisplayText(event.message ?? event.content);
+    return text ? `${clr("31", text)}\n` : null;
+  }
+  if (type === "item.completed") {
+    const item = event.item as Record<string, unknown> | undefined;
+    if (item?.type === "agent_message") {
+      const text = coerceDisplayText(item.text ?? item.message ?? item.output_text ?? item.content);
+      return text ? `${clr("96", text)}\n` : null;
+    }
+    if (item?.type === "reasoning") {
+      const text = coerceDisplayText(item.summary ?? item.text ?? item.message ?? item.content);
+      return text ? `${clr("2", `thinking: ${text}`)}\n` : null;
+    }
+  }
+  return null;
+}
+
+function extractAgentText(stdout: string): string {
+  const texts: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      const type = event.type;
+      if (type === "assistant") {
+        const content = (event.message as Record<string, unknown> | undefined)?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            const text = (block as Record<string, unknown>)?.text;
+            if (typeof text === "string" && text.trim()) texts.push(text);
+          }
+        }
+      } else if (type === "message" || type === "agent") {
+        const text = coerceDisplayText(event.content ?? event.message);
+        if (text.trim()) texts.push(text);
+      } else if (type === "item.completed") {
+        const item = event.item as Record<string, unknown> | undefined;
+        if (item?.type === "agent_message") {
+          const text = coerceDisplayText(item.text ?? item.message ?? item.output_text ?? item.content);
+          if (text.trim()) texts.push(text);
+        }
+      }
+    } catch {
+      if (line.trim().startsWith("@@@")) texts.push(line.trim());
+    }
+  }
+  return texts.join("\n");
+}
+
 async function runAgent(
   agent: AgentKind,
   prompt: string,
@@ -743,11 +835,18 @@ async function runAgent(
     sawTextDeltaInCurrentMessage: false,
   };
 
-  const result = await runCommand("claude", buildClaudeArgs(prompt), {
-    streamOutput: true,
-    timeout: 900_000, // 15 min max per agent call
-    stdoutLineFormatter: (line) => formatClaudeStreamLine(line, claudeState),
-  });
+  const result =
+    agent === "codex"
+      ? await runCommand("codex", buildCodexArgs(prompt), {
+          streamOutput: true,
+          timeout: 900_000, // 15 min max per agent call
+          stdoutLineFormatter: formatCodexStreamLine,
+        })
+      : await runCommand("claude", buildClaudeArgs(prompt), {
+          streamOutput: true,
+          timeout: 900_000, // 15 min max per agent call
+          stdoutLineFormatter: (line) => formatClaudeStreamLine(line, claudeState),
+        });
 
   clearInterval(heartbeat);
   console.log(clr("1;36", SEP));
@@ -846,7 +945,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
       diagnosis.push("");
       diagnosis.push("⚠ CRITICAL: Output is GARBAGE — decoded text contains no recognizable words.");
       diagnosis.push("  The forward pass is executing but producing incorrect values.");
-      diagnosis.push("  Common causes for this Qwen3.5 hybrid (attention+SSM+MoE) model:");
+      diagnosis.push("  Common causes for this Qwen3.6 hybrid (attention+SSM+MoE) model:");
       diagnosis.push("  - Q/K/V split from fused attn_q.weight is wrong (Q includes gate, needs proper stride extraction)");
       diagnosis.push("  - RoPE freq_base or section dimensions incorrect");
       diagnosis.push("  - Flash attention shader bugs (scaling, causal mask, GQA head mapping)");
@@ -900,7 +999,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   }
 
   diagnosis.push("");
-  diagnosis.push("## Forward Pass Architecture (Qwen3.5-35B-A3B = hybrid attention+SSM+MoE)");
+  diagnosis.push("## Forward Pass Architecture (Qwen3.6-35B-A3B = hybrid attention+SSM+MoE)");
   diagnosis.push("- 40 layers: every 4th (3,7,11,...,39) is full attention, rest are SSM/delta-net");
   diagnosis.push("- Full attention layers: separate attn_q/k/v + Q/K norm + IMRoPE (64/256 dims) + flash attention + sigmoid gate + output proj");
   diagnosis.push("- SSM layers: TWO PATHS available (selected at runtime by pipeline availability):");
@@ -967,7 +1066,7 @@ function buildPrompt(state: RunState, lastResult: BuildRunResult): string {
   diagnosis.push("- Enabling GPU SSM without swiglu_buf size fix — buffer overflow, wrong output (fixed)");
   diagnosis.push("");
   diagnosis.push("## REFERENCE: llama.cpp implementation");
-  diagnosis.push("On the remote node, the full Qwen3.5-MoE implementation is at:");
+  diagnosis.push("On the remote node, the full Qwen3.6-MoE implementation is at:");
   diagnosis.push("  /root/llama.cpp/src/models/qwen35moe.cpp — build_layer_attn, build_layer_attn_linear, build_layer_ffn");
   diagnosis.push("  /root/llama.cpp/src/models/delta-net-base.cpp — build_delta_net_autoregressive");
   diagnosis.push("You can read these files via SSH to understand the correct computation flow.");
@@ -1201,7 +1300,7 @@ async function runCycle(
   await writeFile(join(cycleDir, "agent_stderr.txt"), agentResult.stderr);
 
   // Extract agent output markers
-  const assembledText = extractTextFromStreamJson(agentResult.stdout);
+  const assembledText = extractAgentText(agentResult.stdout);
   const lastChars = assembledText.slice(-3000);
 
   const descMatch =
@@ -1502,7 +1601,7 @@ async function runCycle(
 async function main() {
   const rawArgs = process.argv.slice(2);
   let maxCycles = Infinity;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let modelPath = DEFAULT_MODEL;
   let dryRun = false;
   let resumeDir: string | undefined;
@@ -1534,7 +1633,7 @@ async function main() {
             "Usage: bun loops/optimize_zinc.ts [options]",
             "",
             "Options:",
-            "  --agent <claude|codex>   Agent to use (default: claude)",
+            "  --agent <claude|codex>   Agent to use (default: codex)",
             "  --cycles N               Max cycles (default: infinite)",
             "  --model-path <path>      GGUF model path on remote node",
             "  --dry-run                Build+run only, no agent",

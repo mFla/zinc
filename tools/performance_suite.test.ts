@@ -4,12 +4,16 @@ import {
   buildArtifact,
   buildComparison,
   buildMeasurementPhases,
+  benchmarkFailureReason,
   canonicalModelIdFromPath,
+  compareModelsByName,
   detectRdnaServerStartupFailure,
   DEFAULT_LOCAL_MODEL_ROOT,
+  defaultIntelCases,
   defaultMetalCases,
   defaultMaxTokensForModelId,
   defaultPromptForModelId,
+  defaultRdnaCases,
   defaultScenarioDefsForModel,
   guessFamily,
   localZincCommand,
@@ -21,6 +25,7 @@ import {
   parseOpenAiCompletionOutput,
   parseZincCliOutput,
   prefersChatPrompt,
+  intelZincCommand,
   rdnaZincCommand,
   resolveLocalLlamaServer,
   summarizeValues,
@@ -35,11 +40,13 @@ test("parseArgs reads suite options", () => {
     "--warmup",
     "2",
     "--models",
-    "gemma4-12b-q4k-m,qwen3-8b-q4k-m",
+    "gemma4-26b-a4b-q4k-m,qwen35-9b-q4k-m",
     "--llama-cli",
     "/tmp/llama-cli",
     "--llama-server",
     "/tmp/llama-server",
+    "--phase",
+    "zinc",
     "--no-site-write",
   ]);
 
@@ -48,8 +55,36 @@ test("parseArgs reads suite options", () => {
   expect(args.warmupRuns).toBe(2);
   expect(args.llamaCli).toBe("/tmp/llama-cli");
   expect(args.llamaServer).toBe("/tmp/llama-server");
+  expect(args.phase).toBe("zinc");
   expect(args.writeSiteData).toBe(false);
-  expect(args.models && [...args.models]).toEqual(["gemma4-12b-q4k-m", "qwen3-8b-q4k-m"]);
+  expect(args.models && [...args.models]).toEqual(["gemma4-26b-a4b-q4k-m", "qwen35-9b-q4k-m"]);
+});
+
+test("parseArgs reads Intel suite options", () => {
+  const args = parseArgs([
+    "--target",
+    "intel",
+    "--intel-sync",
+    "--intel-build",
+    "--intel-start-llama",
+    "--intel-model-root",
+    "/home/tempuser/.cache/zinc/models/models",
+    "--intel-workdir",
+    "/home/tempuser/zinc-intel-loop",
+    "--intel-xdg-cache-home",
+    "/home/tempuser/.cache",
+    "--intel-remote-libc-conf",
+    "/workspace/zinc/.build-support/libc.conf",
+  ]);
+
+  expect(args.target).toBe("intel");
+  expect(args.intelSync).toBe(true);
+  expect(args.intelBuild).toBe(true);
+  expect(args.intelStartLlama).toBe(true);
+  expect(args.intelModelRoot).toBe("/home/tempuser/.cache/zinc/models/models");
+  expect(args.intelWorkdir).toBe("/home/tempuser/zinc-intel-loop");
+  expect(args.intelXdgCacheHome).toBe("/home/tempuser/.cache");
+  expect(args.intelRemoteLibcConf).toBe("/workspace/zinc/.build-support/libc.conf");
 });
 
 test("parseArgs enables discovery mode", () => {
@@ -68,41 +103,63 @@ test("resolveLocalLlamaServer prefers explicit path, then PATH, then docker fall
   expect(resolveLocalLlamaServer({ llamaServer: null }, null, "/tmp/docker")).toBe("/tmp/docker");
 });
 
-test("GPT-OSS uses the chat prompt path in the performance suite", () => {
-  expect(prefersChatPrompt("gpt-oss-20b-q4k-m")).toBe(true);
-  expect(defaultPromptForModelId("gpt-oss-20b-q4k-m")).toBe("What is the capital of France? Answer in one word.");
-  expect(defaultMaxTokensForModelId("gpt-oss-20b-q4k-m")).toBe(48);
-  expect(prefersChatPrompt("qwen3-8b-q4k-m")).toBe(false);
-  expect(defaultPromptForModelId("qwen3-8b-q4k-m")).toBe("The capital of France is");
-  expect(defaultMaxTokensForModelId("qwen3-8b-q4k-m")).toBe(8);
+test("Gemma uses the chat prompt path in the performance suite", () => {
+  expect(prefersChatPrompt("gemma4-26b-a4b-q4k-m")).toBe(true);
+  expect(defaultPromptForModelId("gemma4-26b-a4b-q4k-m")).toContain("benchmark screenshots");
+  expect(defaultMaxTokensForModelId("gemma4-26b-a4b-q4k-m")).toBe(96);
+  expect(prefersChatPrompt("qwen35-9b-q4k-m")).toBe(false);
+  expect(defaultPromptForModelId("qwen35-9b-q4k-m")).toContain("Developer question");
+  expect(defaultMaxTokensForModelId("qwen35-9b-q4k-m")).toBe(96);
 });
 
-test("default Metal cases use managed cache ids and include Qwen 3.5 and Qwen 3.6", () => {
+test("default Metal cases use managed cache ids and include Qwen 3.6", () => {
   const cases = defaultMetalCases("/tmp/models");
-  const qwen35 = cases.find((entry) => entry.id === "qwen35-35b-a3b-q4k-xl");
-  expect(qwen35?.model_id).toBe("qwen35-35b-a3b-q4k-xl");
-  expect(qwen35?.model_path).toBe("/tmp/models/qwen35-35b-a3b-q4k-xl/model.gguf");
 
   const qwen36 = cases.find((entry) => entry.id === "qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_id).toBe("qwen36-35b-a3b-q4k-xl");
   expect(qwen36?.model_path).toBe("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf");
+
+  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+  expect(qwen36Dense?.model_id).toBe("qwen36-27b-q4k-m");
+  expect(qwen36Dense?.model_path).toBe("/tmp/models/qwen36-27b-q4k-m/model.gguf");
+});
+
+test("default RDNA cases include Qwen 3.6 27B dense", () => {
+  const cases = defaultRdnaCases("/root/models");
+  const qwen36Dense = cases.find((entry) => entry.id === "qwen36-27b-q4k-m");
+
+  expect(qwen36Dense?.model_path).toBe("/root/models/Qwen3.6-27B-Q4_K_M.gguf");
+  expect(qwen36Dense?.prompt_mode).toBe("raw");
+  expect(qwen36Dense?.prompt).toContain("Developer question");
+  expect(qwen36Dense?.max_tokens).toBe(96);
+});
+
+test("default Intel cases use the remote managed cache layout", () => {
+  const cases = defaultIntelCases("/remote/cache");
+  const qwen = cases.find((entry) => entry.id === "qwen35-9b-q4k-m");
+
+  expect(qwen?.model_path).toBe("/remote/cache/qwen35-9b-q4k-m/model.gguf");
+  expect(qwen?.prompt_mode).toBe("raw");
 });
 
 test("performance suite canonicalizes and labels Qwen 3.6 GGUFs", () => {
   expect(canonicalModelIdFromPath("/tmp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
+  expect(canonicalModelIdFromPath("/tmp/Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
+  expect(canonicalModelIdFromPath("/tmp/Qwen_Qwen3.6-27B-Q4_K_M.gguf")).toBe("qwen36-27b-q4k-m");
   expect(canonicalModelIdFromPath("/tmp/models/qwen36-35b-a3b-q4k-xl/model.gguf")).toBe("qwen36-35b-a3b-q4k-xl");
   expect(guessFamily("qwen36-35b-a3b-q4k-xl")).toBe("Qwen 3.6");
+  expect(guessFamily("qwen36-27b-q4k-m")).toBe("Qwen 3.6");
 });
 
 test("local ZINC command prefers managed model ids when using the default cache", () => {
   const cmd = localZincCommand({
-    model_id: "qwen3-8b-q4k-m",
-    model_path: `${DEFAULT_LOCAL_MODEL_ROOT}/qwen3-8b-q4k-m/model.gguf`,
+    model_id: "qwen35-9b-q4k-m",
+    model_path: `${DEFAULT_LOCAL_MODEL_ROOT}/qwen35-9b-q4k-m/model.gguf`,
     prompt_mode: "raw",
     prompt: "The capital of France is",
     max_tokens: 8,
   });
-  expect(cmd).toContain("--model-id qwen3-8b-q4k-m");
+  expect(cmd).toContain("--model-id qwen35-9b-q4k-m");
   expect(cmd).not.toContain(" -m ");
 });
 
@@ -124,6 +181,26 @@ test("RDNA ZINC command preserves chat prompt mode", () => {
   expect(cmd).toContain("--prompt");
 });
 
+test("Intel ZINC command does not inject RDNA-specific environment", () => {
+  const cmd = intelZincCommand({
+    model_path: "/home/tempuser/.cache/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
+    prompt_mode: "raw",
+    prompt: "The capital of France is",
+    max_tokens: 8,
+  }, {
+    host: "intel.local",
+    user: "tempuser",
+    port: "8888",
+    workdir: "/home/tempuser/zinc",
+    env: {},
+  });
+
+  expect(cmd).toContain("tempuser@intel.local");
+  expect(cmd).toContain("./zig-out/bin/zinc");
+  expect(cmd).not.toContain("RADV_PERFTEST");
+  expect(cmd).not.toContain("--chat");
+});
+
 test("RDNA startup failure detection spots unsupported model architecture logs", () => {
   const failure = detectRdnaServerStartupFailure(`
 llama_model_load: error loading model: error loading model architecture: unknown model architecture: 'gemma4'
@@ -135,18 +212,29 @@ main: exiting due to model loading error
   expect(detectRdnaServerStartupFailure("server ready")).toBeNull();
 });
 
-test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {
-  const qwen = defaultScenarioDefsForModel("qwen3-8b-q4k-m", "raw", "The capital of France is");
-  expect(qwen.map((scenario) => scenario.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
-  expect(qwen[1]?.prompt).not.toBe(qwen[0]?.prompt);
-  expect(qwen[3]?.max_tokens).toBe(32);
+test("benchmark failure reasons do not publish shell commands", () => {
+  const error = new Error("Command failed (1): remote benchmark command with private args\nprivate details");
+  expect(benchmarkFailureReason("ZINC run failed", error)).toBe("ZINC run failed: command exited unsuccessfully (1).");
+  const diagnostic = new Error("Command failed (1): remote benchmark command with private args\nerr(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("ZINC run failed", diagnostic)).toBe("ZINC run failed: err(zinc): Failed to init inference engine: QueueSubmitFailed");
+  expect(benchmarkFailureReason("Intel baseline failed", new Error("Remote server failed to start"))).toBe("Intel baseline failed: Remote server failed to start");
+});
 
-  const gptoss = defaultScenarioDefsForModel("gpt-oss-20b-q4k-m", "chat", "What is the capital of France? Answer in one word.");
-  expect(gptoss[3]?.max_tokens).toBe(96);
+test("benchmark suite uses a multi-scenario matrix instead of a single prompt", () => {
+  const qwen = defaultScenarioDefsForModel("qwen35-9b-q4k-m", "raw", defaultPromptForModelId("qwen35-9b-q4k-m"));
+  expect(qwen.map((scenario) => scenario.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
+  expect(qwen.map((scenario) => scenario.label)).toEqual(["Quick Chat", "Coding Review", "Incident Context", "Long Coding Draft"]);
+  expect(qwen[1]?.prompt).not.toBe(qwen[0]?.prompt);
+  expect(qwen[1]?.prompt).toContain("src/cache.ts");
+  expect(qwen[1]?.max_tokens).toBe(160);
+  expect(qwen[2]?.prompt).toContain("Incident notes");
+  expect(qwen[2]?.max_tokens).toBe(128);
+  expect(qwen[3]?.prompt).toContain("stable benchmark preset");
+  expect(qwen[3]?.max_tokens).toBe(256);
 });
 
 test("benchmark suite measures all ZINC scenarios before starting baselines", () => {
-  const phases = buildMeasurementPhases("qwen35-35b-a3b-q4k-xl", "raw", "The capital of France is");
+  const phases = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is");
   expect(phases.map((phase) => phase.phase)).toEqual([
     "zinc",
     "zinc",
@@ -159,6 +247,14 @@ test("benchmark suite measures all ZINC scenarios before starting baselines", ()
   ]);
   expect(phases.slice(0, 4).map((phase) => phase.scenarioDef.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
   expect(phases.slice(4).map((phase) => phase.scenarioDef.id)).toEqual(["core", "context-medium", "context-long", "decode-extended"]);
+});
+
+test("benchmark suite can split ZINC and baseline phases for clean reboot runs", () => {
+  const zincOnly = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is", "zinc");
+  expect(zincOnly.map((phase) => phase.phase)).toEqual(["zinc", "zinc", "zinc", "zinc"]);
+
+  const baselineOnly = buildMeasurementPhases("qwen36-35b-a3b-q4k-xl", "raw", "The capital of France is", "baseline");
+  expect(baselineOnly.map((phase) => phase.phase)).toEqual(["baseline", "baseline", "baseline", "baseline"]);
 });
 
 test("parseDotEnv handles export lines and quotes", () => {
@@ -278,6 +374,8 @@ test("buildComparison adds prompt and latency deltas", () => {
   const comparison = buildComparison(
     {
       name: "ZINC",
+      prompt_tokens: 10,
+      generated_tokens: 20,
       prefill_tps: { median: 50, avg: 50 },
       decode_tps: { median: 40, avg: 40 },
       total_latency_ms: { median: 2500, avg: 2500 },
@@ -285,6 +383,8 @@ test("buildComparison adds prompt and latency deltas", () => {
     },
     {
       name: "llama.cpp",
+      prompt_tokens: 10,
+      generated_tokens: 20,
       prefill_tps: { median: 100, avg: 100 },
       decode_tps: { median: 80, avg: 80 },
       total_latency_ms: { median: 2000, avg: 2000 },
@@ -298,6 +398,10 @@ test("buildComparison adds prompt and latency deltas", () => {
   expect(comparison?.latency_delta_ms).toBe(500);
   expect(comparison?.end_to_end_pct_of_baseline).toBe(50);
   expect(comparison?.end_to_end_delta_tps).toBe(-30);
+  expect(comparison?.overall_pct_of_baseline).toBe(50);
+  expect(comparison?.zinc_overall_tps).toBeCloseTo(42.857, 3);
+  expect(comparison?.baseline_overall_tps).toBeCloseTo(85.714, 3);
+  expect(comparison?.overall_delta_tps).toBeCloseTo(-42.857, 3);
 });
 
 test("mergeArtifacts replaces matching targets and preserves others", () => {
@@ -351,6 +455,24 @@ test("mergeArtifacts replaces matching targets and preserves others", () => {
   expect(merged.targets[1].summary.fastest_model_id).toBeNull();
 });
 
+test("compareModelsByName normalizes published model label variants", () => {
+  const models = [
+    { id: "qwen36-35b-a3b-q4k-xl", label: "Qwen36 35B A3B Q4K XL" },
+    { id: "qwen36-27b-q4k-m", label: "Qwen 3.6 27B Dense Q4_K_M" },
+    { id: "qwen35-9b-q4k-m", label: "Qwen3.5 9B Q4K M" },
+    { id: "gemma4-31b-q4k-m", label: "Gemma 4 31B Q4_K_M" },
+    { id: "gemma4-26b-a4b-q4k-m", label: "Gemma 4 26B-A4B MoE Q4_K_M" },
+  ];
+
+  expect(models.sort(compareModelsByName).map((model) => model.id)).toEqual([
+    "gemma4-26b-a4b-q4k-m",
+    "gemma4-31b-q4k-m",
+    "qwen35-9b-q4k-m",
+    "qwen36-27b-q4k-m",
+    "qwen36-35b-a3b-q4k-xl",
+  ]);
+});
+
 test("mergeArtifacts replaces an existing target to avoid stale model rows", () => {
   const merged = mergeArtifacts(
     {
@@ -392,6 +514,63 @@ test("mergeArtifacts replaces an existing target to avoid stale model rows", () 
     zinc: { version: "zinc", commit: "zinc-commit" },
     llama_cpp: { binary: "llama-server", version: "42", commit: "xyz" },
   });
+});
+
+test("mergeArtifacts can preserve missing phase data for split benchmark runs", () => {
+  const merged = mergeArtifacts(
+    {
+      schema_version: 1,
+      generated_at: "old",
+      targets: [
+        {
+          id: "rdna",
+          label: "RDNA",
+          models: [
+            {
+              id: "qwen",
+              label: "Qwen",
+              zinc: { name: "ZINC", decode_tps: { median: 120, avg: 120 } },
+              baseline: null,
+              scenarios: [
+                {
+                  id: "core",
+                  label: "Core Prompt",
+                  zinc: { name: "ZINC", decode_tps: { median: 120, avg: 120 } },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    [
+      {
+        id: "rdna",
+        label: "RDNA",
+        models: [
+          {
+            id: "qwen",
+            label: "Qwen",
+            baseline: { name: "llama.cpp", decode_tps: { median: 100, avg: 100 } },
+            scenarios: [
+              {
+                id: "core",
+                label: "Core Prompt",
+                baseline: { name: "llama.cpp", decode_tps: { median: 100, avg: 100 } },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    { preserveMissingPhases: true },
+  );
+
+  const model = merged.targets[0]?.models[0];
+  expect(model?.zinc?.decode_tps.median).toBe(120);
+  expect(model?.baseline?.decode_tps.median).toBe(100);
+  expect(model?.comparison?.pct_of_baseline).toBe(120);
+  expect(model?.scenarios[0]?.comparison?.pct_of_baseline).toBe(120);
 });
 
 test("buildArtifact writes only the incoming targets", () => {

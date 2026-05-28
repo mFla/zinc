@@ -25,6 +25,8 @@ pub const DeviceCapabilities = struct {
     compute_full_subgroups: bool = false,
     /// Shader stages that accept `requiredSubgroupSize`.
     required_subgroup_size_stages: vk.c.VkShaderStageFlags = 0,
+    /// Default subgroup width used when no required subgroup size is requested.
+    default_subgroup_size: u32 = 0,
     /// Minimum supported subgroup width.
     min_subgroup_size: u32 = 0,
     /// Maximum supported subgroup width.
@@ -39,6 +41,8 @@ pub const DeviceCapabilities = struct {
     cooperative_matrix: bool = false,
     /// Push descriptors are supported by the device extension list.
     push_descriptor: bool = false,
+    /// VK_EXT_memory_budget is supported and enabled.
+    memory_budget: bool = false,
 
     /// Return whether a compute shader can request the given subgroup size.
     pub fn supportsRequiredSubgroupSize(self: DeviceCapabilities, size: u32) bool {
@@ -143,7 +147,8 @@ pub const Instance = struct {
         const dev_name = std.mem.sliceTo(&device_props.deviceName, 0);
         log.debug("Selected GPU {d}: {s}", .{ dev_idx, dev_name });
         if (device_caps.subgroup_size_control) {
-            log.debug("Subgroup size control enabled: {d}-{d}", .{
+            log.debug("Subgroup size control enabled: default {d}, range {d}-{d}", .{
+                device_caps.default_subgroup_size,
                 device_caps.min_subgroup_size,
                 device_caps.max_subgroup_size,
             });
@@ -194,7 +199,7 @@ pub const Instance = struct {
             .pQueuePriorities = &queue_priority,
         };
 
-        var enabled_extensions: [2][*:0]const u8 = undefined;
+        var enabled_extensions: [3][*:0]const u8 = undefined;
         var enabled_extension_count: u32 = 0;
         if (device_caps.cooperative_matrix) {
             enabled_extensions[enabled_extension_count] = vk.c.VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
@@ -202,6 +207,10 @@ pub const Instance = struct {
         }
         if (device_caps.push_descriptor) {
             enabled_extensions[enabled_extension_count] = vk.c.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+            enabled_extension_count += 1;
+        }
+        if (device_caps.memory_budget) {
+            enabled_extensions[enabled_extension_count] = vk.c.VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
             enabled_extension_count += 1;
         }
 
@@ -319,11 +328,50 @@ pub const Instance = struct {
         return null;
     }
 
-    /// Sum the size of all device-local memory heaps exposed by the selected GPU.
-    /// @param self Active Vulkan instance and memory properties.
-    /// @returns The total number of bytes in device-local heaps.
-    /// @note Drivers may expose multiple heaps, so this is an aggregate capacity rather than a single contiguous pool.
+    /// Return the usable device-local memory budget in bytes.
+    ///
+    /// When `VK_EXT_memory_budget` is enabled, queries the driver for per-heap
+    /// budget values which reflect the actual usable VRAM (important on Intel
+    /// Arc where resizable BAR inflates the raw heap size). Otherwise falls
+    /// back to summing `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT` heap sizes.
+    ///
+    /// Honors `ZINC_VRAM_BUDGET_MB` to let users override the detected value.
     pub fn vramBytes(self: *const Instance) u64 {
+        const total = if (self.caps.memory_budget) self.queryMemoryBudget() else self.queryHeapSizes();
+        if (std.c.getenv("ZINC_VRAM_BUDGET_MB")) |raw| {
+            const budget_mb = std.fmt.parseInt(u64, std.mem.span(raw), 10) catch return total;
+            const capped = budget_mb * 1024 * 1024;
+            if (capped < total) return capped;
+        }
+        return total;
+    }
+
+    /// Query actual memory budget via VK_EXT_memory_budget.
+    fn queryMemoryBudget(self: *const Instance) u64 {
+        var budget_props = vk.c.VkPhysicalDeviceMemoryBudgetPropertiesEXT{
+            .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+            .pNext = null,
+            .heapBudget = [_]vk.c.VkDeviceSize{0} ** vk.c.VK_MAX_MEMORY_HEAPS,
+            .heapUsage = [_]vk.c.VkDeviceSize{0} ** vk.c.VK_MAX_MEMORY_HEAPS,
+        };
+        var mem_props2 = vk.c.VkPhysicalDeviceMemoryProperties2{
+            .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            .pNext = &budget_props,
+            .memoryProperties = undefined,
+        };
+        vk.c.vkGetPhysicalDeviceMemoryProperties2(self.physical_device, &mem_props2);
+
+        var total: u64 = 0;
+        for (0..self.mem_props.memoryHeapCount) |i| {
+            if (self.mem_props.memoryHeaps[i].flags & vk.c.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0) {
+                total += budget_props.heapBudget[i];
+            }
+        }
+        return total;
+    }
+
+    /// Fallback: sum raw device-local heap sizes.
+    fn queryHeapSizes(self: *const Instance) u64 {
         var total: u64 = 0;
         for (self.mem_props.memoryHeaps[0..self.mem_props.memoryHeapCount]) |heap| {
             if (heap.flags & vk.c.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0) {
@@ -348,6 +396,7 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
     const extensions = ext_props[0..ext_count];
     const coop_extension_supported = hasDeviceExtension(extensions, "VK_KHR_cooperative_matrix");
     const push_descriptor_supported = hasDeviceExtension(extensions, "VK_KHR_push_descriptor");
+    const memory_budget_supported = hasDeviceExtension(extensions, "VK_EXT_memory_budget");
 
     var subgroup_props = vk.c.VkPhysicalDeviceSubgroupSizeControlProperties{
         .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
@@ -357,9 +406,17 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .maxComputeWorkgroupSubgroups = 0,
         .requiredSubgroupSizeStages = 0,
     };
+    var subgroup_core_props = vk.c.VkPhysicalDeviceSubgroupProperties{
+        .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+        .pNext = &subgroup_props,
+        .subgroupSize = 0,
+        .supportedStages = 0,
+        .supportedOperations = 0,
+        .quadOperationsInAllStages = vk.c.VK_FALSE,
+    };
     var props2 = vk.c.VkPhysicalDeviceProperties2{
         .sType = vk.c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &subgroup_props,
+        .pNext = &subgroup_core_props,
         .properties = undefined,
     };
     vk.c.vkGetPhysicalDeviceProperties2(physical_device, &props2);
@@ -407,6 +464,7 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .subgroup_size_control = subgroup_size_control_features.subgroupSizeControl == vk.c.VK_TRUE,
         .compute_full_subgroups = subgroup_size_control_features.computeFullSubgroups == vk.c.VK_TRUE,
         .required_subgroup_size_stages = subgroup_props.requiredSubgroupSizeStages,
+        .default_subgroup_size = subgroup_core_props.subgroupSize,
         .min_subgroup_size = subgroup_props.minSubgroupSize,
         .max_subgroup_size = subgroup_props.maxSubgroupSize,
         .storage_buffer16 = storage_16bit_features.storageBuffer16BitAccess == vk.c.VK_TRUE,
@@ -414,6 +472,7 @@ fn queryDeviceCapabilities(allocator: std.mem.Allocator, physical_device: vk.c.V
         .subgroup_extended_types = subgroup_extended_types_features.shaderSubgroupExtendedTypes == vk.c.VK_TRUE,
         .cooperative_matrix = coop_extension_supported and cooperative_matrix_features.cooperativeMatrix == vk.c.VK_TRUE,
         .push_descriptor = push_descriptor_supported,
+        .memory_budget = memory_budget_supported,
     };
 }
 

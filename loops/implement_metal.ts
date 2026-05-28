@@ -4,7 +4,7 @@
  *
  * Autonomous loop that iteratively implements the Metal/Apple Silicon inference
  * backend. Each cycle:
- *   1. Build locally (zig build)
+ *   1. Build locally (zig build -Doptimize=ReleaseFast by default)
  *   2. Run unit tests (zig build test)
  *   3. Run inference with model (zinc -m model.gguf --prompt "..." -n N)
  *   4. Analyze output: build errors? test failures? correct tokens? tok/s?
@@ -45,18 +45,50 @@ const SEP = "─".repeat(64);
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const EFFORTS_DIR = resolve(REPO_ROOT, "loops", "efforts");
 const RESULTS_DIR = resolve(REPO_ROOT, ".metal_optimize");
-const MODEL_ID = process.env.ZINC_MODEL_ID ?? "qwen35-35b-a3b-q4k-xl";
+const MODEL_ID = process.env.ZINC_MODEL_ID ?? "qwen36-35b-a3b-q4k-xl";
 const MODEL_PATH = process.env.ZINC_MODEL ?? null;
-const TEST_PROMPT = "The capital of France is";
-const MAX_TOKENS = 64; // Enough tokens for stable decode throughput measurement
+const TEST_PROMPT = process.env.ZINC_TEST_PROMPT ?? "The capital of France is";
+const PROMPT_MODE = process.env.ZINC_PROMPT_MODE ?? "raw";
+export type MetricMode = "decode" | "prefill";
+const METRIC_MODE = parseMetricModeEnv("ZINC_METRIC_MODE", "decode");
+const METRIC_LABEL = METRIC_MODE === "prefill" ? "prefill tok/s" : "decode tok/s";
+const MAX_TOKENS = parsePositiveIntEnv("ZINC_MAX_TOKENS", 64); // Enough tokens for stable throughput measurement
 const REFERENCE_TEXT = "Paris"; // Expected in correct output
-const TARGET_TOK_PER_SEC = 50;
-const BENCHMARK_RUNS = 3; // Median of N inference runs for noise reduction
-const PROFILE_EVERY = 5; // Run with --profile every N cycles
+const TARGET_TOK_PER_SEC = parsePositiveFloatEnv("ZINC_TARGET_TOK_PER_SEC", 50);
+const QWEN36_PREFILL_INTERMEDIATE_TARGET = Math.max(50, TARGET_TOK_PER_SEC);
+const BENCHMARK_RUNS = parsePositiveIntEnv("ZINC_BENCHMARK_RUNS", 3); // Number of TIMED inference runs (median across them)
+// Pre-rolls discarded before any timed sample. Each fresh ZINC invocation
+// resets Metal residency + GPU clocks, so the FIRST few samples in a series
+// land cold-GPU while later samples land warm. On M1 Max for Qwen3-8B that
+// shows up as ~8.6 cold vs ~10.6 warm — a ~20% spread that masks real
+// regressions. Setting BENCHMARK_WARMUPS≥1 runs throwaway inferences first
+// so timed samples are more likely to start with a warm-ish GPU baseline.
+// Note: a process boundary still resets some state; for fully stable
+// numbers, also raise BENCHMARK_RUNS so the median rejects outliers.
+const BENCHMARK_WARMUPS = parsePositiveIntEnv("ZINC_BENCHMARK_WARMUPS", 1);
+// Trim the high and low samples before taking the median. Only fires when
+// BENCHMARK_RUNS ≥ 5, since trimming 3 samples down to 1 just picks the
+// middle anyway. Mitigates the cold/warm process-boundary noise pattern
+// without requiring zinc itself to support multi-prompt batched runs.
+const BENCHMARK_TRIM = parseBoolEnv("ZINC_BENCHMARK_TRIM", true);
+const PROFILE_EVERY = parsePositiveIntEnv("ZINC_PROFILE_EVERY", 5); // Run with --profile every N cycles
 const STALL_THRESHOLD = 5; // Cycles without tok/s improvement before studying references
+const RECENT_PROGRESS_WINDOW = 10;
+const QWEN36_PLATEAU_STALL_CYCLES = 20;
+const QWEN36_PLATEAU_WINDOW = 32;
+const TEST_TIMEOUT_MS = parsePositiveIntEnv("ZINC_TEST_TIMEOUT_MS", 120_000);
+const RUN_TIMEOUT_MS = parsePositiveIntEnv("ZINC_RUN_TIMEOUT_MS", 300_000);
+const STOP_ON_TARGET = parseBoolEnv("ZINC_STOP_ON_TARGET", true);
+const BUILD_OPTIMIZE = process.env.ZINC_BUILD_OPTIMIZE ?? "ReleaseFast";
+const LOOP_COMMIT_PATHS = ["src/", "benchmarks/", "build.zig", "build.zig.zon"];
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
+  "Bash(git fetch:*)",
+  "Bash(git merge:*)",
+  "Bash(git pull:*)",
+  "Bash(git push:*)",
+  "Bash(git rebase:*)",
   "Bash(git revert:*)",
   "Bash(git restore:*)",
   "Bash(git reset:*)",
@@ -66,17 +98,539 @@ const BLOCKED_GIT_OPS = [
 
 type AgentKind = "claude" | "codex";
 
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parsePositiveFloatEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseMetricModeEnv(name: string, fallback: MetricMode): MetricMode {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "decode" || normalized === "prefill") return normalized;
+  return fallback;
+}
+
 function zincModelArgs(): string[] {
   return MODEL_PATH ? ["-m", MODEL_PATH] : ["--model-id", MODEL_ID];
+}
+
+function zincPromptArgs(): string[] {
+  const args = ["--prompt", TEST_PROMPT];
+  if (PROMPT_MODE === "chat") args.push("--chat");
+  return args;
 }
 
 function displayModelLabel(): string {
   return MODEL_PATH ? basename(MODEL_PATH) : MODEL_ID;
 }
 
+function isGemmaRun(state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">): boolean {
+  const model = displayModelLabel().toLowerCase();
+  return model.includes("gemma") ||
+    state?.effortId === 11 ||
+    (state?.effortFile?.toLowerCase().includes("gemma") ?? false) ||
+    (state?.effortPlan?.toLowerCase().includes("gemma") ?? false);
+}
+
+function isQwen36PrefillRun(
+  state?: Pick<RunState, "effortId" | "effortFile" | "effortPlan">,
+): boolean {
+  const model = displayModelLabel().toLowerCase();
+  const effortText = [
+    state?.effortFile ?? "",
+    state?.effortPlan ?? "",
+  ].join("\n").toLowerCase();
+  const qwen36 = model.includes("qwen36-35b") ||
+    model.includes("qwen3.6") ||
+    effortText.includes("qwen36") ||
+    effortText.includes("qwen 3.6") ||
+    effortText.includes("qwen3.6");
+  const largeMoe = model.includes("35b") ||
+    effortText.includes("35b") ||
+    effortText.includes("35b-a3b");
+  const prefill = METRIC_MODE === "prefill" ||
+    state?.effortId === 16 ||
+    effortText.includes("prefill");
+  return qwen36 && largeMoe && prefill && !isGemmaRun(state);
+}
+
+function promptTrunc(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function bestAcceptedTokPerSec(state: RunState, lastResult: BuildRunResult): number | null {
+  const candidates: number[] = [];
+  if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
+    candidates.push(state.bestTokPerSec);
+  }
+  if (lastResult.strongAnswer && lastResult.tokPerSec != null && lastResult.tokPerSec > 0) {
+    candidates.push(lastResult.tokPerSec);
+  }
+  for (const c of state.cycles) {
+    if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
+      candidates.push(c.tokPerSec);
+    }
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
+function smallAcceptedProgressBand(anchorTokPerSec: number): number {
+  return Math.max(0.15, anchorTokPerSec * 0.003);
+}
+
+export function bestKeptCorrectTokPerSec(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+): number {
+  const candidates: number[] = [];
+  if (Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0) {
+    candidates.push(state.bestTokPerSec);
+  }
+  if (
+    state.currentBest?.containsReference &&
+    state.currentBest.tokPerSec != null &&
+    state.currentBest.tokPerSec > 0
+  ) {
+    candidates.push(state.currentBest.tokPerSec);
+  }
+  for (const c of state.cycles) {
+    if (c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0) {
+      candidates.push(c.tokPerSec);
+    }
+  }
+  return candidates.length > 0 ? Math.max(...candidates) : 0;
+}
+
+export function currentAcceptedTokPerSec(state: Pick<RunState, "cycles" | "currentBest" | "bestTokPerSec">): number {
+  if (
+    state.currentBest?.containsReference &&
+    state.currentBest.tokPerSec != null &&
+    state.currentBest.tokPerSec > 0
+  ) {
+    return state.currentBest.tokPerSec;
+  }
+  for (let idx = state.cycles.length - 1; idx >= 0; idx--) {
+    const cycle = state.cycles[idx];
+    if (cycle.kept && cycle.containsReference && cycle.tokPerSec != null && cycle.tokPerSec > 0) {
+      return cycle.tokPerSec;
+    }
+  }
+  return Number.isFinite(state.bestTokPerSec) && state.bestTokPerSec > 0 ? state.bestTokPerSec : 0;
+}
+
+function correctResultTokPerSec(result: Pick<BuildRunResult, "containsReference" | "tokPerSec">): number {
+  return result.containsReference && result.tokPerSec != null && result.tokPerSec > 0 ? result.tokPerSec : 0;
+}
+
+export function keepBaselinesForCycle(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  cycleBaseline: Pick<BuildRunResult, "containsReference" | "tokPerSec">,
+): { bestTokPerSec: number; acceptedTokPerSec: number } {
+  const measuredBaseline = correctResultTokPerSec(cycleBaseline);
+  const bestTokPerSec = Math.max(bestKeptCorrectTokPerSec(state), measuredBaseline);
+  const acceptedTokPerSec = Math.max(currentAcceptedTokPerSec(state), measuredBaseline);
+  return { bestTokPerSec, acceptedTokPerSec };
+}
+
+function normalizeStateBestTokPerSec(state: RunState): void {
+  state.bestTokPerSec = Math.max(state.bestTokPerSec, bestKeptCorrectTokPerSec(state));
+}
+
+export function recentAcceptedProgress(
+  state: Pick<RunState, "cycles" | "bestTokPerSec" | "currentBest">,
+  window = RECENT_PROGRESS_WINDOW,
+): { start: number; end: number; delta: number; threshold: number; hasProgress: boolean } {
+  const recent = state.cycles.slice(-window);
+  if (recent.length === 0) {
+    const current = currentAcceptedTokPerSec(state);
+    const threshold = smallAcceptedProgressBand(current);
+    return { start: current, end: current, delta: 0, threshold, hasProgress: false };
+  }
+
+  const priorKept = state.cycles
+    .slice(0, -recent.length)
+    .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
+    .map(c => c.tokPerSec!);
+  const recentKept = recent
+    .filter(c => c.kept && c.containsReference && c.tokPerSec != null && c.tokPerSec > 0)
+    .map(c => c.tokPerSec!);
+
+  const start = priorKept.length > 0
+    ? Math.max(...priorKept)
+    : (recentKept.length > 0 ? recentKept[0] : currentAcceptedTokPerSec(state));
+  const endCandidates = [...recentKept];
+  const current = currentAcceptedTokPerSec(state);
+  if (current > 0) endCandidates.push(current);
+  const end = endCandidates.length > 0 ? Math.max(start, ...endCandidates) : start;
+  const delta = end - start;
+  const threshold = smallAcceptedProgressBand(start > 0 ? start : end);
+  return { start, end, delta, threshold, hasProgress: delta >= threshold };
+}
+
+function highestMatchingCycle(
+  cycles: CycleResult[],
+  predicate: (cycle: CycleResult) => boolean,
+): CycleResult | null {
+  let best: CycleResult | null = null;
+  for (const cycle of cycles) {
+    if (!predicate(cycle) || cycle.tokPerSec == null) continue;
+    if (best == null || (cycle.tokPerSec ?? 0) > (best.tokPerSec ?? 0)) {
+      best = cycle;
+    }
+  }
+  return best;
+}
+
+function cycleSummary(cycle: CycleResult): string {
+  const rate = cycle.tokPerSec == null ? "" : ` (${cycle.tokPerSec.toFixed(1)} tok/s)`;
+  return `cycle ${cycle.cycle}: ${promptTrunc(cycle.description, 118)}${rate}`;
+}
+
+type ProfileEntry = { name: string; value: number };
+
+function profileSection(line: string, marker: string): string | null {
+  const idx = line.toLowerCase().indexOf(marker.toLowerCase());
+  if (idx < 0) return null;
+  return line.slice(idx + marker.length);
+}
+
+function parseGibEntries(section: string): ProfileEntry[] {
+  const entries: ProfileEntry[] = [];
+  const re = /\b([A-Za-z][A-Za-z0-9_-]*)\s+([0-9]+(?:\.[0-9]+)?)\s+GiB\b/g;
+  for (const match of section.matchAll(re)) {
+    entries.push({ name: match[1], value: Number.parseFloat(match[2]) });
+  }
+  return entries.sort((a, b) => b.value - a.value);
+}
+
+function parseNumericEntries(section: string): ProfileEntry[] {
+  const entries: ProfileEntry[] = [];
+  const re = /\b([A-Za-z][A-Za-z0-9_-]*)\s+([0-9]+(?:\.[0-9]+)?)\b/g;
+  for (const match of section.matchAll(re)) {
+    entries.push({ name: match[1], value: Number.parseFloat(match[2]) });
+  }
+  return entries.sort((a, b) => b.value - a.value);
+}
+
+function formatProfileEntries(entries: ProfileEntry[], unit: string, max = 5): string {
+  return entries
+    .slice(0, max)
+    .map(e => `${e.name}=${e.value.toFixed(2)}${unit}`)
+    .join(", ");
+}
+
+function cycleTags(cycle: Pick<CycleResult, "description" | "selfAnalysis" | "nextIdeas">): string[] {
+  const text = [
+    cycle.description,
+    cycle.selfAnalysis,
+    ...cycle.nextIdeas,
+  ].join("\n").toLowerCase();
+  const tags: string[] = [];
+  if (/shader|kernel|threadgroup|simd|tg128|metal/.test(text)) tags.push("shader");
+  if (/dispatch|command|encoder|barrier|commit|batch|launch/.test(text)) tags.push("dispatch");
+  if (/buffer|alloc|pool|reuse|memory|private|repack/.test(text)) tags.push("memory");
+  if (/fuse|fusion|merged|combined/.test(text)) tags.push("fusion");
+  if (/moe|expert|router|topk|route.?pack|shared.?gate/.test(text)) tags.push("moe");
+  if (/attention|flash|kv.?cache|rope/.test(text)) tags.push("attention");
+  if (/ssm|delta|conv|gated.?norm|q8/.test(text)) tags.push("ssm");
+  if (/half|float16|bfloat|bf16|f16/.test(text)) tags.push("precision");
+  if (tags.length === 0) tags.push("other");
+  return tags;
+}
+
+function categoryCounts(cycles: CycleResult[]): Array<[string, { kept: number; reverted: number }]> {
+  const categories: Record<string, { kept: number; reverted: number }> = {};
+  for (const c of cycles) {
+    for (const tag of cycleTags(c)) {
+      if (!categories[tag]) categories[tag] = { kept: 0, reverted: 0 };
+      if (c.kept) categories[tag].kept++;
+      else categories[tag].reverted++;
+    }
+  }
+  return Object.entries(categories).sort((a, b) => {
+    const aTotal = a[1].kept + a[1].reverted;
+    const bTotal = b[1].kept + b[1].reverted;
+    return bTotal - aTotal || b[1].kept - a[1].kept;
+  });
+}
+
+function isRoutePackOrSharedGateWork(cycle: CycleResult): boolean {
+  const text = [
+    cycle.description,
+    cycle.selfAnalysis,
+    cycle.outputText,
+    ...cycle.nextIdeas,
+  ].join("\n").toLowerCase();
+  return /route.?pack|shared.?gate|f32 shared|materialized.*gate|validator.*logit/.test(text);
+}
+
+function recentRoutePackCooldown(state: RunState): { active: boolean; count: number; window: number } {
+  const window = 8;
+  const recent = state.cycles.slice(-window);
+  const count = recent.filter(c => !c.kept && isRoutePackOrSharedGateWork(c)).length;
+  return { active: count >= 2, count, window };
+}
+
+export function buildQwen36PrefillPlateauAnalysis(state: RunState): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+  if (state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return [];
+
+  const recent = state.cycles.slice(-QWEN36_PLATEAU_WINDOW);
+  if (recent.length === 0) return [];
+
+  const keptCorrect = state.cycles.filter(c => c.kept && c.containsReference && c.tokPerSec != null);
+  const recentKeptCorrect = recent.filter(c => c.kept && c.containsReference && c.tokPerSec != null);
+  const overallBest = keptCorrect.length > 0
+    ? Math.max(...keptCorrect.map(c => c.tokPerSec!))
+    : bestKeptCorrectTokPerSec(state);
+  const recentBest = recentKeptCorrect.length > 0
+    ? Math.max(...recentKeptCorrect.map(c => c.tokPerSec!))
+    : 0;
+  const current = currentAcceptedTokPerSec(state);
+  const topRecent = [...recentKeptCorrect]
+    .sort((a, b) => (b.tokPerSec ?? 0) - (a.tokPerSec ?? 0))
+    .slice(0, 3);
+  const q8Retunes = recent.filter(c =>
+    /q8|repack|fixed.?k|k=2048|k=4096|tg128|threadgroup/i.test(`${c.description}\n${c.selfAnalysis}`)
+  );
+  const neutralKept = recent.filter(c =>
+    c.kept &&
+    c.containsReference &&
+    c.tokPerSec != null &&
+    overallBest > 0 &&
+    c.tokPerSec <= overallBest + 0.05
+  );
+  const categoryLine = categoryCounts(recent)
+    .slice(0, 5)
+    .map(([tag, stats]) => `${tag}=${stats.kept} kept/${stats.reverted} reverted`)
+    .join(", ");
+
+  const lines = [
+    "## Qwen3.6 35B Prefill Plateau Analysis",
+    `- PLATEAU MODE: ${state.stalledCycles} cycles without promoted-best improvement. Last ${recent.length} cycles: ${recent.filter(c => c.kept).length} kept, ${recent.filter(c => !c.kept).length} reverted; recent best ${recentBest.toFixed(1)} ${METRIC_LABEL}, overall best ${overallBest.toFixed(1)}, current tree ${current.toFixed(1)}.`,
+  ];
+
+  if (categoryLine) {
+    lines.push(`- Recent work mix: ${categoryLine}.`);
+  }
+  if (q8Retunes.length >= 4) {
+    lines.push(`- Cooldown: ${q8Retunes.length}/${recent.length} recent cycles touched Q8/repacked/fixed-K/TG128-style retunes. Do not spend the next cycle on another narrow shape retune unless the latest profile names that exact kernel as the top remaining cost and the change is expected to move at least 0.5 tok/s.`);
+  }
+  if (neutralKept.length >= Math.max(8, Math.floor(recent.length * 0.5))) {
+    lines.push(`- Neutral keeps are dominating (${neutralKept.length}/${recent.length} recent cycles). In plateau mode, a correct optimization that is merely within noise is churn; prefer a structural scheduler/validator change, or make the change beat current accepted throughput by the small-progress band.`);
+  }
+  if (topRecent.length > 0) {
+    lines.push("- Best recent evidence:");
+    for (const c of topRecent) {
+      lines.push(`  - ${cycleSummary(c)}`);
+    }
+  }
+  lines.push(
+    "- Required pivot: attack a larger remaining boundary (command scheduling, SSM/MoE phase fusion, route-pack correctness diff with layer/tensor max error, or an all-model coherence guard) instead of another local arithmetic cleanup.",
+    "- If the next step is neutral on speed, mark it `@@@STEP_KIND: enablement` or `@@@STEP_KIND: analysis` and name the exact follow-up speed path it unlocks; unlabeled neutral optimization steps are eligible for automatic revert in plateau mode.",
+    "",
+  );
+
+  return lines;
+}
+
+export function buildQwen36PrefillPostBreakthroughAnalysis(state: RunState): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+
+  const best = bestKeptCorrectTokPerSec(state);
+  if (best < 60) return [];
+
+  const breakthrough = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && (c.tokPerSec ?? 0) >= 60 &&
+      /router_f32_topk_batched|f32 router|top-?k|topk/i.test(c.description),
+  ) ?? highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && (c.tokPerSec ?? 0) >= 60,
+  );
+
+  const profile = state.lastProfileOutput ?? "";
+  const pathLine = profile.split("\n").find(line => /path bytes:/i.test(line));
+  const pathEntries = pathLine
+    ? parseGibEntries(profileSection(pathLine, "path bytes:") ?? pathLine)
+    : [];
+  const barrierLine = profile.split("\n").find(line => /barriers\/step:/i.test(line));
+  const barrierEntries = barrierLine
+    ? parseNumericEntries(profileSection(barrierLine, "barriers/step:") ?? barrierLine)
+    : [];
+  const ssmBucketLine = profile.split("\n").find(line => /prefill buckets: ssm/i.test(line));
+
+  const recent = state.cycles.slice(-12);
+  const q8Retunes = recent.filter(c =>
+    /q8|repack|fixed.?k|k=2048|k=4096|tg128|threadgroup/i.test(`${c.description}\n${c.selfAnalysis}`)
+  );
+
+  const lines = [
+    "## Qwen3.6 35B Post-60 Prefill Jump Focus",
+  ];
+
+  if (breakthrough) {
+    lines.push(`- Banked breakthrough: ${cycleSummary(breakthrough)}. Treat this as the new floor; do not optimize from pre-cycle-231 assumptions.`);
+  } else {
+    lines.push(`- Banked breakthrough: accepted best is ${best.toFixed(1)} prefill tok/s. Treat this as the new floor; do not optimize from pre-60 assumptions.`);
+  }
+
+  if (pathEntries.length > 0) {
+    const top = pathEntries[0];
+    lines.push(`- Latest profile dominant path bytes: ${formatProfileEntries(pathEntries, " GiB")}. The next change should target \`${top.name}\` unless a fresh profile proves another bucket moved above it.`);
+    if (top.name === "ssm") {
+      lines.push("- After the fused F32 router/top-k win, SSM is larger than router. Do not make router/top-k the default next target unless the profile moves it back on top.");
+    }
+  } else {
+    lines.push("- No accepted post-breakthrough profile is available. First action in the next run should be a profile-backed analysis or microbench, not a speculative kernel rewrite.");
+  }
+
+  if (barrierEntries.length > 0) {
+    lines.push(`- Latest barrier pressure: ${formatProfileEntries(barrierEntries, "/step")}. Pick one barrier-heavy bucket and remove real command/barrier work; do not add passive counters.`);
+  }
+  if (ssmBucketLine) {
+    lines.push(`- SSM detail from latest profile: ${ssmBucketLine.trim()}. Use this to split projection work from recurrent conv/delta/gated work before editing.`);
+  }
+  if (q8Retunes.length >= 4) {
+    lines.push(`- Cooldown remains active for narrow Q8/repacked/fixed-K/TG128 retunes (${q8Retunes.length}/${recent.length} recent cycles). A small retune needs exact-shape evidence and same-cycle A/B medians.`);
+  }
+
+  lines.push(
+    "- Good next swings: SSM projection/branch reuse that preserves short-prompt coherence, SSM recurrent dispatch/barrier reduction, MoE expert launch/buffer fusion, or a prefill-only exact-shape microbench tied to the current top bucket.",
+    "- If touching `router_f32_topk_batched`, keep it prefill-only and cite OFF/ON medians; router work should be a narrow follow-up to cycle 231, not another broad route-pack validator pass.",
+    "",
+  );
+
+  return lines;
+}
+
+function buildQwen36PrefillFocus(state: RunState, lastResult: BuildRunResult): string[] {
+  if (!isQwen36PrefillRun(state)) return [];
+
+  const best = bestAcceptedTokPerSec(state, lastResult);
+  const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
+  const recentProgress = recentAcceptedProgress(state);
+  const routeCooldown = recentRoutePackCooldown(state);
+  const tokenMajorWin = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && /token-major|shared-gate|topk_weight_and_reduce/i.test(c.description),
+  );
+  const earlyCommitWin = highestMatchingCycle(
+    state.cycles,
+    (c) => c.kept && c.containsReference && /early graph|leading prompt chunk|commit/i.test(c.description),
+  );
+  const routePackFailures = state.cycles.filter((c) => {
+    const text = `${c.description}\n${c.outputText}\n${c.selfAnalysis}`.toLowerCase();
+    return !c.kept && !c.containsReference && /route.?pack|f32 shared.?gate|shared-gate/.test(text);
+  });
+  const dualQ8Failures = state.cycles.filter((c) => {
+    const text = `${c.description}\n${c.outputText}\n${c.selfAnalysis}`.toLowerCase();
+    return !c.kept && !c.containsReference && /dual.?q8|two-row|qkv\+z|attn_qkv\+attn_gate/.test(text);
+  });
+  const bangOnlyFailures = state.cycles.filter((c) => !c.kept && /^!+$/.test(c.outputText.trim()));
+  const routePackDensityLine = state.lastProfileOutput
+    ?.split("\n")
+    .find(line => /route-pack candidate blocks/i.test(line));
+  const lastKept = [...state.cycles].reverse().find(c => c.kept && c.containsReference);
+  const lastKeptWasVisibilityOnly = lastKept != null &&
+    /profile|validator|diff|density|visibility|counter/i.test(lastKept.description);
+
+  const lines: string[] = [
+    "## Qwen3.6 35B Prefill Target Focus",
+  ];
+
+  if (best != null) {
+    const gap = QWEN36_PREFILL_INTERMEDIATE_TARGET - best;
+    if (gap > 0) {
+      const pct = ((gap / best) * 100).toFixed(1);
+      lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; the next milestone is ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} prefill tok/s, a +${gap.toFixed(1)} tok/s (${pct}%) gap.`);
+    } else {
+      lines.push(`- Accepted best is ${best.toFixed(1)} prefill tok/s; keep pushing past the 50 tok/s milestone with correctness intact.`);
+    }
+    if (currentAccepted > 0 && Math.abs(currentAccepted - best) > 0.05) {
+      lines.push(`- Current accepted tree is measuring ${currentAccepted.toFixed(1)} prefill tok/s; compare new work to this current-tree baseline, not only the promoted-best checkpoint.`);
+    }
+    if (recentProgress.hasProgress) {
+      lines.push(`- Recent accepted movement: ${recentProgress.start.toFixed(1)} → ${recentProgress.end.toFixed(1)} prefill tok/s over the last ${RECENT_PROGRESS_WINDOW} cycles. Treat this as small real progress, not a total stall.`);
+    }
+  } else {
+    lines.push(`- No accepted prefill baseline is known yet; establish one before chasing the ${QWEN36_PREFILL_INTERMEDIATE_TARGET.toFixed(1)} tok/s milestone.`);
+  }
+
+  if (tokenMajorWin) {
+    lines.push(`- Banked win to build on: ${cycleSummary(tokenMajorWin)}. This is the current productive MoE direction.`);
+  }
+  if (earlyCommitWin) {
+    lines.push(`- Banked dispatch win to refine: ${cycleSummary(earlyCommitWin)}. Try measured chunk-size variants before wider graph rewrites.`);
+  }
+
+  const traps: string[] = [];
+  if (routePackFailures.length > 0) {
+    traps.push(`${routePackFailures.length} route-packed/F32 shared-gate correctness failures`);
+  }
+  if (dualQ8Failures.length > 0) {
+    traps.push(`${dualQ8Failures.length} dual-Q8 SSM correctness failures`);
+  }
+  if (bangOnlyFailures.length > 0) {
+    traps.push(`${bangOnlyFailures.length} bang-only outputs`);
+  }
+  if (traps.length > 0) {
+    lines.push(`- Measured-dead traps: ${traps.join(", ")}. Treat their tok/s as invalid until the output contains Paris.`);
+  }
+  if (routeCooldown.active) {
+    lines.push(`- ROUTE-PACK COOLDOWN: ${routeCooldown.count} route-pack/shared-gate attempts reverted in the last ${routeCooldown.window} cycles. For the next cycle, do not edit route-pack/shared-gate validators, guards, or kernels; choose an SSM, attention, command-buffer, or exact-shape Q8 path instead.`);
+  }
+  if (routePackDensityLine) {
+    if (routeCooldown.active) {
+      lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This remains useful evidence, but the cooldown above takes precedence until a real outer-harness validator log identifies a specific tensor/layer fix.`);
+    } else {
+      lines.push(`- Latest route-pack profile: ${routePackDensityLine.trim()}. This says the active route-pack path is worth validating; do not add another passive counter before using the existing validator/diff output.`);
+    }
+  }
+  if (lastKeptWasVisibilityOnly) {
+    lines.push(`- The last kept cycle added measurement or validation visibility (${cycleSummary(lastKept)}). The next cycle should consume that evidence to promote, fix, or abandon a default-off path.`);
+  }
+
+  lines.push(...buildQwen36PrefillPostBreakthroughAnalysis(state));
+  lines.push(...buildQwen36PrefillPlateauAnalysis(state));
+
+  lines.push(
+    "- Validation gate for risky paths: `ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1`, F32 shared-gate route-pack, active-block route-pack, and dual-Q8 SSM variants must stay default-off until a full active-prompt validation run keeps `Paris` and beats the accepted median.",
+    "- Codex subprocesses in this harness must not run local Metal model commands such as `./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl` or `ZINC_QWEN36_* ./zig-out/bin/zinc`; they fail with `Metal device not available`. Use `zig build`/`zig build test`; the outer harness owns all Metal measurement and validation runs.",
+    "- Next high-leverage moves after 69.9: profile-first SSM projection/recurrent/barrier work, MoE expert launch/buffer fusion, and exact-shape router follow-ups only when the profile still names router/top-k as the blocker.",
+    "- If adding a validator or microbench, make it report the exact layer, prompt-token count, max abs diff, and flag-on command so the next cycle can decide whether to promote or abandon it.",
+    "",
+  );
+
+  return lines;
+}
+
+function zigBuildArgs(): string[] {
+  return BUILD_OPTIMIZE === "Debug" ? ["build"] : ["build", `-Doptimize=${BUILD_OPTIMIZE}`];
+}
+
 // ── Phase detection ──────────────────────────────────────────────────
 
 export type Phase = "fix" | "implement" | "optimize";
+export type StepKind = "optimization" | "enablement" | "analysis" | "fix" | "rollback";
 
 export type OutputEvaluation = {
   normalizedText: string;
@@ -133,7 +687,22 @@ type KeepDecision = {
   reason: string;
 };
 
-function parseTokPerSec(output: string): number | null {
+export function parseTokPerSec(output: string, mode: MetricMode = "decode"): number | null {
+  if (mode === "prefill") {
+    const prefillRate = output.match(/Prefill(?:\s+complete)?:\s+\d+\s+tokens\s+in\s+\d+\.?\d*\s*(?:ms|s)\s*\(\s*(\d+\.?\d*)\s*tok\/s\s*\)/i);
+    if (prefillRate) return parseFloat(prefillRate[1]);
+
+    const prefillTime = output.match(/Prefill(?:\s+complete)?:\s+(\d+)\s+tokens\s+in\s+(\d+\.?\d*)\s*(ms|s)/i);
+    if (prefillTime) {
+      const tokens = parseInt(prefillTime[1], 10);
+      let seconds = parseFloat(prefillTime[2]);
+      if (prefillTime[3].toLowerCase() === "ms") seconds /= 1000;
+      if (seconds > 0) return tokens / seconds;
+    }
+
+    return null;
+  }
+
   const m = output.match(/Generated\s+(\d+)\s+tokens\s+in\s+(\d+\.?\d*)\s*(ms|s)/i);
   if (m) {
     const tokens = parseInt(m[1], 10);
@@ -424,8 +993,9 @@ async function runCommand(
 // ── Build, test, and run ─────────────────────────────────────────────
 
 async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
-  console.log(clr("1;33", "  🔨 Building..."));
-  const build = await runCommand("zig", ["build"], { timeout: 120_000 });
+  const buildArgs = zigBuildArgs();
+  console.log(clr("1;33", `  🔨 Building (${buildArgs.join(" ")})...`));
+  const build = await runCommand("zig", buildArgs, { timeout: 120_000 });
 
   if (build.exitCode !== 0) {
     return {
@@ -451,7 +1021,7 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
   console.log(clr("1;32", "  ✅ Build OK"));
 
   console.log(clr("1;33", "  🧪 Testing..."));
-  const test = await runCommand("zig", ["build", "test"], { timeout: 120_000 });
+  const test = await runCommand("zig", ["build", "test"], { timeout: TEST_TIMEOUT_MS });
 
   if (test.exitCode !== 0) {
     return {
@@ -499,39 +1069,98 @@ async function buildTestRun(maxTokens: number): Promise<BuildRunResult> {
     };
   }
 
-  console.log(clr("1;33", `  🚀 Running inference (${maxTokens} tokens, ${BENCHMARK_RUNS} samples)...`));
+  const warmupLabel = BENCHMARK_WARMUPS > 0 ? `${BENCHMARK_WARMUPS} warmup + ` : "";
+  console.log(clr("1;33", `  🚀 Running inference (${maxTokens} tokens, ${warmupLabel}${BENCHMARK_RUNS} samples, ${PROMPT_MODE} prompt)...`));
   const tokPerSecSamples: number[] = [];
   let lastRun: RunResult = { exitCode: -1, stdout: "", stderr: "" };
   let lastCombined = "";
 
-  for (let sample = 0; sample < BENCHMARK_RUNS; sample++) {
+  // Pre-roll throwaway runs to prime caches (file mmap, Metal pipeline,
+  // OS page cache) before the timed samples. These do NOT preserve GPU
+  // clock state across process boundaries — that's a deeper limitation —
+  // but they at least surface model-load failures here instead of mid-
+  // measurement, and warm the OS file cache so timing starts from a
+  // consistent state.
+  for (let warmup = 0; warmup < BENCHMARK_WARMUPS; warmup++) {
     const run = await runCommand(
       "./zig-out/bin/zinc",
-      [...zincModelArgs(), "--prompt", TEST_PROMPT, "-n", String(maxTokens)],
-      { timeout: 300_000 },
+      [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
+      { timeout: RUN_TIMEOUT_MS },
+    );
+    lastRun = run;
+    lastCombined = run.stderr + run.stdout;
+    if (run.exitCode !== 0) break; // crash — surface immediately, don't pretend to measure
+    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
+    if (tps != null) {
+      console.log(clr("2", `    warmup ${warmup + 1}/${BENCHMARK_WARMUPS}: ${tps.toFixed(2)} ${METRIC_LABEL} (discarded)`));
+    }
+  }
+
+  // If a warmup crashed, skip the timed loop and surface the failure below.
+  const warmupCrashed = BENCHMARK_WARMUPS > 0 && lastRun.exitCode !== 0;
+
+  for (let sample = 0; !warmupCrashed && sample < BENCHMARK_RUNS; sample++) {
+    const run = await runCommand(
+      "./zig-out/bin/zinc",
+      [...zincModelArgs(), ...zincPromptArgs(), "-n", String(maxTokens)],
+      { timeout: RUN_TIMEOUT_MS },
     );
     lastRun = run;
     lastCombined = run.stderr + run.stdout;
 
     if (run.exitCode !== 0) break; // crash — no point running more samples
 
-    const tps = parseTokPerSec(lastCombined);
+    const tps = parseTokPerSec(lastCombined, METRIC_MODE);
     if (tps != null) {
       tokPerSecSamples.push(tps);
-      console.log(clr("2", `    sample ${sample + 1}/${BENCHMARK_RUNS}: ${tps.toFixed(2)} tok/s`));
+      console.log(clr("2", `    sample ${sample + 1}/${BENCHMARK_RUNS}: ${tps.toFixed(2)} ${METRIC_LABEL}`));
     }
   }
 
-  // Use median of samples for noise-resistant measurement
+  // Aggregate samples. Default is median of all timed samples. With
+  // BENCHMARK_TRIM, drop symmetric high+low extremes before taking the
+  // median:
+  //   * 5–6 samples:  drop 1 high + 1 low  → median of remaining 3–4
+  //   * 7+   samples: drop 2 high + 2 low  → median of remaining ≥3
+  // The 2-trim variant kicks in for overnight runs (BENCHMARK_RUNS=7),
+  // where Effort 14 logged bimodal samples on M1 Max — e.g. [42, 45]
+  // sets where a single-trim still picked the wrong cluster. Symmetric
+  // 2-trim from 7 samples leaves the middle 3, which is robust to the
+  // cold-GPU outlier and the occasional too-warm outlier together.
   const sorted = [...tokPerSecSamples].sort((a, b) => a - b);
-  const tokPerSec = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : null;
+  let kept: number[] = sorted;
+  let trimmed = false;
+  let trimCount = 0;
+  if (BENCHMARK_TRIM && sorted.length >= 7) {
+    trimCount = 2;
+    kept = sorted.slice(2, sorted.length - 2);
+    trimmed = true;
+  } else if (BENCHMARK_TRIM && sorted.length >= 5) {
+    trimCount = 1;
+    kept = sorted.slice(1, sorted.length - 1);
+    trimmed = true;
+  }
+  const tokPerSec = kept.length > 0 ? kept[Math.floor(kept.length / 2)] : null;
   const tokensGenerated = parseTokensGenerated(lastCombined);
   const outputText = parseOutputText(lastCombined);
   const evaluation = evaluateOutputText(outputText);
 
   if (tokPerSec != null && sorted.length > 1) {
     const range = sorted[sorted.length - 1] - sorted[0];
-    console.log(clr("1;36", `    median: ${tokPerSec.toFixed(2)} tok/s [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}`));
+    const aggLabel = trimmed
+      ? `trimmed median (drop ${trimCount} high + ${trimCount} low)`
+      : "median";
+    // Bimodal heuristic: if range > 1.5 AND samples straddle a ~1.5
+    // tok/s gap (low cluster ≤ median−0.75 and high cluster ≥
+    // median+0.75 both present), flag THERMAL — the loop's accept
+    // band is tighter than this spread, so a "kept" verdict at this
+    // noise level should be read with suspicion.
+    const med = tokPerSec;
+    const hasLow = sorted.some(s => s <= med - 0.75);
+    const hasHigh = sorted.some(s => s >= med + 0.75);
+    const bimodal = range > 1.5 && hasLow && hasHigh;
+    const flag = bimodal ? " ⚠ THERMAL" : "";
+    console.log(clr("1;36", `    ${aggLabel}: ${tokPerSec.toFixed(2)} ${METRIC_LABEL} [${tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] range=${range.toFixed(1)}${flag}`));
   }
 
   const result: BuildRunResult = {
@@ -854,6 +1483,7 @@ function buildClaudeArgs(prompt: string, model?: string): string[] {
 // `xhigh` is the top tier; override via ZINC_CODEX_REASONING_EFFORT if a cycle
 // needs something cheaper.
 const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
 
 function buildCodexArgs(prompt: string, model?: string): string[] {
   const args = [
@@ -866,9 +1496,17 @@ function buildCodexArgs(prompt: string, model?: string): string[] {
     "--sandbox", "workspace-write",
     "--cd", REPO_ROOT,
   ];
-  if (model) args.push("--model", model);
+  args.push("--model", model ?? CODEX_MODEL);
   args.push(prompt);
   return args;
+}
+
+async function resetCycleToPreHash(preHash: string): Promise<void> {
+  await runCommand("git", ["reset", "--hard", preHash]);
+  // `git reset --hard` leaves untracked files behind. Agents often add new
+  // shaders/benchmarks while exploring; if a cycle is reverted, those files
+  // must not leak into the next pre-cycle checkpoint and become "accepted".
+  await runCommand("git", ["clean", "-fd", "--", ...LOOP_COMMIT_PATHS]).catch(() => {});
 }
 
 async function runAgent(agent: AgentKind, prompt: string, model?: string): Promise<RunResult> {
@@ -969,49 +1607,84 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     const current = lastResult.tokPerSec;
     const gap = TARGET_TOK_PER_SEC - current;
     const pctNeeded = ((gap / current) * 100).toFixed(0);
-    diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} tok/s → target ≥${TARGET_TOK_PER_SEC}`);
-    diagnosis.push(`Gap: ${gap.toFixed(1)} tok/s (need ${pctNeeded}% improvement)`);
+    const currentAccepted = Math.max(currentAcceptedTokPerSec(state), correctResultTokPerSec(lastResult));
+    const bestKept = Math.max(bestKeptCorrectTokPerSec(state), correctResultTokPerSec(lastResult));
+    diagnosis.push(`## Status: CORRECT OUTPUT — ${current.toFixed(2)} ${METRIC_LABEL} → target ≥${TARGET_TOK_PER_SEC}`);
+    diagnosis.push(`Gap: ${gap.toFixed(1)} ${METRIC_LABEL} (need ${pctNeeded}% improvement)`);
+    if (currentAccepted > 0 || bestKept > 0) {
+      diagnosis.push(`Accepted baseline: current tree ${currentAccepted.toFixed(2)} ${METRIC_LABEL}; highest kept-correct ${bestKept.toFixed(2)} ${METRIC_LABEL}.`);
+    }
+    if (state.bestTokPerSec > 0 && bestKept > state.bestTokPerSec + 0.05) {
+      diagnosis.push(`Note: saved promoted-best checkpoint is ${state.bestTokPerSec.toFixed(2)} ${METRIC_LABEL}; use the kept-correct/current-tree baseline above for comparisons.`);
+    }
     diagnosis.push(`Output: "${trunc(lastResult.outputText, 80)}"`);
     if (lastResult.tokPerSecSamples.length > 1) {
-      diagnosis.push(`Benchmark samples: [${lastResult.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] tok/s`);
+      diagnosis.push(`Benchmark samples: [${lastResult.tokPerSecSamples.map(s => s.toFixed(1)).join(", ")}] ${METRIC_LABEL}`);
+      const sampleMin = Math.min(...lastResult.tokPerSecSamples);
+      const sampleMax = Math.max(...lastResult.tokPerSecSamples);
+      const sampleRange = sampleMax - sampleMin;
+      if (sampleRange > Math.max(2.0, current * 0.2)) {
+        diagnosis.push(`Benchmark variance warning: sample range ${sampleRange.toFixed(1)} tok/s is too wide for reliable direction. Do not optimize from the low sample; compare against accepted best and profile evidence.`);
+      }
     }
   } else {
-    diagnosis.push(`## Status: TARGET REACHED — ${lastResult.tokPerSec?.toFixed(1)} tok/s ≥${TARGET_TOK_PER_SEC}`);
+    diagnosis.push(`## Status: TARGET REACHED — ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL} ≥${TARGET_TOK_PER_SEC}`);
     diagnosis.push("Performance target met!");
   }
 
   // Stall warning
-  if (state.stalledCycles >= STALL_THRESHOLD) {
+  const recentProgress = recentAcceptedProgress(state);
+  if (state.stalledCycles >= STALL_THRESHOLD && recentProgress.hasProgress) {
+    diagnosis.push("");
+    diagnosis.push(`## Limited Progress — accepted baseline moved ${recentProgress.start.toFixed(2)} → ${recentProgress.end.toFixed(2)} ${METRIC_LABEL} recently`);
+    diagnosis.push("");
+    diagnosis.push("Do not treat this as a clean stall, but the gain is still too small for the target gap.");
+    diagnosis.push("Use the latest profile/validator evidence to convert the current default-off or measurement-only path into a default-on correctness-preserving speedup.");
+    diagnosis.push("Avoid adding another passive probe unless it answers the exact blocker exposed by the previous one.");
+  } else if (state.stalledCycles >= STALL_THRESHOLD) {
     diagnosis.push("");
     diagnosis.push(`## ⚠ STALL — ${state.stalledCycles} cycles without meaningful improvement. STUDY THE REFERENCES.`);
     diagnosis.push("");
     diagnosis.push("Guessing is not working. Before making ANY more changes, you MUST study how");
     diagnosis.push("production Metal inference engines solve this exact problem:");
     diagnosis.push("");
-    diagnosis.push("### Step 1: Clone and read llama.cpp Metal backend");
-    diagnosis.push("```bash");
-    diagnosis.push("git clone --depth 1 https://github.com/ggerganov/llama.cpp /tmp/llama.cpp");
-    diagnosis.push("```");
-    diagnosis.push("Read these files:");
-    diagnosis.push("- `/tmp/llama.cpp/ggml/src/ggml-metal/ggml-metal.m` — the core Metal dispatch loop");
-    diagnosis.push("- Look at how they batch command buffers, manage encoders, handle MoE expert dispatch");
-    diagnosis.push("- Look at their threadgroup sizes for Q4_K DMMV and how they tile matmuls");
+    const llamaMetal = existsSync("/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal")
+      ? "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-metal"
+      : "/tmp/llama.cpp/ggml/src/ggml-metal";
+    const vllmMoe = existsSync("/Users/zolotukhin/Workplace/vllm/vllm/model_executor/layers/fused_moe")
+      ? "/Users/zolotukhin/Workplace/vllm/vllm/model_executor/layers/fused_moe"
+      : "/tmp/vllm/vllm/model_executor/layers/fused_moe";
+    diagnosis.push("### Step 1: Read llama.cpp Metal backend");
+    if (llamaMetal.startsWith("/tmp/")) {
+      diagnosis.push("```bash");
+      diagnosis.push("git clone --depth 1 https://github.com/ggerganov/llama.cpp /tmp/llama.cpp");
+      diagnosis.push("```");
+    }
+    diagnosis.push("Read these files if they exist in the local checkout:");
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal-context.m\` — graph command-buffer scheduling and commit/wait policy`);
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal-ops.cpp\` — op-level encoder barriers, fusion, and mul_mat_id dispatch`);
+    diagnosis.push(`- \`${llamaMetal}/ggml-metal.metal\` — Q8/Q4 matvec and routed matmul kernels`);
+    diagnosis.push("Some llama.cpp checkouts no longer have `ggml-metal.m`; do not waste a cycle rediscovering that rename.");
+    diagnosis.push("After reading the current files once, cite the specific function you are adapting and move to a measured code change.");
+    diagnosis.push("- Look at how they batch command buffers, manage encoders, and choose per-shape Q8 paths");
     diagnosis.push("- Note how many commitAndWait calls happen per token (likely 1)");
     diagnosis.push("");
-    diagnosis.push("### Step 2: Clone and read vLLM Metal / MPS backend");
-    diagnosis.push("```bash");
-    diagnosis.push("git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm");
-    diagnosis.push("```");
+    diagnosis.push("### Step 2: Read vLLM MoE packing");
+    if (vllmMoe.startsWith("/tmp/")) {
+      diagnosis.push("```bash");
+      diagnosis.push("git clone --depth 1 https://github.com/vllm-project/vllm /tmp/vllm");
+      diagnosis.push("```");
+    }
     diagnosis.push("Read these files:");
-    diagnosis.push("- `/tmp/vllm/vllm/attention/backends/` — attention dispatch strategies");
-    diagnosis.push("- Look at how they handle MoE routing and expert parallelism");
-    diagnosis.push("- Check their memory management and buffer pooling approach");
+    diagnosis.push(`- \`${vllmMoe}\` — topk -> align/pack -> grouped expert flow`);
+    diagnosis.push("- Look at which ideas require many prompt tokens; do not force those into single-token decode");
     diagnosis.push("");
     diagnosis.push("### Step 3: Apply what you learned");
     diagnosis.push("Identify the SPECIFIC technique from llama.cpp or vLLM that addresses our bottleneck,");
     diagnosis.push("then implement it. Cite which file/function you're adapting from in @@@DESCRIPTION.");
     diagnosis.push("Do NOT repeat variations of previously failed approaches.");
-  } else if (state.stalledCycles >= 3) {
+    diagnosis.push("If the local Codex subprocess cannot initialize Metal, do not spend the cycle retrying direct `./zig-out/bin/zinc` or Metal microbenchmarks; the outer harness owns the Metal measurement gate.");
+  } else if (state.stalledCycles >= 3 && !recentProgress.hasProgress) {
     diagnosis.push("");
     diagnosis.push(`## Note: ${state.stalledCycles}/${STALL_THRESHOLD} cycles without improvement — will switch to reference study soon`);
   }
@@ -1051,6 +1724,25 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     );
   }
 
+  const gemmaRun = isGemmaRun(state);
+  const modelContext = gemmaRun ? [
+    "## Model (Gemma 4 26B-A4B MoE Q4_K_M)",
+    "- 30 layers, all current profile steps are attention + Gemma MoE (`mix/step: attn 30.0 gpu-moe 30.0`).",
+    "- hidden_dim=2816, n_heads=16, n_kv_heads=8, vocab=262144.",
+    "- MoE FFN: 128 experts, 8 active per token, intermediate=704, shared expert=2112.",
+    "- Hot request profile after cycle 49: q8_0 52.56 GiB, q4_k 13.96 GiB, q5_1 9.31 GiB.",
+    "- Hot path bytes: attn 31.16 GiB, moe-expert 23.26 GiB, shared 14.83 GiB, lm-head 6.57 GiB.",
+    "",
+  ] : [
+    "## Model (Qwen3.6-35B-A3B, Q4_K, 20.8 GB)",
+    "- 40 layers: every 4th is full attention (layers 3,7,11,...,39), rest are SSM/delta-net.",
+    "- MoE FFN: 256 experts, 8 active per token, + shared expert.",
+    "- head_dim=256, hidden_dim=2048, n_heads=16, n_kv_heads=2.",
+    "- Active parameters per token: ~3B (due to MoE sparsity).",
+    "- Effective working set per decode step: ~1.7 GB at Q4_K.",
+    "",
+  ];
+
   sections.push(
     ...diagnosis,
     "",
@@ -1059,13 +1751,7 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "- Apple GPU family: Apple9 (M4), simdgroup_matrix = true, bfloat = true",
     "- macOS, Metal compute only",
     "",
-    "## Model (Qwen3.5-35B-A3B, Q4_K, 20.7 GB)",
-    "- 40 layers: every 4th is full attention (layers 3,7,11,...,39), rest are SSM/delta-net",
-    "- MoE FFN: 256 experts, 8 active per token, + shared expert",
-    "- head_dim=256, hidden_dim=2048, n_heads=16, n_kv_heads=2",
-    "- Active parameters per token: ~3B (due to MoE sparsity)",
-    "- Effective working set per decode step: ~1.7 GB at Q4_K",
-    "",
+    ...modelContext,
   );
 
   if (isOptimize) {
@@ -1073,15 +1759,21 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     sections.push(
       "## Bandwidth Analysis",
       "- Memory BW: 546 GB/s theoretical, ~480 GB/s achievable",
-      "- Working set per token: ~1.7 GB (only active experts + attention layers)",
-      "- Theoretical BW-limited decode: ~280 tok/s (480 / 1.7)",
-      `- Current: ${lastResult.tokPerSec?.toFixed(1)} tok/s → ${((lastResult.tokPerSec ?? 0) / 280 * 100).toFixed(0)}% of theoretical BW limit`,
-      "- This means MOST time is lost to dispatch overhead, sync, or compute bottlenecks — NOT bandwidth",
+      ...(gemmaRun ? [
+        "- Gemma cycle-49 Q8 attention microbenchmarks already hit ~370-510 GB/s on accepted hot shapes.",
+        "- Treat broad Q8 threadgroup/repack work as low-probability unless an exact-shape benchmark proves the candidate wins first.",
+        "- Decode target ≥50 tok/s means about ≤20 ms/token; current accepted best 37.79 tok/s is about 26.5 ms/token.",
+      ] : [
+        "- Working set per token: ~1.7 GB (only active experts + attention layers)",
+        "- Theoretical BW-limited decode: ~280 tok/s (480 / 1.7)",
+        `- Current: ${lastResult.tokPerSec?.toFixed(1)} tok/s → ${((lastResult.tokPerSec ?? 0) / 280 * 100).toFixed(0)}% of theoretical BW limit`,
+        "- This means MOST time is lost to dispatch overhead, sync, or compute bottlenecks — NOT bandwidth",
+      ]),
       "",
       "## Baseline Reference",
-      "- llama.cpp Metal on this machine: 72.93 tok/s decode (tg128)",
-      `- ZINC target: ≥${TARGET_TOK_PER_SEC} tok/s`,
-      `- ZINC current: ${lastResult.tokPerSec?.toFixed(1)} tok/s`,
+      gemmaRun ? "- Current accepted ZINC best: 37.79 tok/s; target is 50 tok/s before chasing larger redesigns." : "- llama.cpp Metal on this machine: 72.93 tok/s decode (tg128)",
+      `- ZINC target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}`,
+      `- ZINC current: ${lastResult.tokPerSec?.toFixed(1)} ${METRIC_LABEL}`,
       "",
       "## Optimization Targets (pick ONE per cycle)",
       "",
@@ -1181,6 +1873,11 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     sections.push(state.reviewSummaries[state.reviewSummaries.length - 1], "");
   }
 
+  const qwen36PrefillFocus = buildQwen36PrefillFocus(state, lastResult);
+  if (qwen36PrefillFocus.length > 0) {
+    sections.push(...qwen36PrefillFocus);
+  }
+
   sections.push(
     "## Cycle History",
     historyBlock,
@@ -1196,17 +1893,19 @@ export function buildPrompt(state: RunState, lastResult: BuildRunResult): string
     "2. CORRECTNESS IS SACRED. Output MUST contain 'Paris'. Speed without correctness = instant revert.",
     "3. All 27+ tests must continue passing.",
     "4. Do NOT modify src/vulkan/, loops/, or .env.",
-    "5. Zig 0.15.2 API: ArrayList is unmanaged (pass allocator to append/deinit).",
-    "6. MSL shaders use 'main0' as entry point (SPIRV-Cross convention).",
-    "7. Metal push constants go in buffer[n_bufs] (see shim.m mtl_dispatch).",
-    "8. The Metal command pattern: beginCommand → dispatch → barrier → dispatch → commitAndWait.",
-    "9. UMA advantage: all buffers are SharedMode — cpu_ptr gives direct CPU access to GPU data.",
-    "10. Read the profile output and run output BEFORE deciding what to optimize.",
-    "11. Prefer changes to forward_metal.zig and shaders. Avoid refactoring infrastructure.",
+    "5. Do NOT run git push, git pull, git fetch, git merge, git rebase, git reset, git checkout, or git restore. The harness owns git commits/reverts.",
+    "6. Zig 0.15.2 API: ArrayList is unmanaged (pass allocator to append/deinit).",
+    "7. MSL shaders use 'main0' as entry point (SPIRV-Cross convention).",
+    "8. Metal push constants go in buffer[n_bufs] (see shim.m mtl_dispatch).",
+    "9. The Metal command pattern: beginCommand → dispatch → barrier → dispatch → commitAndWait.",
+    "10. UMA advantage: all buffers are SharedMode — cpu_ptr gives direct CPU access to GPU data.",
+    "11. Read the profile output and run output BEFORE deciding what to optimize.",
+    "12. Prefer changes to forward_metal.zig and shaders. Avoid refactoring infrastructure.",
     "",
     "## Output Format",
-    "After making your change, print these 3 lines:",
+    "After making your change, print these 4 lines:",
     "@@@DESCRIPTION: <one-line summary>",
+    "@@@STEP_KIND: <optimization|enablement|analysis|fix|rollback>",
     "@@@SELF_ANALYSIS: <why this approach and what you expect, with estimated tok/s impact>",
     "@@@NEXT_IDEAS: <comma-separated ideas for future cycles>",
   );
@@ -1230,6 +1929,7 @@ export type CycleResult = {
   runExitCode: number | null;
   outputText: string;
   error?: string;
+  stepKind?: StepKind;
   selfAnalysis: string;
   nextIdeas: string[];
 };
@@ -1290,8 +1990,8 @@ async function runProfileBenchmark(): Promise<string> {
   console.log(clr("1;33", "  📊 Profiling run (--profile)..."));
   const run = await runCommand(
     "./zig-out/bin/zinc",
-    [...zincModelArgs(), "--prompt", TEST_PROMPT, "-n", "32", "--profile"],
-    { timeout: 300_000 },
+    [...zincModelArgs(), ...zincPromptArgs(), "-n", String(Math.min(MAX_TOKENS, 32)), "--profile"],
+    { timeout: RUN_TIMEOUT_MS },
   );
   const combined = (run.stderr + run.stdout).slice(-4000);
   console.log(clr("2", "    profile captured"));
@@ -1305,43 +2005,35 @@ export function buildSelfReview(state: RunState): string {
   if (recent.length === 0) return "";
 
   const kept = recent.filter(c => c.kept);
-  const reverted = recent.filter(c => !c.kept);
   const tpsValues = kept.filter(c => c.tokPerSec != null).map(c => c.tokPerSec!);
-  const tpsStart = recent[0].tokPerSec ?? 0;
-  const tpsEnd = recent[recent.length - 1].tokPerSec ?? tpsStart;
-  const delta = tpsEnd - tpsStart;
-
-  // Categorize approaches by keywords
-  const categories: Record<string, { kept: number; reverted: number }> = {};
-  for (const c of recent) {
-    const desc = c.description.toLowerCase();
-    const tags: string[] = [];
-    if (desc.match(/shader|kernel|threadgroup|simd|metal/)) tags.push("shader");
-    if (desc.match(/dispatch|command|encoder|barrier|commit|batch/)) tags.push("dispatch");
-    if (desc.match(/buffer|alloc|pool|reuse|memory/)) tags.push("memory");
-    if (desc.match(/fuse|fusion|merged|combined/)) tags.push("fusion");
-    if (desc.match(/moe|expert|router|topk/)) tags.push("moe");
-    if (desc.match(/attention|flash|kv.?cache|rope/)) tags.push("attention");
-    if (desc.match(/half|float16|bfloat|bf16|f16/)) tags.push("precision");
-    if (tags.length === 0) tags.push("other");
-    for (const tag of tags) {
-      if (!categories[tag]) categories[tag] = { kept: 0, reverted: 0 };
-      if (c.kept) categories[tag].kept++;
-      else categories[tag].reverted++;
-    }
-  }
+  const rawTpsStart = recent[0].tokPerSec ?? 0;
+  const rawTpsEnd = recent[recent.length - 1].tokPerSec ?? rawTpsStart;
+  const rawDelta = rawTpsEnd - rawTpsStart;
+  const priorKeptTps = state.cycles
+    .slice(0, -recent.length)
+    .filter(c => c.kept && c.tokPerSec != null)
+    .map(c => c.tokPerSec!);
+  const acceptedStart = priorKeptTps.length > 0
+    ? Math.max(...priorKeptTps)
+    : (tpsValues.length > 0 ? tpsValues[0] : rawTpsStart);
+  const acceptedEnd = tpsValues.length > 0
+    ? Math.max(acceptedStart, ...tpsValues)
+    : acceptedStart;
+  const acceptedDelta = acceptedEnd - acceptedStart;
+  const smallProgressThreshold = smallAcceptedProgressBand(acceptedStart);
 
   const lines: string[] = [
     `## Self-Review (last ${recent.length} cycles)`,
     "",
     `- Kept: ${kept.length}/${recent.length} changes`,
-    `- tok/s movement: ${tpsStart.toFixed(1)} → ${tpsEnd.toFixed(1)} (${delta >= 0 ? "+" : ""}${delta.toFixed(1)})`,
+    `- Accepted best movement: ${acceptedStart.toFixed(1)} → ${acceptedEnd.toFixed(1)} (${acceptedDelta >= 0 ? "+" : ""}${acceptedDelta.toFixed(1)})`,
+    `- Raw measured movement, including reverted candidates: ${rawTpsStart.toFixed(1)} → ${rawTpsEnd.toFixed(1)} (${rawDelta >= 0 ? "+" : ""}${rawDelta.toFixed(1)})`,
     `- Best tok/s in window: ${tpsValues.length > 0 ? Math.max(...tpsValues).toFixed(1) : "N/A"}`,
     "",
     "### What's working vs not:",
   ];
 
-  for (const [cat, stats] of Object.entries(categories).sort((a, b) => b[1].kept - a[1].kept)) {
+  for (const [cat, stats] of categoryCounts(recent).sort((a, b) => b[1].kept - a[1].kept)) {
     const total = stats.kept + stats.reverted;
     const rate = ((stats.kept / total) * 100).toFixed(0);
     const indicator = stats.kept > stats.reverted ? "✅" : stats.kept === 0 ? "❌" : "⚠";
@@ -1349,13 +2041,20 @@ export function buildSelfReview(state: RunState): string {
   }
 
   lines.push("");
-  if (delta < 1) {
-    lines.push("### ⚠ Low progress — strategic pivot recommended:");
+  if (kept.length === 0) {
+    lines.push("### ⚠ No accepted progress — strategic pivot required:");
+    lines.push("- Do NOT treat faster reverted candidates as progress");
+    lines.push("- Stop doubling down on categories with 0 kept changes");
+    lines.push("- Build missing measurement/microbench coverage before another kernel retune");
+  } else if (acceptedDelta < smallProgressThreshold) {
+    lines.push("### ⚠ Low progress in accepted changes — strategic pivot recommended:");
     lines.push("- STOP trying small variations of what already failed");
     lines.push("- Focus on categories with >50% success rate above");
     lines.push("- If no category is working, the bottleneck is elsewhere — profile first");
+  } else if (acceptedDelta < 1) {
+    lines.push(`### Small accepted progress (+${acceptedDelta.toFixed(1)} tok/s). Use the evidence from kept measurement/validator cycles before adding another probe.`);
   } else {
-    lines.push(`### Progress is positive (+${delta.toFixed(1)} tok/s). Double down on what's working.`);
+    lines.push(`### Progress is positive in accepted changes (+${acceptedDelta.toFixed(1)} tok/s). Double down only on kept categories.`);
   }
 
   // Most impactful kept changes
@@ -1401,6 +2100,50 @@ function extractAgentText(stdout: string): string {
   return texts.join("\n");
 }
 
+function inferStepKind(description: string, selfAnalysis: string): StepKind {
+  const text = `${description}\n${selfAnalysis}`.toLowerCase();
+  if (/\b(rollback|revert|measured[- ]dead)\b/.test(text)) return "rollback";
+  if (/\b(fix|build failure|test failure|correctness regression|crash)\b/.test(text)) return "fix";
+  if (/\b(analysis|profile|measure|microbench|counter|diagnos|validator|diff|instrument)\b/.test(text)) return "analysis";
+  if (/\b(enablement|plumbing|infrastructure|harness|scaffold|guard|sweep|coherence)\b/.test(text)) return "enablement";
+  return "optimization";
+}
+
+function parseStepKind(raw: string | undefined, description: string, selfAnalysis: string): StepKind {
+  const normalized = raw?.trim().toLowerCase();
+  if (
+    normalized === "optimization" ||
+    normalized === "enablement" ||
+    normalized === "analysis" ||
+    normalized === "fix" ||
+    normalized === "rollback"
+  ) {
+    return normalized;
+  }
+  return inferStepKind(description, selfAnalysis);
+}
+
+export function shouldRejectQwen36PlateauNeutralKeep(args: {
+  state: RunState;
+  stepKind: StepKind;
+  description: string;
+  selfAnalysis: string;
+  verifyTokPerSec: number;
+  acceptedTokPerSec: number;
+  currentProgressBand: number;
+}): boolean {
+  if (!isQwen36PrefillRun(args.state)) return false;
+  if (args.state.stalledCycles < QWEN36_PLATEAU_STALL_CYCLES) return false;
+  if (args.verifyTokPerSec >= args.acceptedTokPerSec + args.currentProgressBand) return false;
+  if (args.stepKind !== "optimization") return false;
+
+  const text = `${args.description}\n${args.selfAnalysis}`.toLowerCase();
+  if (/\b(profile|measure|microbench|counter|diagnos|validator|validate|diff|instrument|coherence|harness)\b/.test(text)) {
+    return false;
+  }
+  return true;
+}
+
 // ── Main loop ────────────────────────────────────────────────────────
 
 function findLatestRunDir(): string | null {
@@ -1427,7 +2170,7 @@ async function main() {
   const args = process.argv.slice(2);
   let maxCycles = 999;
   let dryRun = false;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let model: string | undefined;
   let resume = false;
   let effort: number | null = null;
@@ -1469,7 +2212,7 @@ async function main() {
           "Usage: bun loops/implement_metal.ts [options]",
           "",
           "Options:",
-          "  --agent <claude|codex>  Agent to use (default: claude)",
+          "  --agent <claude|codex>  Agent to use (default: codex)",
           "  --model <name>          Model override for selected agent",
           "  --cycles N              Max cycles (default: 999)",
           "  --dry-run               Build+run only, no agent",
@@ -1531,6 +2274,7 @@ async function main() {
     state.effortPlan ??= null;
     state.effortId ??= null;
     state.effortFile ??= null;
+    normalizeStateBestTokPerSec(state);
     // Re-read the effort doc from disk every resume so an edited plan
     // reaches the next agent invocation without losing saved history.
     if (effortBundle) {
@@ -1549,11 +2293,11 @@ async function main() {
     startCycle = state.cycles.length + 1;
     console.log(clr("1;36", "╔══════════════════════════════════════════════════════════════╗"));
     console.log(clr("1;36", "║  ZINC Metal Optimization Loop — RESUMING                     ║"));
-    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} tok/s  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
+    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
     console.log(clr("1;36", `║  Run: ${runId}  |  Resuming from cycle ${startCycle}            ║`));
     console.log(clr("1;36", "╚══════════════════════════════════════════════════════════════╝"));
     console.log(`  Agent: ${clr("1", agentLabel)}${model ? ` (${model})` : ""}`);
-    console.log(`  Previous cycles: ${state.cycles.length}, best: ${state.bestTokPerSec.toFixed(2)} tok/s`);
+    console.log(`  Previous cycles: ${state.cycles.length}, best kept-correct: ${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL}, current accepted: ${currentAcceptedTokPerSec(state).toFixed(2)} ${METRIC_LABEL}`);
     console.log(`  Results: ${clr("2", runDir)}`);
     if (state.effortFile) {
       console.log(`  Effort: ${clr("1;36", `#${state.effortId}`)} → ${state.effortFile}`);
@@ -1583,7 +2327,7 @@ async function main() {
     };
     console.log(clr("1;36", "╔══════════════════════════════════════════════════════════════╗"));
     console.log(clr("1;36", "║  ZINC Metal Optimization Loop                                ║"));
-    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} tok/s  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
+    console.log(clr("1;36", `║  Target: ≥${TARGET_TOK_PER_SEC} ${METRIC_LABEL}  |  Model: ${displayModelLabel().slice(0, 35)}  ║`));
     console.log(clr("1;36", `║  Run: ${runId}  |  Max cycles: ${maxCycles}               ║`));
     console.log(clr("1;36", "╚══════════════════════════════════════════════════════════════╝"));
     console.log(`  Agent: ${clr("1", agentLabel)}${model ? ` (${model})` : ""}`);
@@ -1597,6 +2341,19 @@ async function main() {
     console.log(clr("1;35", "\n" + "═".repeat(64)));
     console.log(clr("1;35", `  CYCLE ${cycle}`));
     console.log(clr("1;35", "═".repeat(64)));
+
+    // Live-reload the effort doc each cycle so edits during a long run
+    // take effect on the next cycle without needing --resume. The doc
+    // is re-spliced into every agent prompt anyway; only the in-memory
+    // copy needs to refresh.
+    if (state.effortId != null) {
+      const refreshed = await loadEffortPlan(state.effortId);
+      if (refreshed && refreshed.plan !== state.effortPlan) {
+        state.effortPlan = refreshed.plan;
+        state.effortFile = refreshed.file;
+        console.log(clr("1;36", `  Effort plan reloaded (${refreshed.file}, ${refreshed.plan.length} chars)`));
+      }
+    }
 
     const cycleDir = join(runDir, `cycle-${String(cycle).padStart(3, "0")}`);
     await mkdir(cycleDir, { recursive: true });
@@ -1621,7 +2378,7 @@ async function main() {
       console.log(clr("1;31", `  ❌ CRASH (exit ${result.runExitCode})`));
     } else {
       const refTag = result.containsReference ? clr("1;32", " ✅CORRECT") : clr("1;33", " ❌WRONG");
-      const tpsTag = result.tokPerSec ? ` ${result.tokPerSec.toFixed(1)} tok/s` : "";
+      const tpsTag = result.tokPerSec ? ` ${result.tokPerSec.toFixed(1)} ${METRIC_LABEL}` : "";
       console.log(clr("1;32", `  ✅ ${result.tokensGenerated} tokens${tpsTag}`) + refTag);
       if (result.outputText) console.log(clr("2", `  Output: "${result.outputText.slice(0, 80)}"`));
     }
@@ -1632,7 +2389,7 @@ async function main() {
     }
 
     // Step 2: Git snapshot
-    await runCommand("git", ["add", "-A", "src/", "build.zig"]).catch(() => {});
+    await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
     await runCommand("git", ["commit", "--allow-empty", "-m", `metal-loop: pre-cycle-${cycle}`]).catch(() => {});
     const preCommit = await runCommand("git", ["rev-parse", "HEAD"]);
     const preHash = preCommit.stdout.trim();
@@ -1648,10 +2405,12 @@ async function main() {
     const agentText = extractAgentText(agentResult.stdout);
     const lastChars = agentText.slice(-3000);
     const descMatch = lastChars.match(/@@@DESCRIPTION:\s*(.+)/im);
+    const stepKindMatch = lastChars.match(/@@@STEP_KIND:\s*(.+)/im);
     const analysisMatch = lastChars.match(/@@@SELF_ANALYSIS:\s*(.+)/im);
     const ideasMatch = lastChars.match(/@@@NEXT_IDEAS:\s*(.+)/im);
     const description = descMatch?.[1]?.trim() ?? "Agent made changes";
     const selfAnalysis = analysisMatch?.[1]?.trim() ?? "";
+    const stepKind = parseStepKind(stepKindMatch?.[1], description, selfAnalysis);
     const newIdeas = ideasMatch?.[1]?.split(",").map(s => s.trim()).filter(s => s.length > 3) ?? [];
 
     // Step 4: Verify
@@ -1661,50 +2420,87 @@ async function main() {
 
     // Keep/revert decision — tight for optimization
     let kept = false;
-    const prevTps = state.bestTokPerSec;
+    const baselines = keepBaselinesForCycle(state, result);
+    const bestTps = baselines.bestTokPerSec;
+    const acceptedTps = baselines.acceptedTokPerSec;
     const verifyTps = verify.tokPerSec ?? 0;
+    // Proportional bands scale with real accepted performance, but use
+    // two different anchors: promotion compares with the best kept
+    // correct result, while neutral keeps compare with the current
+    // accepted baseline measured at the start of this cycle. This avoids
+    // the Effort 16 cycle-106/107 drift where a stale best=43.4 allowed
+    // a 44.0 tree to keep 43.2 tok/s regressions as "within noise".
+    //
+    // The neutral band is intentionally tighter than the promotion band:
+    // a correct foundation step can be kept when it is flat, but not when
+    // it materially slows the current tree.
+    const improveBand = Math.max(0.3, bestTps * 0.02);
+    const noiseBand = Math.max(0.25, acceptedTps * 0.01);
+    const currentProgressBand = smallAcceptedProgressBand(acceptedTps);
 
     if (verify.buildExitCode !== 0 || verify.testExitCode !== 0) {
       // Build or test broken → revert
       console.log(clr("1;31", `  ↩ REVERTING — ${verify.buildExitCode !== 0 ? "build" : "tests"} broken`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — broke ${verify.buildExitCode !== 0 ? "build" : "tests"}`);
       state.stalledCycles++;
     } else if (verify.runExitCode !== 0 && verify.runExitCode !== null) {
       // Crash → revert
       console.log(clr("1;31", `  ↩ REVERTING — runtime crash`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — runtime crash`);
       state.stalledCycles++;
     } else if (!verify.containsReference && state.currentBest?.containsReference) {
       // Lost correctness → always revert
       console.log(clr("1;31", `  ↩ REVERTING — lost correctness (output: "${verify.outputText.slice(0, 60)}")`));
-      await runCommand("git", ["reset", "--hard", preHash]);
+      await resetCycleToPreHash(preHash);
       state.failedApproaches.push(`${description} — broke correctness`);
       state.stalledCycles++;
-    } else if (verify.containsReference && verifyTps > prevTps + 0.5) {
+    } else if (verify.containsReference && verifyTps > bestTps + improveBand) {
       // Meaningful speed improvement with correct output
       kept = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
-      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} tok/s (was ${prevTps.toFixed(2)}, +${(verifyTps - prevTps).toFixed(2)})`));
-    } else if (verify.containsReference && verifyTps >= prevTps - 0.3) {
-      // Within noise band, correct output — keep (might enable future gains)
-      kept = true;
-      if (verifyTps > prevTps) state.bestTokPerSec = verifyTps;
-      state.stalledCycles++;
-      console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} tok/s (within noise of ${prevTps.toFixed(2)})`));
+      console.log(clr("1;32", `  ✅ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (best was ${bestTps.toFixed(2)}, +${(verifyTps - bestTps).toFixed(2)}; band +${improveBand.toFixed(2)})`));
+    } else if (verify.containsReference && verifyTps >= acceptedTps - noiseBand) {
+      // Within noise band, correct output — keep the change but DO NOT
+      // advance bestTokPerSec. Advancing on noise creates a one-way
+      // ratchet that pretends throughput improved when it did not
+      // (Effort 12 cycles 1-24 went 0.21 → 0.30 this way, all noise).
+      if (shouldRejectQwen36PlateauNeutralKeep({
+        state,
+        stepKind,
+        description,
+        selfAnalysis,
+        verifyTokPerSec: verifyTps,
+        acceptedTokPerSec: acceptedTps,
+        currentProgressBand,
+      })) {
+        console.log(clr("1;31", `  ↩ REVERTING — Qwen36 plateau mode rejects neutral ${stepKind} keep at ${verifyTps.toFixed(2)} ${METRIC_LABEL}; current ${acceptedTps.toFixed(2)}`));
+        await resetCycleToPreHash(preHash);
+        state.failedApproaches.push(`${description} — plateau-neutral ${stepKind} did not beat current ${acceptedTps.toFixed(1)} ${METRIC_LABEL}`);
+        state.stalledCycles++;
+      } else {
+        kept = true;
+        if (verifyTps >= acceptedTps + currentProgressBand) {
+          state.stalledCycles = 0;
+          console.log(clr("1;32", `  ↑ KEPT — current accepted improved ${acceptedTps.toFixed(2)} → ${verifyTps.toFixed(2)} ${METRIC_LABEL} (below promotion band +${improveBand.toFixed(2)})`));
+        } else {
+          state.stalledCycles++;
+          console.log(clr("1;33", `  ≈ KEPT — ${verifyTps.toFixed(2)} ${METRIC_LABEL} (within ${noiseBand.toFixed(2)} of current ${acceptedTps.toFixed(2)}; best ${bestTps.toFixed(2)} unchanged)`));
+        }
+      }
     } else if (verify.containsReference && !state.currentBest?.containsReference) {
       // Gained correctness for the first time
       kept = true;
       state.bestTokPerSec = verifyTps;
       state.stalledCycles = 0;
-      console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} tok/s`));
+      console.log(clr("1;32", `  ✅ KEPT — gained correct output! ${verifyTps.toFixed(2)} ${METRIC_LABEL}`));
     } else {
       // Regressed speed or no correctness
-      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} tok/s < ${prevTps.toFixed(2)} (regressed ${(prevTps - verifyTps).toFixed(2)} tok/s)`));
-      await runCommand("git", ["reset", "--hard", preHash]);
-      state.failedApproaches.push(`${description} — regressed from ${prevTps.toFixed(1)} to ${verifyTps.toFixed(1)} tok/s`);
+      console.log(clr("1;31", `  ↩ REVERTING — ${verifyTps.toFixed(2)} ${METRIC_LABEL} < current ${acceptedTps.toFixed(2)} (regressed ${(acceptedTps - verifyTps).toFixed(2)}; band -${noiseBand.toFixed(2)})`));
+      await resetCycleToPreHash(preHash);
+      state.failedApproaches.push(`${description} — regressed from current ${acceptedTps.toFixed(1)} to ${verifyTps.toFixed(1)} ${METRIC_LABEL}`);
       state.stalledCycles++;
     }
 
@@ -1713,8 +2509,8 @@ async function main() {
         tokPerSec: verify.tokPerSec,
         containsReference: verify.containsReference,
       };
-      await runCommand("git", ["add", "-A", "src/", "build.zig"]).catch(() => {});
-      await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} tok/s)`]).catch(() => {});
+      await runCommand("git", ["add", "-A", ...LOOP_COMMIT_PATHS]).catch(() => {});
+      await runCommand("git", ["commit", "-m", `metal-loop: cycle-${cycle} ${description} (${verifyTps.toFixed(1)} ${METRIC_LABEL})`]).catch(() => {});
     }
 
     // Periodic profiling run (after verify, so we profile the current accepted state)
@@ -1744,6 +2540,7 @@ async function main() {
       runExitCode: verify.runExitCode,
       outputText: verify.outputText,
       selfAnalysis,
+      stepKind,
       nextIdeas: newIdeas,
     };
 
@@ -1760,15 +2557,16 @@ async function main() {
       console.log(clr("2", review));
     }
 
+    normalizeStateBestTokPerSec(state);
     await saveState(runDir, state);
 
     // Status summary
-    console.log(clr("2", `  stall=${state.stalledCycles} best=${state.bestTokPerSec.toFixed(2)} target=${TARGET_TOK_PER_SEC}`));
+    console.log(clr("2", `  stall=${state.stalledCycles} best-kept=${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL} current=${currentAcceptedTokPerSec(state).toFixed(2)} target=${TARGET_TOK_PER_SEC}`));
 
     // Check if we're done
-    if (verify.containsReference && verify.tokPerSec != null && verify.tokPerSec >= TARGET_TOK_PER_SEC) {
+    if (STOP_ON_TARGET && verify.containsReference && verify.tokPerSec != null && verify.tokPerSec >= TARGET_TOK_PER_SEC) {
       console.log(clr("1;32", "\n" + "=".repeat(64)));
-      console.log(clr("1;32", `  TARGET REACHED: ${verify.tokPerSec.toFixed(1)} tok/s >= ${TARGET_TOK_PER_SEC} with correct output!`));
+      console.log(clr("1;32", `  TARGET REACHED: ${verify.tokPerSec.toFixed(1)} ${METRIC_LABEL} >= ${TARGET_TOK_PER_SEC} with correct output!`));
       console.log(clr("1;32", "=".repeat(64)));
       break;
     }
@@ -1777,7 +2575,7 @@ async function main() {
   console.log(clr("1;36", `\nLoop complete. Results: ${runDir}`));
   console.log(clr("1;36", `Total cycles: ${state.cycles.length}`));
   console.log(clr("1;36", `Kept: ${state.cycles.filter(c => c.kept).length}`));
-  console.log(clr("1;36", `Best: ${state.bestTokPerSec.toFixed(2)} tok/s (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
+  console.log(clr("1;36", `Best kept-correct: ${bestKeptCorrectTokPerSec(state).toFixed(2)} ${METRIC_LABEL}; current accepted: ${currentAcceptedTokPerSec(state).toFixed(2)} ${METRIC_LABEL} (target: ${TARGET_TOK_PER_SEC}), correct=${state.currentBest?.containsReference ?? false}`));
 }
 
 if (import.meta.main) {

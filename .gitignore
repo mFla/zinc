@@ -3,6 +3,8 @@ zig-cache/
 zig-out/
 .zig-cache/
 .zig-cache-local/
+.zig-cache-global/
+.zinc_rt_autopilot/
 .zig-global-cache-local/
 .zig-global-cache/
 .zig-api-cache/
@@ -20,10 +22,14 @@ node_modules/
 bun.lock
 bun.lockb
 
+# Local build workarounds such as patched CRT objects on rolling Linux distros.
+.build-support/
+
 # Optimization loop state
 .llm_optimize/
 .zinc_optimize/
 .perf_optimize/
+.gpu_optimize/
 .metal_optimize/
 .worktrees/
 

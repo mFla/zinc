@@ -14,9 +14,9 @@
  *
  * Usage:
  *   bun loops/optimize_perf.ts --effort 1                        # Push descriptors
- *   bun loops/optimize_perf.ts --effort 2 --model qwen35b       # Fused gate+up on Qwen 35B
+ *   bun loops/optimize_perf.ts --effort 2 --model qwen36b       # Fused gate+up on Qwen 35B
  *   bun loops/optimize_perf.ts --effort 3 --agent codex         # Batch prefill with Codex
- *   bun loops/optimize_perf.ts --effort 6 --model qwen35b       # RDNA prefill recovery on Qwen 35B
+ *   bun loops/optimize_perf.ts --effort 6 --model qwen36b       # RDNA prefill recovery on Qwen 35B
  *   bun loops/optimize_perf.ts --effort 1 --resume               # Resume previous run
  *   bun loops/optimize_perf.ts --effort 1 --cycles 10 --dry-run  # Baseline only
  */
@@ -47,7 +47,8 @@ const CLAUDE_EFFORT = "max";
 // 1M-context variant is the right default for these cycles. Overridable
 // via ZINC_CLAUDE_MODEL in case a future run needs Sonnet / Haiku.
 const CLAUDE_MODEL = process.env.ZINC_CLAUDE_MODEL ?? "claude-opus-4-7[1m]";
-const CODEX_REASONING_EFFORT = "xhigh";
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 function loadEnv(): Record<string, string> {
   const envPath = join(REPO_ROOT, ".env");
@@ -85,24 +86,23 @@ function envOrDefault(name: string, fallback: string): string {
 }
 
 const MODELS: Record<string, ModelTarget> = {
-  qwen35b: {
-    key: "qwen35b",
-    name: "Qwen3.5-35B",
-    path: envOrDefault("ZINC_RDNA_QWEN35_35B_MODEL", "/root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"),
-    promptMode: "raw",
-    // Keep throughput benchmarking on the raw decode path, but run coherence
-    // prompts through ChatML so Qwen gets the expected closed-think scaffold.
-    coherencePromptMode: "chat",
-    envVar: "ZINC_RDNA_QWEN35_35B_MODEL",
-  },
   qwen36b: {
     key: "qwen36b",
     name: "Qwen3.6-35B",
     path: envOrDefault("ZINC_RDNA_QWEN36_35B_MODEL", "/root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
     promptMode: "raw",
-    // Qwen3.6 inherits the same closed-think chat prompt behavior as Qwen3.5.
+    // Keep throughput benchmarking on the raw decode path, but run coherence
+    // prompts through ChatML so Qwen gets the expected closed-think scaffold.
     coherencePromptMode: "chat",
     envVar: "ZINC_RDNA_QWEN36_35B_MODEL",
+  },
+  qwen3627b: {
+    key: "qwen3627b",
+    name: "Qwen3.6-27B",
+    path: envOrDefault("ZINC_RDNA_QWEN36_27B_MODEL", "/root/models/Qwen3.6-27B-Q4_K_M.gguf"),
+    promptMode: "raw",
+    coherencePromptMode: "chat",
+    envVar: "ZINC_RDNA_QWEN36_27B_MODEL",
   },
   qwen8b: {
     key: "qwen8b",
@@ -118,27 +118,27 @@ const MODELS: Record<string, ModelTarget> = {
     promptMode: "chat",
     envVar: "ZINC_RDNA_GEMMA4_31B_MODEL",
   },
-  gemma412b: {
-    key: "gemma412b",
-    name: "Gemma4-12B",
+  gemma426ba4b: {
+    key: "gemma426ba4b",
+    name: "Gemma4-26B-A4B",
     path: envOrDefault("ZINC_RDNA_GEMMA4_12B_MODEL", "/root/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
     promptMode: "chat",
     envVar: "ZINC_RDNA_GEMMA4_12B_MODEL",
-  },
-  gptoss20b: {
-    key: "gptoss20b",
-    name: "GPT-OSS-20B",
-    path: envOrDefault("ZINC_RDNA_GPT_OSS_20B_MODEL", "/root/models/openai_gpt-oss-20b-Q4_K_M.gguf"),
-    promptMode: "chat",
-    envVar: "ZINC_RDNA_GPT_OSS_20B_MODEL",
-    // GPT-OSS emits analysis/final channel scaffolding before the concise answer.
-    coherenceMaxTokens: 96,
   },
 };
 
 const MODEL_KEYS = Object.keys(MODELS).join(", ");
 
 const REMOTE_ZINC_ENV = "RADV_PERFTEST=coop_matrix";
+const REMOTE_VULKAN_DEVICE_INDEX = (() => {
+  const raw = process.env.ZINC_RDNA_DEVICE_INDEX
+    ?? ENV.ZINC_RDNA_DEVICE_INDEX
+    ?? process.env.ZINC_VULKAN_DEVICE_INDEX
+    ?? ENV.ZINC_VULKAN_DEVICE_INDEX
+    ?? "1";
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 1;
+})();
 const LONG_CONTEXT_BENCH_SENTENCE =
   "Benchmark context only. alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu.";
 
@@ -162,6 +162,58 @@ const PREFILL_BENCHMARK_PROMPT = [
   "Based on the reference above, the capital of France is",
 ].join("\n");
 
+const CODING_REVIEW_SNIPPET = [
+  "File: src/cache.ts",
+  "```ts",
+  "const cache = new Map<string, string>();",
+  "const pending = new Map<string, Promise<string>>();",
+  "",
+  "export async function getValue(key: string, load: () => Promise<string>) {",
+  "  if (cache.has(key)) return cache.get(key)!;",
+  "  if (pending.has(key)) return cache.get(key)!;",
+  "",
+  "  const task = load().then((value) => {",
+  "    cache.set(key, value);",
+  "    pending.delete(key);",
+  "    return value;",
+  "  });",
+  "  pending.set(key, task);",
+  "  return task;",
+  "}",
+  "```",
+].join("\n");
+
+const QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT = [
+  "Code review request: identify the bug, explain why it appears under concurrent requests, and provide a corrected version.",
+  "",
+  CODING_REVIEW_SNIPPET,
+  "",
+  "Review:",
+].join("\n");
+
+// Long-context decode benchmark for Effort 11. The prompt is a single
+// English narrative excerpt designed to tokenize to ~1500 tokens on
+// Qwen 3 8B (no chat-template overhead, no list/code tokenizer
+// quirks). Decode at L≈1500 is where the user-visible curve drop
+// hurts most in chat sessions, and it's still under the L=2300 GPU
+// hang we observed during manual cycles 71-73 of flash_attn.comp.
+const LONG_CONTEXT_DECODE_PROMPT = [
+  "Once upon a time, in a small village nestled between rolling hills and a meandering river, there lived a young blacksmith named Tomas. His forge stood at the edge of the marketplace, its chimney trailing thin grey smoke into the morning air. Every dawn he rose before the sun, lit the coals, and shaped iron into the tools and trinkets the villagers needed: horseshoes, kettles, hinges, plowshares. Tomas was not yet thirty, but the lines around his eyes told of long days and patient craft. He had inherited the forge from his father, who had inherited it from his father before him, three generations of black iron and orange sparks. The villagers respected him, though few understood why he often paused mid-strike to listen to the wind, or why on certain summer evenings he would walk alone along the riverbank, far past the willow trees, to a place no one else cared to go. The river there was deeper, its water darker, and the reeds grew taller than a man.",
+  "",
+  "Tomas had been going to that place since he was a boy, ever since the day his mother had taken him there to teach him the names of the herbs that grew along the bank. She had died the following winter, and the place had become his alone, a kind of memorial that did not need a stone. On this particular morning, however, Tomas did not go to the river. Instead, when he opened the forge, he found something unusual lying on the cold anvil: a sealed letter, its red wax stamped with a sigil he did not recognize. There was no draft, no ash disturbed, no footprint in the soot. The letter had simply appeared. Tomas turned it over in his rough hands. The paper was thick, expensive, and the wax had not yet hardened completely. Whoever left it had done so within the last hour.",
+  "",
+  "He carried it outside into the daylight and broke the seal with his thumb. The handwriting inside was elegant, precise, and the words were short: \"Come tonight, when the moon is over the willow. Bring nothing. Tell no one.\" There was no signature. Tomas read it twice, then a third time, and the more he read it the more he felt the weight of the morning shift around him. The wind, which had been still, began to stir. The smoke from his chimney bent westward toward the river. A horse in the marketplace whinnied without reason. Tomas folded the letter carefully and slipped it into the leather pouch at his belt, the one where he kept his grandfather's small iron compass and a single silver coin from a country no one in the village had heard of.",
+  "",
+  "He returned to the forge and worked through the day as he always did, but his mind was not on the iron. He shoed two horses for the miller, repaired a broken latch for the inn, and shaped four new nails for the carpenter, but he did all of it as if he were a man underwater. The customers noticed nothing. The village turned its slow wheel of bread and gossip and bargain and rest. The sun climbed, paused, and began its descent. When the bells of the small chapel rang for evening prayer, Tomas wiped his hands on his leather apron, banked the coals, and locked the forge for the night. He did not eat supper. He walked to the river path and waited for the moon.",
+  "",
+  "The moon rose late that evening, slow and full, the color of old brass. By the time it crested the willow at the bend of the river, Tomas had been waiting for nearly an hour. The reeds whispered. An owl called once and was silent. Tomas was about to turn back when a figure stepped out from behind the largest willow trunk. It was a woman he had never seen before, tall, with hair the color of river silt and a long traveling cloak the color of moss. She held no lantern, yet her face was clearly visible in the moonlight, as if she carried her own quiet light.",
+  "",
+  "Continue the story, describing what the woman said next and how Tomas responded.",
+].join("\n");
+
+const GEMMA_LONG_DECODE_PROMPT =
+  "Write six short bullet points explaining why local LLM benchmark reports should separate prefill throughput from decode throughput.";
+
 type MetricMode = "decode" | "prefill";
 
 type EffortSpec = {
@@ -172,6 +224,12 @@ type EffortSpec = {
   benchmarkPrompt: string;
   benchmarkMaxTokens: number;
   benchmarkMethod: string;
+  defaultModel?: string;
+  // Optional sanity floor for the baseline benchmark. This catches cases
+  // where the RDNA node is effectively not using the GPU path, is badly
+  // contaminated by stale processes, or has fallen into a driver/runtime
+  // state that makes optimization results meaningless.
+  minHealthyTokPerSec?: number;
   // Optional per-effort controller hints. These are rendered into the agent
   // prompt so the loop can encode knowledge the base plan document doesn't
   // (or shouldn't) encode itself.
@@ -231,37 +289,288 @@ const EFFORT_SPECS: Record<number, EffortSpec> = {
     benchmarkMaxTokens: 8,
     benchmarkMethod: "long-context prefill benchmark aligned with the site report",
   },
+  10: {
+    doc: "MULTI_HOUR_EFFORT_10_QWEN36_DECODE.md",
+    summary: "Qwen 3.6 35B-A3B decode + prefill speedups on RDNA4 (cross-token batched MoE, parallel-scan SSM, GEMM mmq)",
+    metricMode: "decode",
+    primaryMetricLabel: "decode tok/s",
+    benchmarkPrompt: "Write a detailed essay about the history of computing, from mechanical calculators to modern artificial intelligence.",
+    benchmarkMaxTokens: 200,
+    benchmarkMethod: "200-token decode benchmark on Qwen 3.6 35B-A3B, with --profile to track per-phase budgets",
+    knownFlatCategories: [
+      "Q4_K × Q8_1 mmq for SSM proj GEMV. Built in commit 27f0c76, wired behind ZINC_MMQ_SSM=1 in 3fef46e — measured zero speedup on Qwen 3.6 (SSM phase 15.94 ms either way). The shader is correct; the path is bandwidth-bound on the *weight* side, not on activation bandwidth or dequant compute. Don't re-attempt unless the dispatch is in a GEMM context (multi-token amortizing weight reads).",
+      "Fusing alpha+beta SSM proj DMMVs via dmmv_q4k_fused_gate_up. Reverted in commit 3fef46e (the comment in forward.zig:7557+ explains). The four SSM proj DMMVs already overlap on RDNA4 since there are no inter-DMMV barriers — fusing saves a dispatch but loses no wall time. Distinct from the cycle-13 fused-RMS+alpha+beta which won by adding the RMS norm into the same dispatch — that was a separate dispatch reduction, not just a fusion of already-overlapping DMMVs.",
+      "Dense fused gate+up (dmmv_q4k_fused_gate_up.comp landed in 339c886). Regresses Gemma 4 31B decode by +11% from doubled per-WG register pressure on wide inter_dim=25600. Pipeline + helper available, but not wired and not a candidate for re-wire unless a NUM_ROWS=1 variant is built that fits the register budget.",
+      "Adding a NUM_ROWS=4 medium variant of dmmv_q4k for SSM out (M=2048). The SSM out projection at 3.10 ms already runs near peak occupancy with NUM_ROWS=2 → 1024 WGs on a 2048-WG-capacity device; dropping to 512 WGs (NUM_ROWS=4) underutilizes. Don't add this without measuring the SSM out is genuinely under-saturated.",
+      "Barrier narrowing computeBarrier() → computeBufferBarrier() on already-overlapping dispatches. Cycles 1, 16, 18 all measured at-or-near noise floor on RADV. The driver doesn't appear to differentiate the access masks the way the hypothesis assumed. Don't re-attempt without first proving via VK_KHR_synchronization2 / VkCmdPipelineBarrier2 that the access mask precision actually changes the GPU pipeline behavior on RADV.",
+      "Register-caching delta_net_output across the two passes in ssm_gated_norm.comp (cycle 5). Pass-2 global re-read is not the bottleneck.",
+      "Fused MoE down + SwiGLU (cycle 9, kpar+swiglu and triple-fused down+swiglu+acc both regressed) and Q4_K MoE gate+up+SwiGLU forward fusion (cycle 19, +0.12% — noise). Don't re-attempt MoE-side SwiGLU fusion variants.",
+      "f16-quantized MoE router weight + fused rms_norm_dmmv_f16_router (cycle 17). Per-layer device-local f16 buffers built from f32 ffn_gate_inp at engine init. Negative result. The cycle-8 f32 fused-router shader is the right shape and is already shipped.",
+      "Three-way RMS+K+V fusion (cycle 14, rms_norm_dmmv_q8_0_kv shader). Reverted — too much register pressure in one workgroup. Two-way KV-only fusion or an attention-side fused-RMS+single-DMMV (e.g., RMS+Q proj alone) is still open.",
+      "Wide NUM_ROWS variants on the SSM proj wqkv path (cycle 11 — Q8_0 NUM_ROWS=4 + register-tiled activation reads). Neutral. NUM_ROWS=4 wide kpar variant of dmmv_q4k_moe_kpar for MoE gate/up (cycle 12) measured -0.05 tok/s and gate_up phase +0.10 ms. Don't re-attempt wide NUM_ROWS variants on M ≤ ~10000 dispatches.",
+      "Cycle-6/7 fused MoE down + weighted_acc shader (Q4_K + Q5_K). +0.16 vs checkpoint, below override threshold. Already a correct shader; the bottleneck moved away from this fusion.",
+    ],
+    structuralSwingIdeas: [
+      "More fused-RMS+DMMV shaders. The pattern that delivers wins on this effort: fold the RMS norm into the immediately-consuming DMMV. Cycle 8 shipped rms_norm_dmmv_f32 (+0.61 tok/s) for the f32 router. Cycle 13 shipped rms_norm_dmmv_q4k_alpha_beta (+0.57 tok/s) for the SSM proj alpha+beta pair. Concrete remaining candidates: (a) attn_norm + wqkv DMMV (the SSM proj's biggest output, M≈6144) — cycle 10 attempted this and measured small flag-on gain falling short of checkpoint due to redundant per-WG RMS reduction work; the fix is to compute the RMS reduction ONCE per workgroup via shared memory and reuse across all NUM_ROWS rows (cycle 13's shader does this correctly — read it). (b) attn_norm + ssm_z DMMV (M≈4096), same fix. (c) attn_norm + attention Q proj on the 10 attention layers (M=2048, K=2048) — single-output shape is a clean fit for the existing rms_norm_dmmv_f32 layout.",
+      "Eliminate dispatches in the SSM tail. Fused ssm_out + FFN-RMS-norm shader: the SSM tail does (Q4_K ssm_out DMMV → residual add → ffn_norm RMS norm) which is structurally the same as the existing rms_norm_add shader (commit a5f1fdc, used by Gemma post_ffw_norm) but with a Q4_K DMMV in front. Eliminates 1 dispatch + 1 barrier per SSM layer × 30 layers = 30 dispatches saved per token. The hidden-buf accumulate pattern is already proven correct in rms_norm_add.comp — extend with a Q4_K weight stream.",
+      "KV-cache-write fused into K-projection on attention layers. Saves 10 dispatches + 10 barriers per token. Distinct from cycle 14's failed three-way RMS+K+V (which had too much register pressure) — this fuses just the K projection's dot-product output directly into the cache page write at end-of-kernel, skipping the intermediate k_buf round-trip + the standalone kv_cache_write dispatch. The existing kv_cache_write shader's page-table indexing logic ports cleanly into a Q8_0 / Q4_K K-proj kernel's tail.",
+      "Cross-token batched MoE FFN (phase 1.1, prefill lever — won't help decode metric). Shader dmmv_q4k_moe_batched.comp landed in c36bd23 with dispatch grid (M+1)/2, n_experts_used, n_tokens. Pipeline + DmmvDispatch.recordMoeBatchedDispatch helper available. Remaining work: (1) build per-layer routing buffer for all N prompt tokens; (2) allocate [N × n_experts_used × inter] output scratch; (3) dispatch new shader for gate / up / down; (4) per-token weighted accumulation kernel that scatters n_experts_used × inter outputs per token weighted by routing probs back into hidden; (5) relax canUseBatchedPrefillRdna for the Qwen 35B MoE family with per-layer-type detection. Only attempt if the controller's metric mode is 'prefill' — won't move the decode benchmark.",
+      "Parallel-scan SSM prefill (also prefill-only). The 30 SSM layers in the Qwen 35B MoE family have token-recurrent state. Blelloch/Hillis-Steele scan over the N-token axis. Without this, even with batched MoE, Qwen 3.6 prefill caps around 35-40 tok/s (SSM stays sequential). With both, beats llama.cpp's 54.5. Reference llama.cpp mamba2 ggml_ssm_scan.",
+      "GEMM-style Q4_K mmq (also prefill-only). dmmv_q4k_q8_1.comp from commit 27f0c76 is GEMV-only and proved no-op on RDNA4 GEMV. A GEMM variant where the dispatch axis includes an N-token batch makes integer-dot pay off — arithmetic intensity goes from K to N×K. Pairs with phase 1.1.",
+      "VkCmdPipelineBarrier2 with explicit srcStageMask + srcAccessMask precision (vs the current PipelineBarrier1 we emit). Cycles 1/16/18 narrowed full → buffer-scoped barriers and measured flat — but they didn't change the API. PipelineBarrier2's explicit masks are different on RADV's path, and on a sync-bound benchmark like ours the API switch is worth measuring once before declaring all barrier work flat.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/stepan/Workspace/llama.cpp",
+        focus: "Vulkan backend at ggml/src/ggml-vulkan/. mul_mmq.comp + mul_mmq_funcs.glsl for the GEMM-style mmq pattern (Q4_K and Q5_K stanzas at lines 303-364 of mul_mmq_funcs.glsl). vulkan-shaders/mul_mm.comp for dense matmul. mamba/mamba2 ggml_ssm_scan op in src/llama-graph.cpp + ggml/src/ggml-cuda/ssm-scan.cu (CUDA reference) for parallel-scan SSM prefill. Routing/expert grouping in vulkan-shaders/topk_moe.comp + count_experts.comp.",
+      },
+      {
+        path: "/Users/stepan/Workspace/vllm",
+        focus: "Expert routing + fused MoE: vllm/model_executor/layers/fused_moe/. Useful for understanding how production systems group tokens by expert with permutation indices.",
+      },
+    ],
+  },
   6: {
-    doc: "MULTI_HOUR_EFFORT_6_RDNA_QWEN35_PREFILL.md",
-    summary: "RDNA Qwen35 prefill recovery (restore flagship TTFT and prefill telemetry)",
+    doc: "MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
+    summary: "RDNA Qwen36 prefill recovery (restore flagship TTFT and prefill telemetry)",
     metricMode: "prefill",
     primaryMetricLabel: "prefill tok/s",
     benchmarkPrompt: PREFILL_BENCHMARK_PROMPT,
     benchmarkMaxTokens: 8,
-    benchmarkMethod: "long-context prefill benchmark on RDNA for the Qwen3.5-35B flagship workload",
+    benchmarkMethod: "long-context prefill benchmark on RDNA for the Qwen3.6-35B flagship workload",
     knownFlatCategories: [
-      "Narrowing a single compute→compute barrier between successive dispatches to a buffer-scoped or multi-buffer barrier. Tried 7 times on RDNA4 (cycles 9, 17, 18, 19, 21, 22, 24 of the first run); cumulative movement below 0.25 tok/s. Do not re-attempt unless the barrier is structurally removed (not just narrowed) or a micro-benchmark shows a specific RADV path responds differently.",
-      "Adding phase/dispatch profiling without a downstream structural change in the same cycle. The ZINC_PREFILL_PROFILE=1 output already covers per-phase and MoE/SSM sub-bucket timing; the loop runs with that flag on baseline and after every accepted change, so the phase budget is always fresh in the prompt.",
-      "Re-layering prefill embedding dequant (CPU f32 cache / staging-only / interleaved). Cycles 14, 15, 23 of the first run explored these; the current upfront bulk dequant into host-mapped staging is the accepted equilibrium.",
-      "Pair-dispatch via recordBatchDispatch(num_cols=2) through the existing dmmv_q8_0_batch / dmmv_q4k_batch shaders. Cycle 8 of the second run measured -0.12 tok/s with flag on; cycle 9 rewrote the shader with proper wave64 parallelism (2 rows/WG × 64 threads + subgroupAdd, matching single-col) and STILL measured -0.8 tok/s with flag on. Root cause: the per-layer 'stage norm col0+col1, split 4 outputs' barrier-and-copy chain costs more than the weight-read amortization saves. The right fix is not num_cols=2 — it is llama.cpp's pattern of compile-time specialized DMMV variants at each of num_cols=1..8 AND switching to a proper matmul kernel (mul_mm) when N > 8.",
-      "Extending the prefill CB pipeline from 2-deep to 3-deep (cycle 2 of the second run): flat. Submit/wait is already saturated at 2-deep on the 154-token workload; the record+submit+wait gap is not the dominant cost.",
+      "DORMANT TILED-GEMM FOUNDATIONS. Cycles 14, 16, 18, 21 ported all 4 pieces (count_experts, mul_mm_q4k, mul_mm_id_q4k, mul_mmq_q4k) as foundationKeeps. mul_mm_q4k was wired into the LM head only (N=1, the worst case for tiled GEMM) and measured FLAT (78.14 vs 78.55 noise band). The other 3 stayed dormant with zero callers. Cycle 40 reverted ~1470 LOC of dormant infra after audit. Re-porting the SAME shaders is a known dead-end; the unfinished work is the buffer-layout refactor needed to wire them into SSM proj / MoE FFN prefill, NOT another foundation port. mul_mm_q4k.comp + count_experts.comp survived; mul_mm_id_q4k and mul_mmq_q4k were deleted. See loops/efforts/MULTI_HOUR_EFFORT_6 for the full audit.",
+      "GEMV-style cross-token MoE batching via dmmv_q4k_moe_batched.comp (commit c36bd23). Spent 9 wire-in cycles producing flat or negative results. Architecturally wrong for RDNA4: dispatches 1.7M workgroups (M × n_experts_used × n_tokens) where the device caps at ~1024 in flight. Pipeline + helper stay in tree as record but should not be wired. The structural answer is per-expert grouped GEMM (one WG per expert × tile, not per token × expert × row).",
+      "REGISTER-CACHE EXTENSIONS BEYOND CYCLE 46. Cycles 47, 48, 49 attempted to apply the cycle-42/46 winning pattern (vec4 + register-cache for x[]) to rms_norm_dmmv_f32 (router), norm_rope.comp (per-head Q/K-norm+RoPE), and ssm_gated_norm.comp — all flat. Reasons vary (head_dim=128 too small for vec4 amortization on the head-pinned WGs; per-head WG already register-saturated; multi-WG reductions starve the cache). The pattern is exhausted on the obvious-shape kernels; future targets need shape-fit verification first (single-WG-per-token, K_v4 ≥ 64, no per-head-pinned dispatch).",
+      "Three-way RMS+K+V or RMS+Q+K+V fusion shaders (cycle 11 of effort 6, cycle 14 of effort 10). Register pressure collapses occupancy on RDNA4. Two-way RMS+single-output fusions (cycles 8, 13 of effort 10) are fine — three-way isn't.",
+      "Triple-fused MoE swiglu+down+weighted-acc shader (cycle 9 of effort 6). Regressed -0.5%. The existing path's down + moe_weighted_acc dispatches already overlap on RDNA4.",
+      "Attention K+V DMMV fusion via dmmv_q4k_fused_gate_up (cycle 35). Flat on flagship. Three reasons: (1) full-attention layers are only ~1/3 of the model; (2) Q-proj and K-proj have different M values; (3) the K+V dispatch overlap on RDNA4 already saturates DRAM.",
+      "SSM proj wqkv+z fusion via dmmv_q4k_fused_wqkv_z (cycle 38). When wired (ZINC_SSM_PROJ_FUSED=1) measured -2.2% regression in cycle 40. The shader was deleted. The wqkv and z DMMVs already overlap; fusing them adds register pressure without saving wall time.",
+      "Wide NUM_ROWS variants on dmmv_q4k_moe_kpar (cycle 12 of effort 10). NUM_ROWS=4 underutilizes at MoE expert M=1408. uvec4 collapse of Q4_K/Q5_K block headers across three hot MoE shaders (cycle 43): flat.",
+      "vec4 SwiGLU shader (cycle 44). Flat → -0.15 tok/s. The elementwise SwiGLU is already DRAM-bound on the X-vector; vec4 doesn't move the bottleneck.",
+      "vec4 alias bindings on flash_attn.comp Phase 1 (q.k dot) and dmmv_q8_0.comp x_data reads (cycle 45). Flat. flash_attn's bottleneck is K/V tile reads not Q reads; dmmv_q8_0 X is already amortized.",
+      "Narrowing a single compute→compute barrier to buffer-scoped on RADV (cycles 1, 16, 18 of effort 10; multiple cycles of effort 6 runs). Cumulative movement below 0.25 tok/s. Don't re-attempt without VkCmdPipelineBarrier2 explicit access masks.",
+      "Adding phase/dispatch profiling without a downstream structural change. ZINC_PREFILL_PROFILE=1 already covers per-phase and MoE/SSM sub-bucket timing; the loop emits it on every cycle.",
+      "Re-layering prefill embedding dequant (CPU f32 cache / staging-only / interleaved). Cycles 14, 15, 23 of the first run explored these; current upfront bulk dequant into host-mapped staging is the accepted equilibrium.",
+      "Pair-dispatch via recordBatchDispatch(num_cols=2) through dmmv_q8_0_batch / dmmv_q4k_batch. Cycle 8 of the second run: -0.12 tok/s; cycle 9 rewrote with wave64 parallelism: -0.8 tok/s. K-parallel kpar shaders (commit bed8463 + e43da13) are now the canonical inner loop; specialized num_cols=2 variants on top haven't measured a win.",
+      "Extending the prefill CB pipeline from 2-deep to 3-deep (cycle 2 of the second run): flat. Submit/wait is already saturated at 2-deep.",
     ],
     structuralSwingIdeas: [
-      "Port llama.cpp's compile-time specialized DMMV design: pre-compile 8 variants of the Q8_0 DMMV shader (one per num_cols value 1..8) with num_cols baked in as a GLSL specialization constant so the inner loop unrolls. See /Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp line 267 (`mul_mat_vec_max_cols = 8`) and vulkan-shaders/mul_mat_vec_base.glsl for the NUM_COLS specialization pattern. This is the actual fix cycles 8/9 discovered is needed.",
-      "Switch to a proper multi-token matmul (mul_mm-style) for prefill when N > some threshold (llama.cpp uses 8). The SSM proj and MoE router DMMVs at 154-token prefill are M=~2048 × N=154 × K=2048 — that is a dense matmul, not a DMMV stack. Use the cooperative matrix path (src/shaders/coop_matmul.comp already exists in the tree). Reference: /Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp and mul_mm_cm2.comp.",
-      "Port llama.cpp's mul_mmq / Q8_1 input quantization pattern for prefill matmul: quantize the f32 input activations to Q8_1 once before the matmul, then the per-dispatch memory bandwidth drops by ~4×. See /Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/quantize_q8_1.comp and mul_mmq.comp.",
-      "Step 5b: build per-chunk routing arrays — for a chunk of N prompt tokens, compute the N×top_k routing vector and invert it into per-expert token lists plus a permutation. Pure bookkeeping; no new kernels. Reference vllm's expert routing: /Users/zolotukhin/Workplace/vllm/vllm/model_executor/layers/fused_moe/.",
-      "Step 5c: run per-expert gate/up/down over the gathered token block once Step 5b lands. One larger matmul per active expert instead of N tiny per-token matvecs, then scatter outputs back via the permutation. This depends on Step 5b and the matmul kernel from idea #2.",
-      "Revert the dormant flag-gated pair-batch wiring (effort-6 run-2 cycles 1/3/5/7/9 now proven dead-end by cycles 8/9). Keep only `recordBatchDispatchPush` (cycle 1) if it has a cleaner design than the original and can be repurposed for the 8-way specialized shader in idea #1; otherwise revert that too. Cleaning dead code is real progress — the commit log currently advertises five foundation steps that do not pay.",
+      "WIRE EXISTING mul_mm_q4k INTO SSM PROJ PREFILL (cycle 40's deferred work). The shader exists in tree (src/shaders/mul_mm_q4k.comp, currently used only for LM head where N=1 wastes BN tile). SSM proj fires 4 DMMVs × 30 layers × 154 tokens — perfect amortization shape. Concrete: in src/compute/forward.zig prefillBatched, replace the per-token loop over recordDmmv calls for SSM wqkv/z with a single mul_mm_q4k dispatch where N=batch_size_per_chunk. Buffer layout: gather norm_buf columns into a [N × K] activation tile; output [M × N] result; scatter back via the same pattern that recordBatchDispatch already uses. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3. Cycle 40 self-analysis flagged this as 'high-risk one-cycle refactor needed for buffer layout' — break it into 2 phases: (a) build the gather/scatter helper standalone with synthetic [M, K, N] data; (b) wire ONE projection (z is the simplest, single output M=d_inner) and measure SSM proj phase delta from ZINC_PREFILL_PROFILE=1.",
+      "ATTACK THE MoE BUCKET (884 ms, 24% of prefill, untouched since cycle 40). The mul_mm_id_q4k port was deleted as dormant — re-doing it the same way is the dead-end. Three viable paths: (a) extend the cycle-50 winning pattern (wider threads-per-row, halve register footprint, double WG count) to dmmv_q4k_moe_kpar.comp and dmmv_q4k_moe_fused_down_acc.comp — these are the inner loops of the MoE FFN. The pre-cycle-50 ssm_delta was 8t×8r; analogous shape transformation should land similar gains. (b) Apply vec4 reads/writes to moe_weighted_acc.comp accumulator (cycle 42 pattern on a different shader). (c) Use the in-tree count_experts.comp to add a per-expert dispatch wrapper that culls experts with zero routed tokens — the long tail of unselected experts is wasted dispatch work even before any GEMM port.",
+      "EXTEND CYCLE-50 PATTERN (wider threads-per-row + halved register footprint + doubled WG count) to remaining hot kernels. Cycle 50 found +2.76% on ssm_delta_net via 8t×8r → 16t×4r. The same shape transformation is untried on: dmmv_q4k_moe_kpar.comp (MoE expert FFN, currently NUM_ROWS=2 at expert M=1408 — try 32 threads-per-row × 1 row), dmmv_q4k_q8_1.comp (Q4_K weight × Q8_1 activation), dmmv_q4k_moe_fused_down_acc.comp (MoE down + accumulate). cycle-50 follow-up note: 32t×2r is the next step on ssm_delta itself.",
+      "PARALLEL-SCAN SSM PREFILL (the ssm_delta state recurrence). The 30 SSM layers in the Qwen 35B MoE family have token-recurrent state. Currently scanned token-by-token. Blelloch/Hillis-Steele scan over the N=154 token axis would parallelize this. Reference: llama.cpp mamba2 ggml_ssm_scan op + ggml-cuda/ssm-scan.cu. Risk: correctness blast radius is higher than dispatch-shape changes. Validate via ZINC_BATCHED_PREFILL=validate at tol=1e-3 against the per-token reference. This is the single largest unattacked structural lever for the SSM bucket.",
+      "FLASH_ATTN Q PRE-LOAD INTO SHARED MEMORY (cycle 48 nextIdea). Currently Q[head_dim] is read repeatedly inside the Q.K dot loop across the K-tile axis. Pre-loading Q once per WG into shared/register memory eliminates head_dim × block_len redundant reads. Attention bucket is ~340 ms. Reference: ~/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_*.comp use the same pattern. Cycle 48 attempted vec4 alias bindings on the q.k dot and measured flat — the right intervention is the Q caching, not vec4 on the existing reads.",
+      "TOPK SHADER CROSS-WG PARALLELISM (cycle 49 nextIdea). topk fires once per token at the MoE entry, currently single-WG single-pass. 117 ms bucket. Two-pass topk (find threshold per-block, gather above threshold) parallelizes across WGs. Small absolute bucket but architecturally simple compared to grouped MoE.",
     ],
     referenceImplementations: [
       {
-        path: "/Users/zolotukhin/Workplace/llama.cpp",
-        focus: "Vulkan backend at ggml/src/ggml-vulkan/. Specifically ggml-vulkan.cpp for pipeline selection (mul_mat_vec_max_cols = 8; routing to mul_mm when N > 8), vulkan-shaders/mul_mat_vec_base.glsl for the NUM_COLS specialization pattern, vulkan-shaders/mul_mm.comp and mul_mm_cm2.comp for dense matmul, vulkan-shaders/mul_mmq.comp and quantize_q8_1.comp for quantized-input matmul, vulkan-shaders/topk_moe.comp and count_experts.comp for MoE routing.",
+        path: "/Users/stepan/Workspace/zinc/src/shaders/mul_mm_q4k.comp",
+        focus: "ALREADY IN TREE. Tiled Q4_K GEMM ported in cycle 16, currently wired only for LM head (N=1, worst case for tiled GEMM). The shader is correct and validated. The unfinished work for swing #1 is wiring it into SSM proj prefill where N=batch_size_per_chunk. Read alongside src/compute/dmmv.zig recordMulMmQ4K helper.",
       },
       {
-        path: "/Users/zolotukhin/Workplace/vllm",
-        focus: "Expert routing and fused MoE: vllm/model_executor/layers/fused_moe/. Continuous batching: vllm/core/scheduler.py. Attention backends: vllm/attention/backends/. Useful for understanding how production systems structure prefill vs decode separation and how experts are grouped by token.",
+        path: "/Users/stepan/Workspace/zinc/src/shaders/count_experts.comp",
+        focus: "ALREADY IN TREE. Per-expert token-count buffer ported in cycle 14, wired in cycle 22 (gated ZINC_COUNT_EXPERTS_PREFILL=1). Useful for swing #2(c) — culling zero-token experts before any MoE FFN dispatch.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/dmmv_q4k_moe_kpar.comp",
+        focus: "Current MoE expert FFN inner loop, NUM_ROWS=2 at expert M=1408. Target for swing #3 (cycle-50 wider-threads-per-row pattern). Lines 100-160 contain the Q4_K block decoder reused throughout the MoE shaders.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/ssm_delta_net.comp",
+        focus: "Cycle 50's winner — restructured 8 threads/row × 8 rows/tile to 16 threads/row × 4 rows/tile. Read this to understand the exact pattern to replicate on dmmv_q4k_moe_kpar and dmmv_q4k_moe_fused_down_acc. The reg_state[16] → reg_state[8] halving and subgroupShuffleXor 8 reduction are the two key transformations.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/rms_norm_dmmv_f32.comp",
+        focus: "Cycle 42's winner (+4.66%) — vec4 reads/writes across hidden, ffn_norm weights, router weights, with WG-0 ffn_norm writeback. Pattern: gate fused path on K%4==0. Read alongside rms_norm_mul.comp (cycle 46's similar +1.01% win with register-cache for x[]). These two shaders show the structure that landed wins on RDNA4.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp",
+        focus: "Reference for swing #1 wire-up. The tiled GEMM in tree (mul_mm_q4k.comp) was modeled on this — the dispatch-shape pattern is gridX=blocks_m × split_k, gridY=ceil(N/BN) tiles, gridZ=1 for dense / expert_idx for MUL_MAT_ID. For SSM proj wire-up, copy the gridY = ceil(154/BN) sizing and the buffer-layout convention for [N × K] activation tiles.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm2.comp",
+        focus: "Reference for swing #5 (Q pre-load). Look at the Q-tile shared-memory load at the top of the kernel and how it's reused across the K-tile inner loop. Our flash_attn.comp re-reads Q[head_dim] per K-tile iteration — this is the redundant work cycle 48 should have removed.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/llama-graph.cpp",
+        focus: "Reference for swing #4 (parallel-scan SSM). Search for ggml_ssm_scan to find the prefill-time scan op. The CUDA implementation is at ggml/src/ggml-cuda/ssm-scan.cu — it computes the recurrence via Blelloch scan over the token axis. The math is identical between CUDA and Vulkan; what changes is the WG layout (one WG per head per chunk).",
+      },
+    ],
+  },
+  11: {
+    doc: "MULTI_HOUR_EFFORT_11_RDNA_DECODE_LONG_CONTEXT.md",
+    summary: "Flatten the RDNA4 decode-with-context curve on Qwen 3 8B + 35B (target: decode at L=1500 ≥ 60% of empty-context decode)",
+    metricMode: "decode",
+    primaryMetricLabel: "decode tok/s at L≈846",
+    benchmarkPrompt: LONG_CONTEXT_DECODE_PROMPT,
+    benchmarkMaxTokens: 32,
+    benchmarkMethod: "decode 32 tokens after prefilling the LONG_CONTEXT_DECODE_PROMPT (tokenizes to ~846 tokens on Qwen 3 8B's BPE, NOT 1500 as the prompt comment originally claimed — calibration finding from run-3 cycle 11) on Qwen3-8B-Q4_K_M.gguf with RADV_PERFTEST=coop_matrix; report decode tok/s as the primary metric",
+    knownFlatCategories: [
+      "108.05 IS A HARD PLATEAU AT L≈846 WITHOUT COOPMAT. Run-5 ran 34 cycles (c24-c57) with ZERO perf-keeps. All 6 prior structuralSwingIdeas were directly DISPROVEN by measurement. The realistic next-tier improvement requires the multi-week flash_attn_cm1.comp KHR coopmat port. Single-cycle work in this regime should target the small-win remainder list in structuralSwingIdeas, not redo the disproven structural attacks below.",
+      "FFN SUB-BUCKET CALIBRATION (run-4 c12): gate+up+SwiGLU is 60% of FFN (3.55 ms = 35% of total decode); down_proj is 40% of FFN (2.40 ms = 24% of total). The 'attack down_proj first' premise was wrong AND every direct attack on gate+up+SwiGLU has now also been disproved (see entries below).",
+      "GATE+UP SPLIT-K ON K=4096 IS DEAD. Run-5 c37 (N_K_CHUNKS=2/4): -3.1% / -6.1%. Run-5 c55 (N_K_CHUNKS=2 + dedicated merge pass): -1.8%. Failure mode: gate+up already has 6144 WGs at intermediate_dim=12288, so the run-3 c12 occupancy unlock that gave flash_attn +3.2 tok/s (32 → 128 WGs) does not apply. Splitting K just adds merge-pass overhead with a 192-384 KB partials buffer plus an extra barrier. Don't propose split-K on the gate+up shader.",
+      "LAST-WG-DOES-NORM CROSS-LAYER FUSION IS DEAD ACROSS 4 PATTERNS NOW. Separate-buffer (run-3 c5, -7%); atomic-counter cross-WG sync (run-3 c15, broken output); merge-shader piggyback (run-4 c7/c28, -67%/-69%); atomicAdd + GL_KHR_memory_scope_semantics device-scope acquire-release (run-5 c54, BIT-CORRECT but -1.4%). The synchronization overhead exceeds the saved dispatch+barrier even with proper memory ordering. Don't attempt o_proj+ffn_norm cross-layer fusion; the 36 dispatch+barrier savings/token is not enough to overcome any cross-WG sync mechanism.",
+      "GATE+UP LDS-INPUT BROADCAST IS DEAD. Run-5 c35: cooperatively load 16 KB shared vec4 input at WG start, replace per-thread x_v4 reads with LDS reads. Result: -13.8% (92.95 vs 108.05). The original x_v4 reads were L1-cache hits; LDS staging halved occupancy without recovering anything. Same pattern that killed K/V LDS staging on flash_attn.",
+      "HIDDEN-DIM-ROTATED DISPATCH ON down_proj IS DEAD. Run-5 c44 (ROT_STRIDE=137 spec const): -0.34%. The L1/L2 thrash hypothesis was wrong; the existing in-order dispatch is L2-cache-friendly. Don't propose dispatch-order rotations.",
+      "Q+K+V MERGED-DISPATCH FUSION REGRESSES. Run-5 c49 (single dispatch, WG-ID branched across 3 Q4_K weight tensors): -0.23%. The three projections already overlap on RDNA4; merging them adds register pressure without saving wall time. Same pattern as the failed K+V fusion (run-2 c10, -1.1%).",
+      "MMQ Q4_K × Q8_1 ROUTING FOR down_proj REGRESSES. Run-5 c51: -3.5%. The dmmv_q4k_q8_1.comp pipeline is correct (bias-fix + wave64 spec), but routing the down_proj through it adds activation-quantize overhead that exceeds the int-dot savings at the current decode shape (n_tokens=1).",
+      "NUM_ROWS≠2 ON FUSED gate+up+SwiGLU IS DEAD. NUM_ROWS=4 (run-5 c41, -1.5% — halves WG count from 6144 → 3072, under-saturates). NUM_ROWS=1 narrow Q4_K for tall-K down_proj path (run-5 c39, -0.62%). NUM_ROWS=2 is the right shape on every dense Q4_K path; don't tune NUM_ROWS.",
+      "ATTENTION-SHADER MICRO-TUNING IS EXHAUSTED ACROSS 5+ RUNS. ALL of these are flat/regress: V-load promotion; drop redundant Phase-4 barriers; subgroupShuffleXor merge variants; register-resident accumulators across blocks; 32-way ILP; narrow buffer-scoped barriers; register-resident max_old/sum_old per-lane (run-4 c19); subgroupBroadcast/Shuffle in split_merge (run-4 c29, run-5 c52); hoist Phase B reads ahead of Phase A (run-4 c30); pack 2 heads per WG cluster-32 (run-4 c14); wave64 pinning on pipeline_q4k (run-4 c31); pre-scale Q during s_q4 staging (run-5 c42, flat); fold sink_val into M_c before cluster-max (run-5 c43, flat); fold inv_L_full into s_weights (run-5 c45, flat); D-axis split on split_merge D_SPLIT=2 (run-5 c52, slight regress). The 16-way ILP + cluster-4/2 reductions are the saturation point.",
+      "FFN-SHADER MICRO-TUNES ARE EXHAUSTED. uvec4 alias for header reads (run-4 c8, flat); algebraic refactor with by_sum reuse (run-4 c13, -0.4%); 2-way paired accumulators (run-4 c16, flat); row/block loop swap mirror of c22 (run-4 c24, flat); unpackHalf2x16 paired-halves (run-5 c34, flat); vec2 subgroupAdd packing on dmmv_q4k.comp (run-5 c36, flat); vec2 subgroupAdd packing on fused gate+up (run-5 c47, flat); hoist 12 gate+up u32 weight reads to top of inner block loop (run-5 c46, flat); residual_rms_norm.comp on decode path (run-5 c53, flat-to-regress).",
+      "REMOVING gl_NumSubgroups>1 CROSS-SUBGROUP REDUCTION IN flash_attn REGRESSES (-0.44, run-4 c32). The branch appears unused on wave64=1-subgroup but contributes to compiler scheduling decisions.",
+      "limit_occupancy_shmem (llama.cpp RDNA HACK) IS FLAT FOR DMMV. Run-5 c38: 24 KB dummy LDS to halve concurrent WGs/CU on dmmv_q4k.comp. Flat-to-slight-regress. The hack only helps flash_attn-style patterns where over-subscription thrashes the cache; DMMV doesn't have that pattern.",
+      "BLOCK_SIZE / N_I_CHUNKS TUNING IS LARGELY FLAT. 256→512 / 256→384 / N_I_CHUNKS=8 all flat. EXCEPTION: run-5 c56 N_I_CHUNKS=8 + cluster-quad merge gained +0.41 at L=846 BUT regressed -39% at L=5. Multi-modal blocker for default-switch; would require runtime-conditional dispatch (cluster-2 at short, cluster-quad at long) to ship.",
+      "LDS STAGING OF K OR V IN flash_attn IS UNAMBIGUOUSLY DEAD (3 attempts: -44%, -12%, -29%). Plus run-5 c35 confirms LDS staging of FFN input is also dead (-13.8%). DO NOT propose cooperative LDS staging in any form on the hot decode path.",
+      "GQA COLLAPSE STARVES R9700 WITHOUT SPLIT-K. Q_PER_KV=4 (-9.9%); Q_PER_KV=2 (-17.5%). Split-K (N_I_CHUNKS=4) restores WG count and won +4.1% (run-3 c12). Combining Br=2 with split-K is the only untried GQA variant — see structuralSwingIdeas.",
+      "TPB=32 DENSE Q4_K DMMV IS DEAD ACROSS 3 VARIANTS (run-4 c5/c6/c33: -1.3% / -6.5% / -0.83%). TPB=16 + NUM_ROWS=2 + cycle-22 row/block loop swap is the right shape.",
+      "SPLIT-K / K-AXIS SPLIT ON DENSE Q4_K down_proj IS FLAT-TO-REGRESSING. Split-K kpar32_split (run-4 c4, flat); K-axis N_K_CHUNKS=2/4 (-0.83% / -0.97%). down_proj is already 78-85% of bandwidth-floor; merge-pass overhead exceeds the parallelism gain.",
+      "rms_norm FOLDED INTO ADJACENT MATVECS IS AT-OR-BELOW THRESHOLD. -0.37 (rms+gate+up+SwiGLU); +0.49 (rms+Q/K/V); +0.16 (ffn_norm into existing fusion). Don't re-attempt.",
+      "rms_norm_mul Pass-2 PER-THREAD rms_inv IS FLAT (run-4 c26, -0.12).",
+      "V-CACHE FLOAT16 REGRESSES (-1.6%) at the current scalar V-load shape. Could revisit if a coopmat or Br>1 path absorbs unpack cleanly.",
+      "WIDE NUM_ROWS DMMV VARIANTS UNDER-SATURATE. NUM_ROWS=8 dense Q4_K (-3.83); NUM_ROWS=8 Q6_K LM head (flat — LM head fires once, can't move metric).",
+      "PER-TOKEN COS/SIN PRECOMPUTE FOR RoPE IS BELOW THRESHOLD (+0.29).",
+      "GATE+UP-ONLY FUSION (without SwiGLU) IS FLAT. Only wins WITH SwiGLU folded in.",
+      "K+V PROJECTION FUSION REGRESSES (-1.1%).",
+      "sigmoid_mul (attn_gate) FOLDED INTO SPLIT-K MERGE PASS IS FLAT.",
+      "MANUAL-CYCLE + LANDED-LOOP FOUNDATIONS — DON'T REVERT. Q-stage (6ece0a8); s_kv_base_v4 precompute; Phase 4 rescale+V-acc fusion (539b2aa); gate+up+SwiGLU dense FFN fusion (run-2 c8); Q+K norm+rope+kv_cache_write fusion (run-2 c12); split-K flash attention N_I_CHUNKS=4 + merge pass (run-3 c12); v_im uniform shift-scale Q4_K decode (run-4 c1); cluster-4 M/L reduction in split_merge (run-4 c22); cluster-2 chunk-pair split in split_merge (run-4 c23). All bit-correct. The dmmv_q4k_o_proj_merge.comp shader was DELETED in run-5 c40 (per the prior plan's directive); -430 LOC of dead infrastructure removed.",
+      "L=2325 GPU HANG IS L≥2300-ONLY. Confirmed across 110+ cycles. Watchdog-duration issue, not correctness.",
+      "MEASUREMENT NOTE: run-4's headline jump 99.38 → 108.05 (+8.7%) was MOSTLY system-state shift (thermal/RDNA driver re-baseline at run start), not earned by code. Real run-4 code-driven gains were ~+2.2% (cycle 1: +1.43%; cycle 22: +0.5%; cycle 23: +0.25%). The cycle-12 jump 101.62 → 107.27 was a measurement artifact (HEAD itself measured ~107 at that point). Future runs should expect run-to-run baseline drift of ±3% from system state alone, and only attribute code-wins above that band.",
+    ],
+    structuralSwingIdeas: [
+      "flash_attn_cm1.comp KHR COOPMAT PORT — THE ONLY UNTRIED STRUCTURAL CEILING. Every cheap attack on flash_attn (15+ cycles across 5 runs) has been exhausted; every cheap attack on dense FFN (15+ cycles across runs 4-5) has been exhausted. Cooperative-matrix wmma intrinsics on the Q.K matmul + softmax-V matmul are the only structural shape that hasn't been attempted. RDNA3+ supports VK_KHR_cooperative_matrix and R9700 advertises it. Multi-week port (estimate 5-10 cycles for the shader rewrite + validation + tuning). Reference: /Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp. Read the Br=8/Bc=64 wmma decomposition and the cross-tile softmax reduce. Land behind ZINC_FA_COOPMAT=1, validate against the scalar split-K path at tol=1e-3 on all COHERENCE_MODELS.",
+      "Br=2 + N_I_CHUNKS=4 COMBINED SPLIT-K (cycle 50's untried pivot). Standalone Q_PER_KV=2 GQA collapse failed -17.5% in run-3 c4 due to WG-count loss. The unattempted variant pairs it WITH split-K's WG multiplier: dispatch n_kv_heads × Q_PER_KV_BUDGET=2 × N_I_CHUNKS=4 = 8 × 2 × 4 = 64 WGs (vs the standalone Q_PER_KV=2's 16 WGs that starved). At 64 WGs on 64 CUs the SIMD pool is fed AND each WG amortizes K/V reads 2× across two query heads. Mirrors llama.cpp flash_attn.comp's Br/Bc shape. Build behind ZINC_FA_BR2=1.",
+      "PROFILE-PHASE DECOMPOSITION OF THE 'OTHER' 33% BUCKET. The cycle-48 attempt added attn_input_norm/ffn_input_norm tags but didn't decompose all of the residual ~3 ms/token. Sub-categorize: attn_norm, ffn_norm, residual, scale_acc, lm_head, host_gap. May reveal a hidden hotspot (e.g., a per-token rms_norm that's actually 8% of decode and not gate+up at all). Cheap diagnostic; valuable if it surfaces an untouched bucket.",
+      "CONDITIONAL DISPATCH FOR flash_attn_split_merge (unblocks cycle 56's +0.41 at L=846). Cycle 56 found N_I_CHUNKS=8 + cluster-quad merge gains +0.41 at long context but regresses -39% at L=5. The fix is to switch dispatch parameters at runtime based on L: cluster-2 chunk-pair (current default, fast at L=5) when L<512, cluster-quad (faster at L≥846) when L≥512. Single Zig-side dispatch decision based on seq_len; no shader changes needed. Captures the unrealized cycle-56 win.",
+      "dmmv_q5k.comp ROW/BLOCK SWAP for Q5_K LM head (Qwen 3.6 35B). Mirror cycle-22's row/block swap pattern that won +0.48% on dmmv_q4k.comp and was confirmed +0.72% on dmmv_q6k.comp in run-5 c57 (kept-flat by framework's strict gate but the structural shape is right). Qwen 3.6 35B uses Q5_K weights; this would help the 35B coherence-target's decode rate without affecting the qwen8b primary metric. Cycle-sized.",
+      "TPB=128 WIDENED Q6_K LM HEAD (cycle 57's nextIdea). LM head dispatches once per decoded token at M=151936; halving the b-loop iterations via wider TPB on the row-swap-restructured shader could shave 0.1-0.3 tok/s. Small absolute but structurally clean.",
+      "GATE+UP+SwiGLU INPUT BROADCAST-VIA-LDS WITH NUM_ROWS=4 AS A UNIT (cycle 57's nextIdea). Distinct from the failed run-5 c35 (LDS-only, -13.8%) and run-5 c41 (NUM_ROWS=4-only, -1.5%). The combined hypothesis: NUM_ROWS=4 halves WG count by 2x, but if the same WG-group cooperatively stages 4 KB of input into LDS once and reuses it across 4 rows × gate+up matmuls, the amortization may exceed the LDS-staging penalty that killed the cycle-35 attempt. Risk: the LDS staging cost compounded with the 2x WG count reduction may still under-saturate. Build behind ZINC_GATEUP_NUM_ROWS_4_LDS=1.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/flash_attn.comp",
+        focus: "Current state after 17 cycles of optimization (31.19 → 93.68 tok/s at L=1500). Read the entire shader. Key structural shapes that delivered: (1) cycle 5 D-split — pair lanes (tid, tid+32) on the same d4 and split the i-axis to engage all 64 wave lanes when head_dim=128. (2) cycle 8 s_kv_base_v4 — precompute (page_id*page_size+page_off)*n_kv_heads*head_dim+kv_head*head_dim per i once per block, replacing the prior s_page_ids_block. (3) cycles 6/9/12/16 Phase 4 ILP unrolls (2-way → 4-way → 8-way → 16-way, paired vec4 accumulators). (4) cycles 10/14/17 Phase 1 ILP unrolls (4-way → 8-way → 16-way). The current 16-way pattern is the exhausted ceiling on ILP; 32-way (cycle 18) measured flat.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/flash_attn_batched.comp",
+        focus: "Mirrors flash_attn.comp's structure with grid.y = n_queries. Every cycle in this effort has mirrored the decode-side change to this shader so prefill and ZINC_BATCH_ATTN=1 paths benefit equally. Read alongside flash_attn.comp to see which lines line up.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp",
+        focus: "Scalar fallback flash_attn. Search for `Br` and `Bc` to see how multiple Q rows per WG are handled — that's the multi-Q-per-WG / GQA collapse target. Lines 44-90 are Q staging (we ported a simpler version). Lines 196-218 are SHMEM_STAGING for cooperative K loads (note: ZINC's cycle-1 attempt at K-parallel-with-subgroupAdd FAILED -44%; but cooperative K staging without the subgroup reduction is structurally different and unattempted). Lines 355-384 are the fused exp+V loop.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        focus: "Search for `gqa_ratio` and `get_fa_tuning_params_scalar` (~lines 2854-2928 and ~8866). The gqa_ratio collapse is the host-side change needed for multi-Q-per-WG: when n_heads / n_kv_heads = q_per_kv > 1, dispatch grid.x = n_kv_heads (not n_heads) and the shader processes q_per_kv query heads per WG. ZINC currently dispatches grid.x = n_heads.",
+      },
+      {
+        path: "/Users/stepan/Workspace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp",
+        focus: "KHR cooperative_matrix variant of flash_attn. Reference for the deferred cooperative-matrix swing. Look at how Q.K and score.V matmuls are decomposed into wmma tiles, what subgroup_size/coopmat_M/coopmat_N constraints apply, and how cross-tile softmax reduction is done.",
+      },
+      {
+        path: "/Users/stepan/Workspace/zinc/src/shaders/dmmv_q4k_moe_kpar.comp",
+        focus: "Wave64 K-parallel pattern reference. NOTE: the cycle-1 'K-parallel Phase 1' attempt that reduced ONE row across all 64 threads with subgroupAdd lost -44%. That is NOT the pattern this shader uses. dmmv_q4k_moe_kpar splits 64 threads as THREADS_PER_BLOCK=16 (cooperative on K dim) × NUM_ROWS=4 (parallel rows). For multi-Q-per-WG, the analog is THREADS_PER_BLOCK_PER_Q × Q_PER_WG. Read the inner loop and reduction shape.",
+      },
+    ],
+  },
+  13: {
+    doc: "MULTI_HOUR_EFFORT_13_RDNA_GEMMA_LONG_DECODE.md",
+    summary: "RDNA Gemma 4 26B MoE long-decode parity with llama.cpp (remove Gemma CPU MoE fallback)",
+    metricMode: "decode",
+    primaryMetricLabel: "Gemma 4 26B long-decode tok/s",
+    benchmarkPrompt: GEMMA_LONG_DECODE_PROMPT,
+    benchmarkMaxTokens: 32,
+    benchmarkMethod: "32-token chat decode-extended benchmark on Gemma 4 26B A4B, matching the public benchmark matrix shape; run with --model gemma426ba4b",
+    knownFlatCategories: [
+      "Do not optimize the context-long Gemma win first. In the public data, ZINC generated only 2 tokens while llama.cpp generated 8, so it is an early-stop artifact. The primary metric is decode-extended with 32 generated tokens.",
+      "Generic DMMV micro-tuning before removing Gemma CPU MoE fallback is the wrong order. The 26B MoE model is at 52% of llama.cpp on sustained decode while dense Gemma 31B is at 86%; the architectural delta points at MoE control flow, not a 1-2% matvec detail.",
+      "Do not port llama.cpp grouped-GEMM mul_mat_id first. Decode top-k <= 8 should start with the lighter matvec-ID shape. Grouped GEMM/count_experts is for prefill or true multi-token batches.",
+      "Q8_1 activation quant is not a default fix. llama.cpp enables it conditionally, and ZINC already measured Q8_1 regressions on some Qwen decode paths. Only try it after Gemma GPU MoE is coherent and faster.",
+      "Do not skip Gemma-specific semantics to make the fast path fit. pre_ffw_norm_2, ffn_gate_inp.scale, fused ffn_gate_up_exps, ffn_down_exps.scale, post_ffw_norm_1/2, and post_ffw_norm are correctness requirements.",
+    ],
+    structuralSwingIdeas: [
+      "Step 0 profile proof. Run Gemma 26B decode-extended with --profile -n 32 --chat and record cpu_moe_fallbacks plus moe_router/moe_topk/moe_gate_up/moe_swiglu/moe_down/moe_weighted_acc/shared/final_lm_head. If MoE is not a top bucket, update the effort doc before changing code.",
+      "GPU top-k validation for Gemma. Allow dispatchSoftmaxTopk after Gemma router scaling, but do not consume it yet. Copy router_output_buf for first token/layer and compare IDs/weights against CPU topKSoftmax. Keep CPU fallback as the actual output path until this validates.",
+      "Support fused ffn_gate_up_exps. Gemma 26B uses one fused gate+up expert tensor. Either add offset-aware pushDispatch5/6 helpers so the same buffer can be bound twice with binding 1 at up_base_offset, or add a Gemma-specific fused-gate-up MoE shader with an up_base_offset push constant.",
+      "Enable GPU-routed Gemma MoE behind a flag. Preserve unit router RMS + ffn_gate_inp.scale, pre_ffw_norm_2 expert input, selected-only normalized softmax weights, ffn_down_exps.scale, and post_ffw_norm ordering. The first accepted implementation only needs to remove router readback and serial expert dispatch while staying coherent.",
+      "Collapse per-expert serial dispatch. The target dispatch shape is one all-selected gate/up dispatch, one activation dispatch, one all-selected down dispatch, and one weighted accumulation. That is ZINC's decode-time equivalent of llama.cpp mul_mat_vec_id.",
+      "After GPU MoE lands, test Q4_K x Q8_1 activation quant on exact Gemma expert shapes only. Treat it as a measured follow-up, not the first lever.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/src/llama-graph.cpp",
+        focus: "Search for build_moe_ffn. This is the graph-side reference for keeping router logits, top-k, selected weights, fused gate_up_exps, per-expert scales, and down projection in the graph.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        focus: "Search for ggml_vk_topk_moe, ggml_vk_mul_mat_id, ggml_vk_mul_mat_vec_id_q_f16, ggml_vk_use_mul_mat_vec_id, and ggml_vk_should_use_mmvq. These are the Vulkan control-flow pieces ZINC needs to mirror conceptually.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl",
+        focus: "MUL_MAT_ID shader addressing: data_ids selects expert_id; expert_id offsets the stacked expert weight tensor; expert_i0/expert_i1 select top-k slot and token/batch lane.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp",
+        focus: "Reference for fused top-k MoE softmax/normalization. ZINC already has dispatchSoftmaxTopk; use this to compare semantics and edge cases.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Current ZINC Gemma fallback. Search for use_gpu_moe, router_staging, topKSoftmax, fused_gate_up, ffn_gate_inp_scale, ffn_down_exps_scale, and post_ffw_norm.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/shaders/dmmv_q4k_fused_gate_up_swiglu_moe.comp",
+        focus: "Existing selected-expert fused gate/up/SwiGLU shader. It assumes separate gate/up bindings today; adapt or replace for Gemma's fused ffn_gate_up_exps layout.",
+      },
+    ],
+  },
+  15: {
+    doc: "MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+    summary: "RDNA4 Qwen 3.6 27B dense-hybrid prefill/decode recovery",
+    metricMode: "prefill",
+    primaryMetricLabel: "Qwen3.6-27B prefill tok/s",
+    defaultModel: "qwen3627b",
+    benchmarkPrompt: QWEN36_27B_CONTEXT_MEDIUM_PREFILL_PROMPT,
+    benchmarkMaxTokens: 8,
+    benchmarkMethod: "site-aligned context-medium Coding Review prefill benchmark on RDNA for Qwen3.6-27B dense Q4_K_M; run with --model qwen3627b",
+    minHealthyTokPerSec: 10,
+    knownFlatCategories: [
+      "Do not optimize against the old synthetic Paris prefill prompt for effort 15. It reported ~148 tok/s but does not match the site context-medium workload that exposes the real ~29 tok/s 27B prefill gap.",
+      "Do not relax canUseBatchedPrefillRdna for cfg.ssm_d_inner > 0 as a first step. A prior SSM batched prefill attempt caused QueueSubmitFailed / GPU resets and had a real hidden-state dependency bug.",
+      "Do not repeat the widened dense fused gate+up+SwiGLU path for inter_dim=17408. On Qwen3.6-27B it was mixed or negative across the four-scenario matrix.",
+      "Do not repeat Q6_K+Q4_K fused SSM qkv+z pair dispatch. It engaged but regressed the SSM projection bucket.",
+      "Do not flip ZINC_SSM_DELTA_COLS8=0 or retry ZINC_SSM_DELTA_NORMED_QK=1 without new evidence. Both were mixed or negative on the full 27B matrix.",
+      "Do not retry Q6_K K=17408 dense-down specialization or broad Q4/Q6 wide variants. They were flat or negative on the 27B matrix.",
+      "Do not keep sweeping Q6_K dense-down tiled-kernel variants after the 64.87 tok/s checkpoint without fresh shaderstats. Cycle 27 kept the default-on tiled Q6_K path, but later Q6_K force-wave64, BN64, dequant-hoist, and tail-column FMA-skip variants all measured flat or dead.",
+      "Do not keep sweeping Q4_K gate/up/SwiGLU tile shapes without fresh shaderstats. BM16, K=5120 specialization, default-shape tweaks, and post-64 tok/s BN retile variants have all been flat/dead or too small to clear the keep threshold.",
+      "Do not spend another cycle on submit/barrier cosmetics around the layer-major prefill path unless the edit removes a named measured barrier cost. The cycle-32 scoped barrier keep was real; subsequent scoped-barrier, compute-to-transfer-barrier, and SSM+dense command-buffer fusion attempts were measured dead.",
+      "Do not widen the fused attention o-proj merge to hidden_dim=5120. It caused a severe long-context regression.",
+      "Do not repeat direct descriptor-offset SSM prefill projection replay. Cycle 36 measured flag OFF 31.34 tok/s vs flag ON 31.22 tok/s and reverted it.",
+      "Do not repeat Q5_K row4 SSM-out, SSM delta tile8, or other SSM-side variants while dense_ffn remains the largest phase bucket. Recent SSM cycles produced zero perf keeps.",
+      "Do not repeat Q4_K scale-unpack cleanup, BN=64 mul_mm_q4k projection batches, Q6_K batched-kpar chunk tuning, prefix dense-down batched accumulate, or wave32 row1 selector without new dense subphase evidence. These measured flat or negative around the 31.29 tok/s checkpoint.",
+      "Do not repeat lower-bound dense segment additions unless a fresh profile proves the first layers are now hot. Layer-1 extension measured old 4-62 override at 50.16 tok/s vs new layer-1 schedule at 50.07 tok/s and reverted; earlier prefix-depth/layer 2/3/4/8 sweeps were also flat or negative.",
+      "Do not repeat fusing the partial hidden scratch copy with the first attention-layer RMS norm at full-attention segment handoff. Measured with ZINC_QWEN36_27B_PARTIAL_ATTN_NORM_STORE: OFF median 49.96 tok/s [51.32, 49.82, 49.96] vs ON median 49.53 tok/s [49.53, 49.42, 49.62]; reverted. It also moved attention RMS work outside the normal phase timer, making profiles less trustworthy.",
+    ],
+    structuralSwingIdeas: [
+      "At the current 64.87 tok/s checkpoint, the profile is balanced rather than single-hot: dense_ffn ~=1848 ms, ssm ~=1498 ms, dense gateup ~=934 ms, dense down ~=916 ms, and SSM proj ~=1095 ms. A next jump probably needs a structural change that moves a whole bucket by multiple percent, not another sub-1% tile/barrier variant.",
+      "Before more dense kernel rewrites, collect paired RADV_DEBUG=shaderstats for the accepted fused Q4_K gate/up/SwiGLU path and Q6_K tiled dense-down path. Only edit the shader if shaderstats shows a concrete VGPR/SGPR, occupancy, LDS, spill, or memory-instruction problem that maps to the currently largest dense subphase.",
+      "Treat the current Qwen3.6-27B layer-major segment and barrier schedule as provisionally settled. Segment or barrier work now requires a paired old-vs-new control in the same cycle and a profile-backed reason; otherwise switch buckets.",
+      "If dense gateup and down remain tied, pivot to SSM projection as the largest single subphase. Revisit batched SSM qkv/z/alpha/beta only as a validated layer-major dataflow step, not the old descriptor-offset replay path, and measure flag OFF/ON in the same cycle.",
+      "If pursuing dense down, do not retune the existing Q6_K tile shape again. Either remove the separate residual accumulation with a correctly validated down+acc design, or collect shaderstats proving why the accepted tiled path is leaving occupancy/bandwidth on the table.",
+      "After any new keep above 65 tok/s, run the full four-scenario matrix before treating the win as broadly useful. The site-aligned Coding Review prefill benchmark is the controller metric, but the 27B work has already produced changes that helped one scenario while hurting context-long/decode.",
+      "Keep production prefill changes behind a 27B-specific flag until ZINC_BATCHED_PREFILL=validate or an equivalent validator proves final logits and intermediate tensors. Flag-gated paths must be measured flag OFF and flag ON in the same cycle.",
+    ],
+    referenceImplementations: [
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/src/compute/forward.zig",
+        focus: "Read canUseBatchedPrefillRdna, prefillBatchedImpl, prefillBatch, runSsmLayerGpu, dispatchProjectionBatched, dispatchDmmvAcc, and the dense_ffn profile phase before editing.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_15_RDNA_QWEN36_27B_PREFILL_DECODE.md",
+        focus: "This effort's measured baselines, failed-attempt list, and staged plan. Follow Track 1 before any production SSM prefill change.",
+      },
+      {
+        path: "/Users/zolotukhin/Workplace/zinc/loops/efforts/MULTI_HOUR_EFFORT_6_RDNA_QWEN36_PREFILL.md",
+        focus: "Historical RDNA Qwen prefill attempts, especially dormant tiled-GEMM lessons and SSM capture/validation failures.",
       },
     ],
   },
@@ -271,7 +580,29 @@ export function getEffortSpec(effort: number): EffortSpec | null {
   return EFFORT_SPECS[effort] ?? null;
 }
 
-const BENCHMARK_SAMPLES = 3;
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function minHealthyTokPerSecForSpec(effortSpec: EffortSpec): number | null {
+  const override = process.env.ZINC_MIN_HEALTHY_TPS;
+  if (override != null && override.trim() !== "") {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (parsed === 0) return null;
+  }
+  return effortSpec.minHealthyTokPerSec ?? null;
+}
+
+const BENCHMARK_MIN_SAMPLES = 3;
+const BENCHMARK_MAX_SAMPLES = Math.max(
+  BENCHMARK_MIN_SAMPLES,
+  positiveIntEnv("ZINC_BENCH_MAX_SAMPLES", 5),
+);
+// If the primary metric is noisy, collect a couple of extra samples instead
+// of making a keep/revert decision from a lucky or unlucky 3-run median.
+const BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT = 0.015;
 // Absolute floor on a "material improvement" in tok/s. Previously 0.5,
 // which rejected three effort-6 cycles (13/16/21) that produced gains of
 // 0.29-0.45 tok/s with sample noise well below the gap. Lowered to 0.2 so
@@ -320,6 +651,10 @@ const PIVOT_STALL_THRESHOLD = 3;
 // known-good patterns instead of guessing.
 const REFERENCE_IMPLS_STALL_THRESHOLD = 4;
 
+function shouldCleanRemoteBenchmarkNode(): boolean {
+  return process.env.ZINC_SKIP_REMOTE_CLEAN !== "1";
+}
+
 // Multiple prompts to catch different failure modes:
 // - Short factual: catches total corruption
 // - Arithmetic: catches subtle numeric drift (wrong MoE routing, bad dequant)
@@ -351,12 +686,11 @@ const COHERENCE_CHECKS: CoherenceCheck[] = [
 // All models that must produce coherent output after every change.
 // The primary model (--model flag) is benchmarked; these are correctness-only.
 const COHERENCE_MODELS: ModelTarget[] = [
-  MODELS.qwen35b,
   MODELS.qwen36b,
+  MODELS.qwen3627b,
   MODELS.qwen8b,
   MODELS.gemma431b,
-  MODELS.gemma412b,
-  MODELS.gptoss20b,
+  MODELS.gemma426ba4b,
 ];
 
 type CoherenceFailure = {
@@ -373,6 +707,16 @@ type CoherenceSweep = {
   failureIds: string[];
 };
 
+type CoherenceCase = {
+  modelTarget: ModelTarget;
+  check: CoherenceCheck;
+  promptMode: PromptMode;
+  maxTokens: number;
+  prompt: string;
+  label: string;
+  id: string;
+};
+
 const BLOCKED_FILE_OPS = [
   "Edit(loops/*)", "Write(loops/*)", "Edit(site/*)", "Write(site/*)",
   "Edit(docs/*)", "Write(docs/*)", "Edit(.env)", "Write(.env)",
@@ -386,8 +730,15 @@ const BLOCKED_GIT_OPS = [
   "Bash(git push:*)", "Bash(git commit:*)",
 ];
 
-// Directories the agent may change (used for selective revert)
-const REVERTABLE_PATHS = ["src/"];
+// Paths the agent may change (used for selective revert). Keep this aligned
+// with the prompt's "Files you may edit" block; otherwise rejected cycles can
+// leak non-src edits, such as build.zig shader-install changes, into later
+// baselines.
+const REVERTABLE_PATHS = ["build.zig", "src/"];
+
+function isPrefillMetricLabel(label: string | undefined): boolean {
+  return /\bprefill\b/i.test(label ?? "");
+}
 
 // -- CLI parsing -------------------------------------------------------------
 
@@ -398,9 +749,10 @@ function parseArgs() {
   let effort = 0;
   let cycles = 20;
   let dryRun = false;
-  let model = "qwen35b";
+  let model = "qwen36b";
+  let modelExplicit = false;
   let resume = false;
-  let agent: AgentType = "claude";
+  let agent: AgentType = "codex";
   let analyze = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -409,7 +761,10 @@ function parseArgs() {
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--resume") resume = true;
     else if (args[i] === "--analyze") analyze = true;
-    else if (args[i] === "--model" && args[i + 1]) model = args[++i];
+    else if (args[i] === "--model" && args[i + 1]) {
+      model = args[++i];
+      modelExplicit = true;
+    }
     else if (args[i] === "--agent" && args[i + 1]) agent = args[++i] as AgentType;
   }
   if (!effort || !getEffortSpec(effort)) {
@@ -419,8 +774,8 @@ function parseArgs() {
     console.error("Options:");
     console.error(`  --effort <${effortKeys}>         Optimization to run (required)`);
     console.error("  --cycles N               Max cycles (default: 20)");
-    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: qwen35b)`);
-    console.error("  --agent claude|codex     AI agent to use (default: claude)");
+    console.error(`  --model NAME             Model: ${MODEL_KEYS} (default: effort-specific, else qwen36b)`);
+    console.error("  --agent claude|codex     AI agent to use (default: codex)");
     console.error("  --resume                 Resume from previous run (read history from log)");
     console.error("  --analyze                Print controller analysis from saved run state");
     console.error("  --dry-run                Build+bench baseline only, skip agent");
@@ -439,7 +794,7 @@ function parseArgs() {
     console.error(`Unknown model: ${model}. Use one of: ${MODEL_KEYS}.`);
     process.exit(1);
   }
-  return { effort, cycles, dryRun, model, resume, agent, analyze };
+  return { effort, cycles, dryRun, model, modelExplicit, resume, agent, analyze };
 }
 
 // -- Display helpers ---------------------------------------------------------
@@ -526,10 +881,29 @@ async function rsyncToRemote(): Promise<void> {
     "-e", `ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no`,
     "--exclude", ".zig-cache", "--exclude", "zig-out", "--exclude", "node_modules",
     "--exclude", ".git", "--exclude", ".perf_optimize", "--exclude", ".zinc_optimize",
-    "--exclude", "site", "--exclude", ".DS_Store",
+    "--exclude", "site", "--exclude", ".DS_Store", "--exclude", ".env", "--exclude", ".env.*",
+    "--exclude", "*.swp", "--exclude", "*.swo",
     `${REPO_ROOT}/`, `${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/`,
   ], { timeout: 120_000 });
   if (exitCode !== 0) throw new Error(`rsync failed: ${stderr.slice(0, 300)}`);
+}
+
+async function cleanRemoteBenchmarkNode(): Promise<void> {
+  if (!shouldCleanRemoteBenchmarkNode()) return;
+  console.log(c("2", "  Cleaning stale RDNA benchmark processes..."));
+  try {
+    await ssh(
+      [
+        "pkill -f '[z]ig-out/bin/zinc' || true",
+        "pkill -f '[l]lama-server' || true",
+        "pkill -f '[l]lama-cli' || true",
+        "sleep 1",
+      ].join("; "),
+      30_000,
+    );
+  } catch (e) {
+    console.log(c("1;33", `  Warning: remote cleanup failed; benchmark may be contaminated (${String(e).slice(0, 120)})`));
+  }
 }
 
 // -- Build & benchmark -------------------------------------------------------
@@ -911,6 +1285,11 @@ export function formatPhaseBudget(
     const moe = Object.entries(budget.moeTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- MoE sub-buckets (ms): ${moe.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
   }
+  const denseTotals = budget.denseTotalsMs ?? {};
+  if (Object.keys(denseTotals).length > 0) {
+    const dense = Object.entries(denseTotals).sort((a, b) => b[1] - a[1]);
+    lines.push(`- Dense FFN sub-buckets (ms): ${dense.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
+  }
   if (Object.keys(budget.ssmTotalsMs).length > 0) {
     const ssm = Object.entries(budget.ssmTotalsMs).sort((a, b) => b[1] - a[1]);
     lines.push(`- SSM sub-buckets (ms): ${ssm.map(([n, v]) => `${n}=${v.toFixed(1)}`).join(", ")}`);
@@ -921,6 +1300,24 @@ export function formatPhaseBudget(
     );
   }
   return lines.join("\n");
+}
+
+function formatDominantBucketDirective(budget: PrefillPhaseBudget | null | undefined): string | null {
+  const biggest = budget?.biggestBucket;
+  if (!biggest) return null;
+  const sorted = Object.entries(budget.totalsMs)
+    .filter(([name]) => name !== "embed")
+    .sort((a, b) => b[1] - a[1]);
+  const runnerUp = sorted.find(([name]) => name !== biggest.name);
+  const runnerUpText = runnerUp ? `; runner-up is ${runnerUp[0]} at ${runnerUp[1].toFixed(1)} ms` : "";
+  const lines = [
+    `The current profile's largest top-level bucket is ${biggest.name} at ${biggest.totalMs.toFixed(1)} ms${runnerUpText}.`,
+    `A cycle that targets another bucket must cite a fresh profile or a concrete dependency that unlocks ${biggest.name}.`,
+  ];
+  if (biggest.name === "dense_ffn") {
+    lines.push("For effort 15, prefer dense layer-major segment work, dense gate/up/SwiGLU structural changes, or dense down+acc fusion. Avoid SSM-only work while dense_ffn remains largest.");
+  }
+  return lines.map((line) => `- ${line}`).join("\n");
 }
 
 function tailHistory(history: string, maxLines = HISTORY_LINES_IN_PROMPT): string {
@@ -1124,6 +1521,24 @@ export function sampleStdev(samples: number[]): number {
   return Math.sqrt(variance);
 }
 
+export function relativeSampleSpread(samples: number[]): number {
+  const med = median(samples);
+  if (med == null || med <= 0 || samples.length < 2) return 0;
+  const min = Math.min(...samples);
+  const max = Math.max(...samples);
+  return (max - min) / med;
+}
+
+export function shouldCollectExtraBenchSample(
+  samples: number[],
+  minSamples = BENCHMARK_MIN_SAMPLES,
+  maxSamples = BENCHMARK_MAX_SAMPLES,
+): boolean {
+  if (samples.length < minSamples) return true;
+  if (samples.length >= maxSamples) return false;
+  return relativeSampleSpread(samples) >= BENCHMARK_EXTRA_SAMPLE_SPREAD_PCT;
+}
+
 /**
  * Noise-aware override: when a candidate's sample dispersion is tight and
  * the gain vs best is a multiple of that noise, the measurement is
@@ -1250,7 +1665,7 @@ export function buildAgentPrompt(
   if (options.mode === "pivot") {
     return buildPivotPrompt(plan, originalBaseline, currentBest, cycleNum, model, context, options);
   }
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const sanityCheckPrompt = coherencePromptForMode(
     COHERENCE_CHECKS[0],
     coherencePromptModeForModel(modelTarget),
@@ -1276,8 +1691,11 @@ export function buildAgentPrompt(
       ? "HARVEST"
       : "ADVANCE";
 
-  const phaseBudgetBlock = options.primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
+    : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
 
   const echoWarning = context
@@ -1329,7 +1747,7 @@ ${plan}
 ## Current Checked-Out Code (build on this code)
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(currentBest.bandwidthUtil, currentBest.bandwidthSamples, "%", 1)}
-- output: "${currentBest.outputText}" (coherence tested with 3 prompts on 7 models after every change)
+- output: "${currentBest.outputText}" (coherence tested with ${COHERENCE_CHECKS.length} prompts on ${COHERENCE_MODELS.length} models after every change)
 - This is the performance of the code currently checked out in the worktree.
 
 ## Best Accepted Performance Checkpoint
@@ -1343,7 +1761,7 @@ ${currentVsBestNote}
 - primary metric (${primaryMetricLabel}): ${summarizeBenchMetric(originalBaseline.tokPerSec, originalBaseline.tokPerSecSamples, "tok/s")}
 - bandwidth utilization: ${summarizeBenchMetric(originalBaseline.bandwidthUtil, originalBaseline.bandwidthSamples, "%", 1)}
 - output: "${originalBaseline.outputText}"
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget (ZINC_PREFILL_PROFILE=1)\n${phaseBudgetBlock}\nUse this budget to pick the biggest remaining bucket. Do not propose batching/kernel work for a bucket whose total is clearly smaller than another untried bucket.\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}${echoBlock ? `\n## ⚠ Echo Chamber Warning\n${echoBlock}\n` : ""}${knownFlatBlock ? `\n## Known Flat Territory on This Target (do not re-attempt without new evidence)\n${knownFlatBlock}\n` : ""}${swingIdeasBlock ? `\n## Structural Swing Ideas (pick one when controller wants a swing)\n${swingIdeasBlock}\n` : ""}${referencesBlock ? `\n## Reference Implementations on Disk (read when stuck)\n${referencesBlock}\n\nThese are full checkouts of production inference engines. Skim the specific files named above; do not copy wholesale, but steal the architectural patterns (pipeline specialization constants, kernel selection thresholds, MoE routing shapes). If a reference makes an idea obvious, say so in your self-analysis so the next cycle knows the pattern came from a proven codebase.\n` : ""}
 ## Controller State
 - mode: ${controllerMode}
 - stalled cycles without a new best checkpoint: ${context?.stalledCycles ?? 0}
@@ -1373,6 +1791,8 @@ If you intentionally do a plumbing/enabling step that may be performance-neutral
 
 **Flag-gated changes must be measured in the same cycle.** If your change introduces a new runtime env flag (ZINC_*), you MUST run the benchmark both with the flag OFF and with it ON, cite both tok/s numbers in your SELF_ANALYSIS, and make an explicit keep/revert decision. Dormant flag-gated infrastructure that is only validated in a later cycle has cost us ~5 committed foundation cycles; the loop now rejects flag-gated foundation keeps that lack a flag-on measurement.
 
+**Agent-side measurement budget.** The controller will sync, build, run the 3-sample primary benchmark, and run coherence after you return. Do not start tools/performance_suite.mjs from inside the agent, and do not run remote ./zig-out/bin/zinc with -n > 32 unless this exact cycle is an analysis/shaderstats cycle and you cite the bounded reason. Manual checks should be limited to shader compile/build plus one short smoke or one paired flag-off/flag-on target sample; long suites and repeated -n 96 / -n 160 diagnostics waste RDNA time and make controller decisions stale.
+
 Do not use sub-agents, delegation, spawn_agent, or wait_agent. Work directly in this repo.
 Before editing any file, re-read the exact current contents from disk. Do not rely on stale context, guessed line numbers, or cached snippets.
 
@@ -1398,7 +1818,7 @@ Before editing any file, re-read the exact current contents from disk. Do not re
    - If you are uncertain, add a tiny enabling or measurement step instead of another large speculative refactor.
 
 5. **Test on remote node:**
-   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+   rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
    ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
 6. **Shader compilation:** glslc --target-env=vulkan1.3 -fshader-stage=compute file.comp -o file.spv
@@ -1411,6 +1831,7 @@ Files you may edit:
 - src/server/chat.html
 - src/shaders/*.comp (GLSL compute shaders)
 - src/main.zig
+- build.zig (only when a shader/pipeline change needs the build to install a new artifact)
 
 ## Output Format
 After making your change, print these lines:
@@ -1446,7 +1867,7 @@ export function buildPivotPrompt(
     referenceImplementations?: Array<{ path: string; focus: string }>;
   },
 ): string {
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const sanityCheckPrompt = coherencePromptForMode(
     COHERENCE_CHECKS[0],
     coherencePromptModeForModel(modelTarget),
@@ -1465,8 +1886,11 @@ export function buildPivotPrompt(
         })
         .join("\n") || "  (none)"
     : "  (state unavailable)";
-  const phaseBudgetBlock = primaryMetricLabel === "prefill tok/s"
+  const phaseBudgetBlock = isPrefillMetricLabel(primaryMetricLabel)
     ? formatPhaseBudget(context?.phaseBudget ?? null, context?.phaseBudgetCycle ?? null)
+    : null;
+  const dominantBucketDirective = isPrefillMetricLabel(primaryMetricLabel)
+    ? formatDominantBucketDirective(context?.phaseBudget ?? null)
     : null;
   const knownFlatBlock = options.knownFlatCategories?.length
     ? options.knownFlatCategories.map((entry, i) => `${i + 1}. ${entry}`).join("\n")
@@ -1493,7 +1917,7 @@ ${plan}
 - ${summarizeBenchMetric(currentBest.tokPerSec, currentBest.tokPerSecSamples, "tok/s")}
 - stalled for ${context?.stalledCycles ?? 0} cycles
 - consecutive neutral foundation keeps: ${context?.consecutiveFoundationKeeps ?? 0}
-${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}
+${phaseBudgetBlock ? `\n## Current Prefill Phase Budget\n${phaseBudgetBlock}\n` : ""}${dominantBucketDirective ? `\n## Dominant Bucket Directive\n${dominantBucketDirective}\n` : ""}
 ## Committed Foundations From Recent Cycles
 ${committedFoundations}
 
@@ -1513,6 +1937,8 @@ This cycle is different from a normal optimization cycle. Do exactly the followi
 
 3. **Pick one and execute.** Choose the most promising of your three proposals. Implement it. Measure. If it regresses, revert in this same cycle and record the finding. If it is flag-gated, measure both flag-off and flag-on in this cycle (dormant wiring is not acceptable). Produce a concrete tok/s number, not a hand-wave.
 
+Agent-side measurement budget: the controller will run the official sync/build/benchmark/coherence gate after you return. Do not launch tools/performance_suite.mjs from inside the agent. Do not run remote ./zig-out/bin/zinc with -n > 32 unless the pivot you picked is explicitly a bounded analysis/shaderstats cycle; if you do, stop after the one planned diagnostic and cite the evidence. Long -n 96 / -n 160 suites belong outside the cycle agent.
+
 Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS / @@@NEXT_IDEAS. Valid STEP_KIND values for a pivot cycle include:
 - rollback (if you reverted dead-end foundations)
 - analysis (if the pivot is measurement/diagnosis only and produced a concrete finding)
@@ -1520,10 +1946,10 @@ Your output must still end with @@@DESCRIPTION / @@@STEP_KIND / @@@SELF_ANALYSIS
 - enablement (only if you measured flag-on in this same cycle)
 
 ## Test on Remote Node
-rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast && ${REMOTE_ZINC_ENV} ./zig-out/bin/zinc ${zincCliArgs(modelTarget, sanityCheckPrompt, 16)}"
 
-Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig). You may also remove files that a revert would remove.
+Files you may edit: same as a normal cycle (src/compute/*.zig, src/vulkan/*.zig, src/model/*.zig, src/server/*.zig, src/server/chat.html, src/shaders/*.comp, src/main.zig, and build.zig only when a shader/pipeline change needs build installation). You may also remove files that a revert would remove.
 
 ## Output Format
 @@@DESCRIPTION: <one-line summary of the pivot action you took>
@@ -1548,9 +1974,9 @@ function coherenceMaxTokensForModel(modelTarget: ModelTarget): number {
   return modelTarget.coherenceMaxTokens ?? 30;
 }
 
-function zincCliArgs(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
+export function zincCliArgs(modelTarget: Pick<ModelTarget, "path" | "promptMode">, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
   const chatFlag = promptMode === "chat" ? " --chat" : "";
-  return `-m ${shellQuote(modelTarget.path)}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
+  return `-m ${shellQuote(modelTarget.path)} -d ${REMOTE_VULKAN_DEVICE_INDEX}${chatFlag} --prompt ${shellQuote(prompt)} -n ${maxTokens}`;
 }
 
 function zincRemoteCommand(modelTarget: ModelTarget, prompt: string, maxTokens: number, promptMode = modelTarget.promptMode): string {
@@ -1583,6 +2009,7 @@ async function collectPhaseBudget(modelTarget: ModelTarget, effortSpec: EffortSp
 async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): Promise<BenchResult> {
   console.log(c("2", "  Compiling shaders..."));
   try {
+    await ssh(`cd ${REMOTE_DIR} && rm -rf zig-out/share/zinc/shaders`, 30_000);
     await ssh(`cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute $f -o \${f%.comp}.spv 2>&1; done`, 60_000);
   } catch (e) {
     return {
@@ -1626,6 +2053,43 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
       bandwidthUtil: null,
       bandwidthSamples: [],
       error: "build errors",
+    };
+  }
+
+  // Shader-install parity guard. `zig build` only installs the shaders listed
+  // in build.zig's `shader_sources` tuple into share/zinc/shaders, but the
+  // runtime loads its .spv from that install dir. A new src/shaders/*.comp that
+  // is wired into Zig but forgotten in shader_sources gets compiled (above) yet
+  // never installed, so the engine silently falls back to an older kernel and
+  // the benchmark measures the wrong code. That is exactly how effort-15 logged
+  // a 79.63 tok/s "win" that did not survive a clean build. Fail loud here so a
+  // forgotten shader is an obvious build failure, not a stale-measurement trap.
+  let parityOutput: string;
+  try {
+    parityOutput = await ssh(
+      `cd ${REMOTE_DIR} && for f in src/shaders/*.comp; do b=$(basename "$f" .comp); ` +
+        `test -f "zig-out/share/zinc/shaders/$b.spv" || echo "$b.comp"; done`,
+      30_000,
+    );
+  } catch (e) {
+    parityOutput = String(e);
+  }
+  const missingShaders = parityOutput.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (missingShaders.length > 0) {
+    return {
+      buildOk: false,
+      buildOutput:
+        `Shader-install parity check failed: ${missingShaders.length} shader(s) compiled in ` +
+        `src/shaders but NOT installed by build.zig. Add each to the shader_sources tuple in ` +
+        `build.zig (or delete the unused .comp), otherwise the runtime falls back to older ` +
+        `kernels and the benchmark measures the wrong code:\n  ${missingShaders.join("\n  ")}`,
+      tokPerSec: null,
+      tokPerSecSamples: [],
+      correct: false,
+      outputText: "",
+      bandwidthUtil: null,
+      bandwidthSamples: [],
+      error: "shader install parity mismatch",
     };
   }
 
@@ -1674,13 +2138,19 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
   }
 
   const parseMetric = metricParserForSpec(effortSpec);
+  const samplePlan = BENCHMARK_MAX_SAMPLES > BENCHMARK_MIN_SAMPLES
+    ? `${BENCHMARK_MIN_SAMPLES}-${BENCHMARK_MAX_SAMPLES}`
+    : `${BENCHMARK_MIN_SAMPLES}`;
   console.log(c(
     "2",
-    `  Benchmarking (${BENCHMARK_SAMPLES} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
+    `  Benchmarking (${samplePlan} x ${effortSpec.benchmarkMethod}, primary metric: ${effortSpec.primaryMetricLabel})...`,
   ));
   const tokPerSecSamples: number[] = [];
   const bandwidthSamples: number[] = [];
-  for (let sample = 0; sample < BENCHMARK_SAMPLES; sample++) {
+  for (let sample = 0; sample < BENCHMARK_MAX_SAMPLES; sample++) {
+    if (sample >= BENCHMARK_MIN_SAMPLES && !shouldCollectExtraBenchSample(tokPerSecSamples)) {
+      break;
+    }
     let benchOutput: string;
     try {
       benchOutput = await ssh(
@@ -1705,9 +2175,12 @@ async function buildAndBench(modelTarget: ModelTarget, effortSpec: EffortSpec): 
     const bw = effortSpec.metricMode === "decode" ? parseBandwidthUtil(benchOutput) : null;
     if (tps != null) tokPerSecSamples.push(tps);
     if (bw != null) bandwidthSamples.push(bw);
+    const sampleLabel = sample < BENCHMARK_MIN_SAMPLES
+      ? `${sample + 1}/${BENCHMARK_MIN_SAMPLES}`
+      : `extra ${sample + 1}/${BENCHMARK_MAX_SAMPLES}`;
     console.log(c(
       "2",
-      `    sample ${sample + 1}/${BENCHMARK_SAMPLES}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
+      `    sample ${sampleLabel}: ${tps?.toFixed(2) ?? "?"} tok/s (${effortSpec.primaryMetricLabel})${bw != null ? `, BW ${bw.toFixed(1)}%` : ""}`,
     ));
   }
 
@@ -1739,9 +2212,13 @@ function coherenceCaseLabel(model: string, prompt: string): string {
 }
 
 function formatCoherenceFailure(failure: CoherenceFailure): string {
-  return failure.kind === "crash"
-    ? `${failure.label}: crashed`
-    : `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
+  if (failure.kind === "crash") {
+    const detail = failure.outputText.trim().replace(/\s+/g, " ");
+    return detail
+      ? `${failure.label}: crashed (${trunc(detail, 90)})`
+      : `${failure.label}: crashed`;
+  }
+  return `${failure.label}: "${failure.outputText.slice(0, 50)}"`;
 }
 
 export function formatCoherenceFailureList(failures: CoherenceFailure[]): string {
@@ -1758,45 +2235,83 @@ export function summarizeCoherenceRegression(
   return `New coherence failures vs accepted baseline: ${formatCoherenceFailureList(regressions)}`;
 }
 
+async function runCoherenceCase(testCase: CoherenceCase, timeoutMs: number): Promise<CoherenceFailure | null> {
+  try {
+    const out = await ssh(
+      zincRemoteCommand(testCase.modelTarget, testCase.prompt, testCase.maxTokens, testCase.promptMode),
+      timeoutMs,
+    );
+    const textMatch = out.match(/Output text:\s*(.+)/i);
+    const outputText = textMatch ? textMatch[1].trim() : "";
+    const pass = testCase.check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
+    if (pass) return null;
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText,
+      kind: "mismatch",
+    };
+  } catch (e) {
+    return {
+      id: testCase.id,
+      label: testCase.label,
+      model: testCase.modelTarget.name,
+      prompt: testCase.prompt,
+      outputText: String(e).slice(-500),
+      kind: "crash",
+    };
+  }
+}
+
 async function runCoherenceSweep(): Promise<CoherenceSweep> {
-  const failures: CoherenceFailure[] = [];
+  const cases: CoherenceCase[] = [];
   for (const modelTarget of COHERENCE_MODELS) {
     const promptMode = coherencePromptModeForModel(modelTarget);
     const maxTokens = coherenceMaxTokensForModel(modelTarget);
     for (const check of COHERENCE_CHECKS) {
       const prompt = coherencePromptForMode(check, promptMode);
-      const label = coherenceCaseLabel(modelTarget.name, prompt);
-      try {
-        const out = await ssh(
-          zincRemoteCommand(modelTarget, prompt, maxTokens, promptMode),
-          120_000,
-        );
-        const textMatch = out.match(/Output text:\s*(.+)/i);
-        const outputText = textMatch ? textMatch[1].trim() : "";
-        const pass = check.expect.every(e => outputText.toLowerCase().includes(e.toLowerCase()));
-        if (!pass) {
-          failures.push({
-            id: coherenceCaseId(modelTarget.name, prompt),
-            label,
-            model: modelTarget.name,
-            prompt,
-            outputText,
-            kind: "mismatch",
-          });
-        }
-      } catch (e) {
-        failures.push({
-          id: coherenceCaseId(modelTarget.name, prompt),
-          label,
-          model: modelTarget.name,
-          prompt,
-          outputText: "",
-          kind: "crash",
-        });
-      }
+      cases.push({
+        modelTarget,
+        check,
+        promptMode,
+        maxTokens,
+        prompt,
+        label: coherenceCaseLabel(modelTarget.name, prompt),
+        id: coherenceCaseId(modelTarget.name, prompt),
+      });
     }
+  }
+
+  let failures: CoherenceFailure[] = [];
+  for (const testCase of cases) {
+    const failure = await runCoherenceCase(testCase, 180_000);
+    if (failure) failures.push(failure);
+  }
+
+  const crashedIds = new Set(failures.filter((failure) => failure.kind === "crash").map((failure) => failure.id));
+  if (crashedIds.size > 0) {
+    console.log(c("1;33", `  Coherence saw ${crashedIds.size} crash/timeout case(s); cleaning RDNA node and retrying crashed cases once...`));
+    await cleanRemoteBenchmarkNode();
+    const stableFailures = failures.filter((failure) => failure.kind !== "crash");
+    const retriedFailures: CoherenceFailure[] = [];
+    for (const testCase of cases) {
+      if (!crashedIds.has(testCase.id)) continue;
+      const failure = await runCoherenceCase(testCase, 240_000);
+      if (failure) retriedFailures.push(failure);
+    }
+    failures = [...stableFailures, ...retriedFailures];
+  }
+
+  for (const modelTarget of COHERENCE_MODELS) {
     if (!failures.some((failure) => failure.model === modelTarget.name)) {
       console.log(c("2", `    ${modelTarget.name}: all ${COHERENCE_CHECKS.length} prompts OK`));
+    } else {
+      const crashCount = failures.filter((failure) => failure.model === modelTarget.name && failure.kind === "crash").length;
+      if (crashCount > 0) {
+        console.log(c("1;33", `    ${modelTarget.name}: ${crashCount} crash/timeout case(s) after retry`));
+      }
     }
   }
   return {
@@ -1813,6 +2328,33 @@ export function formatCodexStreamLine(rawLine: string): string | null {
   try { event = JSON.parse(rawLine) as Record<string, unknown>; } catch { return null; }
 
   const type = event.type as string | undefined;
+
+  if (type === "item.started" || type === "item.completed") {
+    const item = event.item as Record<string, unknown> | undefined;
+    const itemType = item?.type as string | undefined;
+    if (itemType === "agent_message") {
+      const text = item?.text ?? item?.message ?? item?.output_text ?? item?.content;
+      if (typeof text === "string" && text.trim()) {
+        return c("96", text.trim()) + "\n";
+      }
+      return null;
+    }
+    if (itemType === "command_execution") {
+      const command = item?.command as string | undefined;
+      if (type === "item.started" && command) {
+        return `\n${c("33", "\uD83D\uDD27 shell")}${c("2", `   $ ${command.length > 120 ? command.slice(0, 120) + "\u2026" : command}`)}\n`;
+      }
+      const exitCode = item?.exit_code;
+      if (type === "item.completed" && typeof exitCode === "number" && exitCode !== 0) {
+        return c("1;31", `  command exited with code ${exitCode}\n`);
+      }
+      return null;
+    }
+    if (itemType === "reasoning") {
+      return c("2", "  \u2026 thinking\n");
+    }
+    return null;
+  }
 
   // Agent message with text
   if (type === "message" || type === "agent") {
@@ -2030,8 +2572,11 @@ export function parseAgentReport(stdout: string): AgentReport {
 }
 
 async function listChangedFiles(): Promise<string[]> {
-  const tracked = await runCommand("git", ["diff", "--name-only", "--", "src/"], { cwd: REPO_ROOT });
-  const untracked = await runCommand("git", ["ls-files", "--others", "--exclude-standard", "src/"], { cwd: REPO_ROOT });
+  const tracked = await runCommand("git", ["diff", "--name-only", "--", ...REVERTABLE_PATHS], { cwd: REPO_ROOT });
+  const untrackedArgs = REVERTABLE_PATHS.filter((path) => path.endsWith("/"));
+  const untracked = untrackedArgs.length > 0
+    ? await runCommand("git", ["ls-files", "--others", "--exclude-standard", ...untrackedArgs], { cwd: REPO_ROOT })
+    : { stdout: "" };
   const files = [
     ...tracked.stdout.split("\n"),
     ...untracked.stdout.split("\n"),
@@ -2162,6 +2707,8 @@ export function codexExecArgs(prompt: string): string[] {
     `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
     "--dangerously-bypass-approvals-and-sandbox",
     "--json",
+    "--model",
+    CODEX_MODEL,
     prompt,
   ];
 }
@@ -2205,19 +2752,22 @@ async function saveLoopState(state: LoopState): Promise<void> {
   await writeFile(statePathForEffort(state.effort), JSON.stringify(state, null, 2));
 }
 
-export function benchmarkSignatureForSpec(spec: EffortSpec): string {
+export function benchmarkSignatureForSpec(spec: EffortSpec, modelKey?: string, modelPath?: string): string {
+  const selectedModelKey = modelKey ?? spec.defaultModel ?? null;
   return JSON.stringify({
     doc: spec.doc,
     metricMode: spec.metricMode,
     primaryMetricLabel: spec.primaryMetricLabel,
+    modelKey: selectedModelKey,
+    modelPath: modelPath ?? (selectedModelKey ? MODELS[selectedModelKey]?.path ?? null : null),
     benchmarkPrompt: spec.benchmarkPrompt,
     benchmarkMaxTokens: spec.benchmarkMaxTokens,
     benchmarkMethod: spec.benchmarkMethod,
   });
 }
 
-export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec): boolean {
-  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec);
+export function isResumeStateCompatible(saved: LoopState, spec: EffortSpec, modelKey?: string, modelPath?: string): boolean {
+  return saved.benchmarkSignature === benchmarkSignatureForSpec(spec, modelKey, modelPath);
 }
 
 function createInitialState(
@@ -2386,29 +2936,34 @@ export async function loadPreviousRun(effort: number): Promise<{
   return { history, bestTokPerSec, lastCycle, bestCycle, bestCommitHash };
 }
 
-// -- Selective revert (only src/, not loops/ or config) ----------------------
+// -- Selective revert (only agent-editable perf paths, not loops/site/docs) ---
 
 async function revertAgentChanges(): Promise<void> {
   for (const path of REVERTABLE_PATHS) {
     await runCommand("git", ["checkout", "--", path], { cwd: REPO_ROOT });
   }
-  // Also clean any new untracked files the agent may have created in src/
-  const { stdout: untracked } = await runCommand("git", ["ls-files", "--others", "--exclude-standard", "src/"], { cwd: REPO_ROOT });
+  // Also clean any new untracked files the agent may have created under
+  // revertable directories.
+  const untrackedArgs = REVERTABLE_PATHS.filter((path) => path.endsWith("/"));
+  const { stdout: untracked } = untrackedArgs.length > 0
+    ? await runCommand("git", ["ls-files", "--others", "--exclude-standard", ...untrackedArgs], { cwd: REPO_ROOT })
+    : { stdout: "" };
   for (const f of untracked.split("\n").filter(Boolean)) {
     await runCommand("rm", ["-f", f], { cwd: REPO_ROOT });
   }
-  console.log(c("2", "  Reverted agent changes (src/ only)."));
+  console.log(c("2", "  Reverted agent changes (build.zig/src only)."));
 }
 
 // -- Main loop ---------------------------------------------------------------
 
 async function main() {
-  const { effort, cycles, dryRun, model, resume, agent, analyze } = parseArgs();
-  const modelTarget = MODELS[model] ?? MODELS.qwen35b;
+  const { effort, cycles, dryRun, model: requestedModel, modelExplicit, resume, agent, analyze } = parseArgs();
   const effortSpec = getEffortSpec(effort);
   if (!effortSpec) {
     throw new Error(`Unknown effort: ${effort}`);
   }
+  const model = modelExplicit ? requestedModel : (effortSpec.defaultModel ?? requestedModel);
+  const modelTarget = MODELS[model] ?? MODELS.qwen36b;
   const effortFile = effortSpec.doc;
   const plan = await readFile(join(EFFORTS_DIR, effortFile), "utf8");
 
@@ -2428,7 +2983,10 @@ async function main() {
   console.log(c("1;37", boxLine(`ZINC Performance Optimization Loop — Effort ${effort}`)));
   console.log(c("1;37", boxLine(effortFile)));
   console.log(c("1;37", boxLine(`Model: ${model}`)));
-  console.log(c("1;37", boxLine(`Agent: ${agent}${agent === "claude" ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})` : ""}`)));
+  const agentDetails = agent === "claude"
+    ? ` (${CLAUDE_MODEL} effort=${CLAUDE_EFFORT})`
+    : ` (${CODEX_MODEL} effort=${CODEX_REASONING_EFFORT})`;
+  console.log(c("1;37", boxLine(`Agent: ${agent}${agentDetails}`)));
   console.log(c("1;37", boxLine(`Cycles this run: ${cycles}`)));
   if (resume) console.log(c("1;37", boxLine("Resuming from previous run")));
   console.log(c("1;37", `\u255A${"═".repeat(BOX_INNER_WIDTH)}\u255D\n`));
@@ -2442,6 +3000,7 @@ async function main() {
 
   // Step 1: Sync and get baseline
   console.log(c("1;33", "\u2500\u2500 Baseline " + "\u2500".repeat(54)));
+  await cleanRemoteBenchmarkNode();
   await rsyncToRemote();
   const originalBaseline = await buildAndBench(modelTarget, effortSpec);
 
@@ -2451,6 +3010,20 @@ async function main() {
   }
   if (!originalBaseline.correct) {
     console.error(c("1;31", `Baseline output incorrect: "${originalBaseline.outputText}". Fix correctness first.`));
+    process.exit(1);
+  }
+  if (originalBaseline.tokPerSec == null) {
+    console.error(c("1;31", `Baseline ${effortSpec.primaryMetricLabel} was not parseable. Fix the benchmark command or parser before starting optimization cycles.`));
+    process.exit(1);
+  }
+  const minHealthyTokPerSec = minHealthyTokPerSecForSpec(effortSpec);
+  if (minHealthyTokPerSec != null && originalBaseline.tokPerSec < minHealthyTokPerSec) {
+    console.error(c(
+      "1;31",
+      `Baseline ${effortSpec.primaryMetricLabel} ${originalBaseline.tokPerSec.toFixed(2)} tok/s is below the ${minHealthyTokPerSec.toFixed(2)} tok/s health floor.`,
+    ));
+    console.error(c("1;31", "This usually means the RDNA node is contaminated, the GPU path is not active, or the driver/runtime state is unhealthy. Clean/reboot/fix the node before burning agent cycles."));
+    console.error(c("2", "Set ZINC_MIN_HEALTHY_TPS=0 only if you intentionally want to optimize from this degraded baseline."));
     process.exit(1);
   }
 
@@ -2468,7 +3041,7 @@ async function main() {
     }
   }
 
-  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec);
+  const benchmarkSignature = benchmarkSignatureForSpec(effortSpec, model, modelTarget.path);
   let currentCode = originalBaseline;
   let bestPerf = originalBaseline;
   let bestTokPerSec = bestPerf.tokPerSec ?? 0;
@@ -2481,7 +3054,7 @@ async function main() {
   if (resume) {
     const saved = await loadLoopState(effort);
     if (saved) {
-      if (!isResumeStateCompatible(saved, effortSpec)) {
+      if (!isResumeStateCompatible(saved, effortSpec, model, modelTarget.path)) {
         console.log(c(
           "1;33",
           "  Resume note: saved state uses an older or different benchmark signature. Ignoring it and starting fresh for this effort.",
@@ -2566,10 +3139,12 @@ async function main() {
       );
       state.ideas = mergeUniqueEntries(state.ideas, agentReport.nextIdeas, IDEA_LIMIT);
       // Revert-after-measurement cycles produce information (they disprove
-      // a hypothesis). They should not count as a stall because that was
-      // the exact behavior the pivot prompt asked for. Only bump stall
-      // for genuine no-ops where the agent produced no measurement.
-      if (!measuredDead) state.stalledCycles++;
+      // a hypothesis), but they still did not create a new best checkpoint.
+      // Count them as stall pressure so long runs of well-measured dead ends
+      // still trigger pivot prompts and phase-budget refreshes instead of
+      // printing stall=0 forever while the search keeps circling the same
+      // local neighborhood.
+      state.stalledCycles++;
       state.consecutiveFoundationKeeps = 0;
       state.lastCycle = cycle;
 
@@ -2633,6 +3208,7 @@ async function main() {
 
     // Sync and benchmark — with up to 2 fix-up retries if build fails
     console.log(c("2", "  Syncing changes..."));
+    await cleanRemoteBenchmarkNode();
     await rsyncToRemote();
     let result = await buildAndBench(modelTarget, effortSpec);
 
@@ -2651,7 +3227,7 @@ ${result.buildOutput.slice(-2000)}
 - The code must compile: zig build -Doptimize=ReleaseFast must succeed on the remote node.
 - Do not use sub-agents, delegation, spawn_agent, or wait_agent.
 - Re-read the file right before patching it; do not patch against stale context.
-- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
+- rsync to remote: rsync -avz --checksum --delete -e "ssh -p ${ZINC_PORT} -o StrictHostKeyChecking=no" --exclude .zig-cache --exclude zig-out --exclude node_modules --exclude .git --exclude .perf_optimize --exclude .zinc_optimize --exclude site --exclude .DS_Store --exclude .env --exclude .env.* --exclude '*.swp' --exclude '*.swo' ${REPO_ROOT}/ ${ZINC_USER}@${ZINC_HOST}:${REMOTE_DIR}/
 - Build on remote: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR} && zig build -Doptimize=ReleaseFast 2>&1"
 - Shader compilation: ssh -p ${ZINC_PORT} ${ZINC_USER}@${ZINC_HOST} "cd ${REMOTE_DIR}/src/shaders && for f in *.comp; do glslc --target-env=vulkan1.3 -fshader-stage=compute \\$f -o \\$\{f%.comp}.spv 2>&1; done"`;
 

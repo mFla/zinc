@@ -5,6 +5,33 @@
 //! information back into the OpenAI-compatible model-management endpoints.
 //! @section API Server
 const std = @import("std");
+
+const FutexMutex = struct {
+    state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+
+    fn lock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        while (@cmpxchgWeak(i32, &self.state.raw, 0, 1, .acquire, .monotonic) != null) {
+            _ = linux.futex_4arg(
+                @ptrCast(&self.state.raw),
+                .{ .cmd = .WAIT, .private = true },
+                1,
+                null,
+            );
+        }
+    }
+
+    fn unlock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        @atomicStore(i32, &self.state.raw, 0, .release);
+        _ = linux.futex_3arg(
+            @ptrCast(&self.state.raw),
+            .{ .cmd = .WAKE, .private = true },
+            1,
+        );
+    }
+};
+
 const catalog_mod = @import("../model/catalog.zig");
 const config_mod = @import("../model/config.zig");
 const managed_mod = @import("../model/managed.zig");
@@ -39,6 +66,13 @@ pub const ModelSummary = struct {
     supported_on_current_gpu: bool,
     fits_current_gpu: bool,
     required_vram_bytes: u64,
+    /// VRAM required when MoE expert tensors are offloaded to host RAM.
+    /// On Apple Silicon (UMA) this equals required_vram_bytes — the field
+    /// exists for API parity with the Vulkan path.
+    required_vram_with_offload_bytes: u64,
+    /// Always false on Apple Silicon — UMA has no separate VRAM, so the
+    /// offload escape hatch isn't applicable here.
+    requires_offload_to_fit: bool,
     size_bytes: u64,
     exact_fit: bool,
     status_label: []const u8,
@@ -91,7 +125,7 @@ pub const ModelManager = struct {
     device: *const MetalDevice,
     profile: []const u8,
     vram_budget_bytes: u64,
-    state_mutex: std.Thread.Mutex = .{},
+    state_mutex: FutexMutex = .{},
     gpu_process_lock: process_lock_mod.ProcessLock = .{},
     requested_context_length: ?u32 = null,
     current: ?*LoadedResources,
@@ -227,7 +261,7 @@ pub const ModelManager = struct {
         const active_display_name = if (self.current) |current| current.display_name else "none";
         const active_supports_thinking_toggle = if (self.current) |current| current.tokenizer.supportsThinkingToggle() else false;
 
-        var list: std.ArrayList(ModelSummary) = .{};
+        var list: std.ArrayList(ModelSummary) = .empty;
         defer list.deinit(allocator);
 
         for (catalog_mod.entries) |entry| {
@@ -237,6 +271,8 @@ pub const ModelManager = struct {
                 .required_vram_bytes = entry.required_vram_bytes,
                 .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
                 .exact = false,
+                .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+                .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
             };
             // Currently-active entries are kept even when the catalog's
             // conservative required_vram_bytes exceeds the live budget — the
@@ -266,6 +302,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = supported_now,
                 .fits_current_gpu = fit.fits_current_gpu,
                 .required_vram_bytes = fit.required_vram_bytes,
+                .required_vram_with_offload_bytes = fit.required_vram_with_offload_bytes,
+                .requires_offload_to_fit = fit.fit_state == .fits_with_offload,
                 .size_bytes = entry.size_bytes,
                 .exact_fit = fit.exact,
                 .status_label = status_label,
@@ -287,6 +325,8 @@ pub const ModelManager = struct {
                 .supported_on_current_gpu = true,
                 .fits_current_gpu = true,
                 .required_vram_bytes = 0,
+                .required_vram_with_offload_bytes = 0,
+                .requires_offload_to_fit = false,
                 .size_bytes = 0,
                 .exact_fit = true,
                 .status_label = "raw",
@@ -306,6 +346,8 @@ pub const ModelManager = struct {
             .required_vram_bytes = entry.required_vram_bytes,
             .fits_current_gpu = catalog_mod.fitsGpu(entry, self.vram_budget_bytes),
             .exact = false,
+            .required_vram_with_offload_bytes = catalog_mod.requiredVramWithOffload(entry),
+            .fit_state = catalog_mod.fitState(entry, self.vram_budget_bytes),
         };
         return catalog_mod.supportsProfile(entry, self.profile) and fit.fits_current_gpu;
     }
@@ -452,11 +494,7 @@ fn loadResourcesInto(
 }
 
 fn tensorBytes(model: *const loader_mod.Model) u64 {
-    var total: u64 = 0;
-    for (model.gguf_file.tensors.items) |tensor_info| {
-        total += tensor_info.sizeBytes();
-    }
-    return total;
+    return loader_mod.residentWeightBytes(model);
 }
 
 fn memoryBudget(device: *const MetalDevice) u64 {
@@ -578,8 +616,8 @@ test "collectCatalogView exposes validated qwen thinking toggles on Metal" {
         },
         .engine = undefined,
         .model_path = try std.testing.allocator.dupe(u8, "/tmp/model.gguf"),
-        .managed_id = try std.testing.allocator.dupe(u8, "qwen35-35b-a3b-q4k-xl"),
-        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.5 35B-A3B UD Q4_K_XL"),
+        .managed_id = try std.testing.allocator.dupe(u8, "qwen36-35b-a3b-q4k-xl"),
+        .display_name = try std.testing.allocator.dupe(u8, "Qwen3.6 35B-A3B UD Q4_K_XL"),
         .weights_bytes = 0,
         .runtime_device_local_bytes = 0,
         .context_reserved_bytes = 0,
@@ -603,7 +641,7 @@ test "collectCatalogView exposes validated qwen thinking toggles on Metal" {
 
     var saw_active = false;
     for (view.data) |entry| {
-        if (std.mem.eql(u8, entry.id, "qwen35-35b-a3b-q4k-xl")) {
+        if (std.mem.eql(u8, entry.id, "qwen36-35b-a3b-q4k-xl")) {
             saw_active = true;
             try std.testing.expect(entry.active);
             try std.testing.expect(entry.supports_thinking_toggle);

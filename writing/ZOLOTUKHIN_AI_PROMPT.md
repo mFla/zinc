@@ -22,6 +22,7 @@ Requirements:
 - Avoid em dashes unless absolutely necessary.
 - Use sentence case headings.
 - Make the title catchy, current, and aligned with real AI or hardware trends.
+- Vary the title opener. Before settling on the title, list the previous five posts' slugs and count how many start with `Why`. If two or more do, this post's title must NOT start with `Why`. Reach for declarative statements, `How ...`, `What ...`, `The <noun> that ...`, a colon-anchored framing, or a direct subject-led title instead.
 - Use SEO-friendly wording naturally. The main topic should appear in the title, excerpt, and early introduction.
 - Include at least one visual aid. Prefer a Mermaid diagram, a benchmark table, or both.
 - Every important claim needs support: benchmark, code detail, architecture fact, or explicit tradeoff.

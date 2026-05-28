@@ -1,0 +1,74 @@
+#version 460
+// ZINC — batched SSM 1D convolution with in-place output.
+//
+// Each invocation owns one channel and walks the prompt-token chunk in order,
+// preserving the exact recurrent conv-state dependency while avoiding one
+// dispatch per token. The input/output buffer is [n_tokens, conv_channels];
+// each element is overwritten with conv1d(input history) * sigmoid(conv1d).
+
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer QkvData {
+    float qkv_data[];
+};
+
+layout(set = 0, binding = 1) readonly buffer ConvKernelF32 {
+    float conv_kernel_f32[];
+};
+
+layout(set = 0, binding = 1) readonly buffer ConvKernelF16 {
+    float16_t conv_kernel_f16[];
+};
+
+layout(set = 0, binding = 2) buffer ConvState {
+    float state[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint conv_channels;
+    uint d_conv;
+    uint kernel_is_f16;
+    uint state_offset;
+    uint n_tokens;
+};
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= conv_channels) return;
+
+    uint d_conv_1 = d_conv - 1u;
+    uint offset = state_offset;
+
+    for (uint tok = 0u; tok < n_tokens; tok++) {
+        uint tok_base = tok * conv_channels;
+        float current = qkv_data[tok_base + ch];
+
+        float sum = 0.0;
+        for (uint ki = 0u; ki < d_conv; ki++) {
+            uint k_idx = ch * d_conv + ki;
+            float kw = (kernel_is_f16 != 0u)
+                ? float(conv_kernel_f16[k_idx])
+                : conv_kernel_f32[k_idx];
+
+            float sv;
+            if (ki < d_conv_1) {
+                uint slot = offset + ki;
+                if (slot >= d_conv_1) slot -= d_conv_1;
+                sv = state[slot * conv_channels + ch];
+            } else {
+                sv = current;
+            }
+            sum += kw * sv;
+        }
+
+        float sig = 1.0 / (1.0 + exp(-sum));
+        qkv_data[tok_base + ch] = sum * sig;
+        state[offset * conv_channels + ch] = current;
+
+        offset += 1u;
+        if (offset >= d_conv_1) offset = 0u;
+    }
+}

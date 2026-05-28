@@ -16,9 +16,9 @@ struct DualQ8DmmvPush {
 //
 // Combines two Q8_0 matrix-vector multiplies that share the same input vector
 // (e.g. SSM qkv 8192x2048 + gate 4096x2048) with inline RMSNorm computation.
-// Each simdgroup reads hidden and norm_weight from L1 cache, computes the
-// normalization factor independently, and uses the normed input directly for
-// the DMMV — no intermediate norm_buf write or barrier needed.
+// Each simdgroup handles four output rows, applying llama.cpp's adjacent-row
+// matvec discipline more aggressively for the exact Qwen3.6 SSM shape while
+// avoiding the intermediate norm_buf write and barrier.
 
 kernel void main0(
     constant DualQ8DmmvPush& p [[buffer(0)]],
@@ -44,41 +44,100 @@ kernel void main0(
     sq_sum = simd_sum(sq_sum);
     const float rms_inv = rsqrt(sq_sum / float(p.K) + 1e-6f);
 
-    const uint linear_row = tg_id * simdgroups_per_tg + sg_idx;
+    const uint linear_row = (tg_id * simdgroups_per_tg + sg_idx) * 4u;
     const uint total_rows = p.M0 + p.M1;
     if (linear_row >= total_rows) return;
 
-    const bool first = linear_row < p.M0;
-    const uint row = first ? linear_row : (linear_row - p.M0);
-    device const uchar* weights = first ? W0 : W1;
-    device float* output = first ? (Y0 + (p.y0_offset >> 2)) : (Y1 + (p.y1_offset >> 2));
-    const uint a_offset = first ? p.a0_offset : p.a1_offset;
+    const bool first0 = linear_row < p.M0;
+    const uint row0 = first0 ? linear_row : (linear_row - p.M0);
+    device const uchar* weights0 = first0 ? W0 : W1;
+    device float* output0 = first0 ? (Y0 + (p.y0_offset >> 2)) : (Y1 + (p.y1_offset >> 2));
+    const uint a_offset0 = first0 ? p.a0_offset : p.a1_offset;
+
+    const bool has1 = linear_row + 1u < total_rows;
+    const uint linear1 = linear_row + 1u;
+    const bool first1 = has1 ? (linear1 < p.M0) : first0;
+    const uint row1 = has1 ? (first1 ? linear1 : (linear1 - p.M0)) : row0;
+    device const uchar* weights1 = has1 ? (first1 ? W0 : W1) : weights0;
+    device float* output1 = has1 ? (first1 ? (Y0 + (p.y0_offset >> 2)) : (Y1 + (p.y1_offset >> 2))) : output0;
+    const uint a_offset1 = has1 ? (first1 ? p.a0_offset : p.a1_offset) : a_offset0;
+
+    const bool has2 = linear_row + 2u < total_rows;
+    const uint linear2 = linear_row + 2u;
+    const bool first2 = has2 ? (linear2 < p.M0) : first0;
+    const uint row2 = has2 ? (first2 ? linear2 : (linear2 - p.M0)) : row0;
+    device const uchar* weights2 = has2 ? (first2 ? W0 : W1) : weights0;
+    device float* output2 = has2 ? (first2 ? (Y0 + (p.y0_offset >> 2)) : (Y1 + (p.y1_offset >> 2))) : output0;
+    const uint a_offset2 = has2 ? (first2 ? p.a0_offset : p.a1_offset) : a_offset0;
+
+    const bool has3 = linear_row + 3u < total_rows;
+    const uint linear3 = linear_row + 3u;
+    const bool first3 = has3 ? (linear3 < p.M0) : first0;
+    const uint row3 = has3 ? (first3 ? linear3 : (linear3 - p.M0)) : row0;
+    device const uchar* weights3 = has3 ? (first3 ? W0 : W1) : weights0;
+    device float* output3 = has3 ? (first3 ? (Y0 + (p.y0_offset >> 2)) : (Y1 + (p.y1_offset >> 2))) : output0;
+    const uint a_offset3 = has3 ? (first3 ? p.a0_offset : p.a1_offset) : a_offset0;
 
     // Step 2: DMMV with inline-normalized input.
     const uint blocks_per_row = p.K >> 5;
-    device const uchar* row_ptr = weights + a_offset + ulong(row) * ulong(blocks_per_row) * 34ull;
+    const ulong row_bytes = ulong(blocks_per_row) * 34ull;
+    device const uchar* row_ptr0 = weights0 + a_offset0 + ulong(row0) * row_bytes;
+    device const uchar* row_ptr1 = weights1 + a_offset1 + ulong(row1) * row_bytes;
+    device const uchar* row_ptr2 = weights2 + a_offset2 + ulong(row2) * row_bytes;
+    device const uchar* row_ptr3 = weights3 + a_offset3 + ulong(row3) * row_bytes;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
     for (uint bi = lane; bi < blocks_per_row; bi += 32u) {
-        device const uchar* block = row_ptr + bi * 34u;
-        const float scale = float(as_type<half>(*(device const ushort*)(block)));
-        device const packed_char4* quants = (device const packed_char4*)(block + 2u);
+        device const uchar* block0 = row_ptr0 + bi * 34u;
+        device const uchar* block1 = row_ptr1 + bi * 34u;
+        device const uchar* block2 = row_ptr2 + bi * 34u;
+        device const uchar* block3 = row_ptr3 + bi * 34u;
+        const float scale0 = float(as_type<half>(*(device const ushort*)(block0)));
+        const float scale1 = has1 ? float(as_type<half>(*(device const ushort*)(block1))) : 0.0f;
+        const float scale2 = has2 ? float(as_type<half>(*(device const ushort*)(block2))) : 0.0f;
+        const float scale3 = has3 ? float(as_type<half>(*(device const ushort*)(block3))) : 0.0f;
+        device const packed_char4* quants0 = (device const packed_char4*)(block0 + 2u);
+        device const packed_char4* quants1 = (device const packed_char4*)(block1 + 2u);
+        device const packed_char4* quants2 = (device const packed_char4*)(block2 + 2u);
+        device const packed_char4* quants3 = (device const packed_char4*)(block3 + 2u);
         const uint x_base = bi << 5;
 
         #pragma unroll
         for (uint vi = 0u; vi < 8u; ++vi) {
-            const char4 q = char4(quants[vi]);
-            const half4 q_half = half4(q);
             const uint idx = x_base + (vi << 2);
             const float4 h4 = *(device const float4*)(h + idx);
             const float4 nw4 = *(device const float4*)(norm_weight + idx);
-            const half4 x = half4(nw4 * (h4 * rms_inv));
-            acc = fma(scale, float(dot(q_half, x)), acc);
+            const float4 x = nw4 * (h4 * rms_inv);
+            acc0 = fma(scale0, dot(float4(char4(quants0[vi])), x), acc0);
+            if (has1) {
+                acc1 = fma(scale1, dot(float4(char4(quants1[vi])), x), acc1);
+            }
+            if (has2) {
+                acc2 = fma(scale2, dot(float4(char4(quants2[vi])), x), acc2);
+            }
+            if (has3) {
+                acc3 = fma(scale3, dot(float4(char4(quants3[vi])), x), acc3);
+            }
         }
     }
 
-    const float sum = simd_sum(acc);
+    const float sum0 = simd_sum(acc0);
+    const float sum1 = simd_sum(acc1);
+    const float sum2 = simd_sum(acc2);
+    const float sum3 = simd_sum(acc3);
     if (lane == 0u) {
-        output[row] = sum;
+        output0[row0] = sum0;
+        if (has1) {
+            output1[row1] = sum1;
+        }
+        if (has2) {
+            output2[row2] = sum2;
+        }
+        if (has3) {
+            output3[row3] = sum3;
+        }
     }
 }

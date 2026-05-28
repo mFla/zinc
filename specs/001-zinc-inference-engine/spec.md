@@ -13,13 +13,13 @@ A developer loads a GGUF model onto an AMD RDNA4 GPU and generates text from a p
 
 **Why this priority**: This is the foundational capability — nothing else works without a correct, performant single-request inference path. Validates the entire GPU kernel library, model loading, and compute graph.
 
-**Independent Test**: Load Qwen3.5-35B-A3B Q4_K_XL GGUF on an RDNA4 GPU, generate 256 tokens from a fixed prompt, verify output is coherent English matching llama.cpp quality. Compare first 10 generated tokens against llama.cpp server output for the same prompt.
+**Independent Test**: Load Qwen3.6-35B-A3B Q4_K_XL GGUF on an RDNA4 GPU, generate 256 tokens from a fixed prompt, verify output is coherent English matching llama.cpp quality. Compare first 10 generated tokens against llama.cpp server output for the same prompt.
 
 **Current State (2026-03-28)**: Forward pass is CORRECT — generates "Paris. The capital of Germany is Berlin..." matching llama.cpp quality. All 13 correctness bugs found and fixed (8 by self-improving loop, 5 manual). 26 build tests pass. Performance: 4 tok/s at 0.4% bandwidth utilization — bottleneck is Vulkan submission overhead (~1600 submits/token), not GPU compute. Phase 3c (decode performance) is the current priority.
 
 **Acceptance Scenarios**:
 
-1. **Given** a valid GGUF model file and an RDNA4 GPU, **When** the user runs `zinc -m model.gguf --prompt "Hello"`, **Then** the engine generates coherent text at 110+ tok/s for Qwen3.5-35B-A3B Q4_K on AI PRO R9700.
+1. **Given** a valid GGUF model file and an RDNA4 GPU, **When** the user runs `zinc -m model.gguf --prompt "Hello"`, **Then** the engine generates coherent text at 110+ tok/s for Qwen3.6-35B-A3B Q4_K on AI PRO R9700.
 2. **Given** a GGUF model with Q4_K quantization, **When** inference runs, **Then** DMMV bandwidth utilization is 67-93% of theoretical (576 GB/s on AI PRO R9700).
 3. **Given** a model with RoPE, RMS norm, SwiGLU, and softmax ops, **When** the forward pass executes, **Then** fused kernels (RMS_NORM_MUL, SWIGLU, ROPE_FUSED) reduce non-matmul compute time by >30% vs unfused baseline.
 
@@ -64,7 +64,7 @@ A user loads a Qwen MoE or Mamba/Jamba hybrid model. The engine correctly handle
 
 **Why this priority**: Extends model coverage to the architectures most relevant for efficient inference (MoE for quality/compute tradeoff, SSM for linear-time sequence processing).
 
-**Independent Test**: Load Qwen3.5-35B-A3B (SSM+attention hybrid MoE), generate text, validate output against llama.cpp reference. Expert routing must correctly select top-k experts per token.
+**Independent Test**: Load Qwen3.6-35B-A3B (SSM+attention hybrid MoE), generate text, validate output against llama.cpp reference. Expert routing must correctly select top-k experts per token.
 
 **Acceptance Scenarios**:
 
@@ -112,7 +112,7 @@ A user loads a Qwen MoE or Mamba/Jamba hybrid model. The engine correctly handle
 
 ### Measurable Outcomes
 
-- **SC-001**: Single-request generation achieves 110+ tok/s on Qwen3.5-35B-A3B Q4_K on AI PRO R9700 (32GB, 576 GB/s).
+- **SC-001**: Single-request generation achieves 110+ tok/s on Qwen3.6-35B-A3B Q4_K on AI PRO R9700 (32GB, 576 GB/s).
 - **SC-002**: 4 concurrent requests achieve 108+ tok/s each (432+ tok/s aggregate) with zero per-slot degradation.
 - **SC-003**: Prefill throughput achieves 2800+ tok/s at pp512 context length.
 - **SC-004**: DMMV bandwidth utilization is 93%+ for large matrices (m >= 248320) and 83%+ for medium matrices (m >= 8192).

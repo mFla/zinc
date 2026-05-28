@@ -4,6 +4,12 @@
 //! Run via `zig build hot-bench -Doptimize=ReleaseFast`.
 //! @section Inference Runtime
 const std = @import("std");
+
+fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 const vk = @import("vulkan/vk.zig");
 const Instance = @import("vulkan/instance.zig").Instance;
 const CommandPool = @import("vulkan/command.zig").CommandPool;
@@ -11,7 +17,8 @@ const CommandBuffer = @import("vulkan/command.zig").CommandBuffer;
 const Buffer = @import("vulkan/buffer.zig").Buffer;
 const buffer_mod = @import("vulkan/buffer.zig");
 const gpu_detect = @import("vulkan/gpu_detect.zig");
-const DmmvDispatch = @import("compute/dmmv.zig").DmmvDispatch;
+const dmmv_mod = @import("compute/dmmv.zig");
+const DmmvDispatch = dmmv_mod.DmmvDispatch;
 const ElementwiseDispatch = @import("compute/elementwise.zig").ElementwiseDispatch;
 const elementwise = @import("compute/elementwise.zig");
 const GGMLType = @import("model/gguf.zig").GGMLType;
@@ -215,7 +222,7 @@ fn printUsage() void {
     , .{});
 }
 
-fn resolveShaderDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
+fn resolveShaderDir(io: std.Io, allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
     if (override) |path| return allocator.dupe(u8, path);
 
     const candidates = [_][]const u8{
@@ -223,7 +230,7 @@ fn resolveShaderDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
         "share/zinc/shaders",
     };
     for (candidates) |candidate| {
-        std.fs.cwd().access(candidate, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
         return allocator.dupe(u8, candidate);
     }
 
@@ -232,7 +239,7 @@ fn resolveShaderDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]u8 {
     const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
     const derived = try std.fs.path.join(allocator, &.{ exe_dir, "..", "share", "zinc", "shaders" });
     errdefer allocator.free(derived);
-    std.fs.cwd().access(derived, .{}) catch return error.ShaderDirNotFound;
+    std.Io.Dir.cwd().access(io, derived, .{}) catch return error.ShaderDirNotFound;
     return derived;
 }
 
@@ -379,7 +386,7 @@ const DmmvSlot = struct {
     weights: Buffer,
     x: Buffer,
     y: Buffer,
-    descriptor_set: vk.c.VkDescriptorSet,
+    descriptor_set: ?vk.c.VkDescriptorSet = null,
 
     fn deinit(self: *DmmvSlot) void {
         self.weights.deinit();
@@ -397,7 +404,7 @@ const SsmDeltaSlot = struct {
     ssm_a: Buffer,
     state: Buffer,
     output: Buffer,
-    descriptor_set: vk.c.VkDescriptorSet,
+    descriptor_set: ?vk.c.VkDescriptorSet = null,
 
     fn deinit(self: *SsmDeltaSlot) void {
         self.conv.deinit();
@@ -415,16 +422,44 @@ fn recordRepeatedDmmv(
     cmd: *CommandBuffer,
     timer: *const TimestampTimer,
     dispatch: *const DmmvDispatch,
-    descriptor_sets: []const vk.c.VkDescriptorSet,
+    push_desc_fn: ?@import("vulkan/instance.zig").PushDescriptorFn,
+    slots: []const DmmvSlot,
     M: u32,
     K: u32,
     iterations: u32,
 ) !void {
+    const pip = dispatch.pipelineForType(.q8_0) orelse return error.ShaderNotLoaded;
     timer.writeStart(cmd);
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        const ds = descriptor_sets[i % descriptor_sets.len];
-        try dispatch.recordDispatch(cmd, .q8_0, ds, M, K, 0, 0, 0);
+        const slot = slots[i % slots.len];
+        if (pip.uses_push_descriptors) {
+            const push = dmmv_mod.DmmvPushConstants{
+                .M = M,
+                .K = K,
+                .a_offset = 0,
+                .x_offset = 0,
+                .y_offset = 0,
+                .acc_mode = 0,
+            };
+            const infos = [3]vk.c.VkDescriptorBufferInfo{
+                .{ .buffer = slot.weights.handle, .offset = 0, .range = slot.weights.size },
+                .{ .buffer = slot.x.handle, .offset = 0, .range = slot.x.size },
+                .{ .buffer = slot.y.handle, .offset = 0, .range = slot.y.size },
+            };
+            cmd.pushDescAndDispatch(
+                pip,
+                push_desc_fn,
+                infos[0..],
+                std.mem.asBytes(&push),
+                (M + 1) / 2,
+                1,
+                1,
+            );
+        } else {
+            const ds = slot.descriptor_set orelse return error.DescriptorSetMissing;
+            try dispatch.recordDispatch(cmd, .q8_0, ds, M, K, 0, 0, 0);
+        }
     }
     timer.writeEnd(cmd);
 }
@@ -433,15 +468,39 @@ fn recordRepeatedSsmDelta(
     cmd: *CommandBuffer,
     timer: *const TimestampTimer,
     dispatch: *const ElementwiseDispatch,
-    descriptor_sets: []const vk.c.VkDescriptorSet,
+    push_desc_fn: ?@import("vulkan/instance.zig").PushDescriptorFn,
+    slots: []const SsmDeltaSlot,
     push: elementwise.SsmDeltaNetPush,
     iterations: u32,
 ) !void {
+    const pip = if (dispatch.pipeline_ssm_delta_net) |*p| p else return error.ShaderNotLoaded;
     timer.writeStart(cmd);
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        const ds = descriptor_sets[i % descriptor_sets.len];
-        try dispatch.recordSsmDeltaNet(cmd, ds, push);
+        const slot = slots[i % slots.len];
+        if (pip.uses_push_descriptors) {
+            const infos = [7]vk.c.VkDescriptorBufferInfo{
+                .{ .buffer = slot.conv.handle, .offset = 0, .range = slot.conv.size },
+                .{ .buffer = slot.dt_bias.handle, .offset = 0, .range = slot.dt_bias.size },
+                .{ .buffer = slot.alpha.handle, .offset = 0, .range = slot.alpha.size },
+                .{ .buffer = slot.beta.handle, .offset = 0, .range = slot.beta.size },
+                .{ .buffer = slot.ssm_a.handle, .offset = 0, .range = slot.ssm_a.size },
+                .{ .buffer = slot.state.handle, .offset = 0, .range = slot.state.size },
+                .{ .buffer = slot.output.handle, .offset = 0, .range = slot.output.size },
+            };
+            cmd.pushDescAndDispatch(
+                pip,
+                push_desc_fn,
+                infos[0..],
+                std.mem.asBytes(&push),
+                push.dt_rank,
+                push.head_v_dim,
+                1,
+            );
+        } else {
+            const ds = slot.descriptor_set orelse return error.DescriptorSetMissing;
+            try dispatch.recordSsmDeltaNet(cmd, ds, push);
+        }
         if (i + 1 < iterations) cmd.computeBarrier();
     }
     timer.writeEnd(cmd);
@@ -453,9 +512,9 @@ fn runRecorded(
     timer: *const TimestampTimer,
 ) !struct { gpu_ms: f64, wall_ms: f64 } {
     try cmd.end();
-    const wall_start = std.time.nanoTimestamp();
+    const wall_start = nanoTimestamp();
     try cmd.submitAndWait(queue);
-    const wall_end = std.time.nanoTimestamp();
+    const wall_end = nanoTimestamp();
     return .{
         .gpu_ms = try timer.elapsedMs(),
         .wall_ms = @as(f64, @floatFromInt(wall_end - wall_start)) / 1_000_000.0,
@@ -508,30 +567,29 @@ fn runDmmvCase(
         slots[init_count].weights = try initDeviceLocalWithBytes(instance, cmd_pool, weight_blob);
         slots[init_count].x = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(x_host));
         slots[init_count].y = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(y_host));
-        slots[init_count].descriptor_set = try allocDescSet(instance.device, dispatch.descriptor_pool, pipeline.descriptor_set_layout);
-        var infos = [3]vk.c.VkDescriptorBufferInfo{
-            .{ .buffer = slots[init_count].weights.handle, .offset = 0, .range = slots[init_count].weights.size },
-            .{ .buffer = slots[init_count].x.handle, .offset = 0, .range = slots[init_count].x.size },
-            .{ .buffer = slots[init_count].y.handle, .offset = 0, .range = slots[init_count].y.size },
-        };
-        writeDescSet(3, instance.device, slots[init_count].descriptor_set, &infos);
+        if (!pipeline.uses_push_descriptors) {
+            const ds = try allocDescSet(instance.device, dispatch.descriptor_pool, pipeline.descriptor_set_layout);
+            slots[init_count].descriptor_set = ds;
+            var infos = [3]vk.c.VkDescriptorBufferInfo{
+                .{ .buffer = slots[init_count].weights.handle, .offset = 0, .range = slots[init_count].weights.size },
+                .{ .buffer = slots[init_count].x.handle, .offset = 0, .range = slots[init_count].x.size },
+                .{ .buffer = slots[init_count].y.handle, .offset = 0, .range = slots[init_count].y.size },
+            };
+            writeDescSet(3, instance.device, ds, &infos);
+        }
     }
     defer {
         for (slots[0..slot_count]) |*slot| slot.deinit();
     }
 
-    const descriptor_sets = try allocator.alloc(vk.c.VkDescriptorSet, slot_count);
-    defer allocator.free(descriptor_sets);
-    for (slots, 0..) |slot, i| descriptor_sets[i] = slot.descriptor_set;
-
     try cmd.reset();
     try cmd.beginOneTime();
-    try recordRepeatedDmmv(cmd, timer, dispatch, descriptor_sets, case.M, case.K, warmup);
+    try recordRepeatedDmmv(cmd, timer, dispatch, instance.push_descriptor_fn, slots, case.M, case.K, warmup);
     try warmupRecorded(cmd, queue);
 
     try cmd.reset();
     try cmd.beginOneTime();
-    try recordRepeatedDmmv(cmd, timer, dispatch, descriptor_sets, case.M, case.K, iterations);
+    try recordRepeatedDmmv(cmd, timer, dispatch, instance.push_descriptor_fn, slots, case.M, case.K, iterations);
     const measured = try runRecorded(cmd, queue, timer);
 
     const bytes_per_iter = dmmvBytesPerIter(case.M, case.K);
@@ -615,25 +673,24 @@ fn runSsmDeltaCase(
         slots[init_count].ssm_a = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(ssm_a));
         slots[init_count].state = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(state));
         slots[init_count].output = try initDeviceLocalWithBytes(instance, cmd_pool, std.mem.sliceAsBytes(output));
-        slots[init_count].descriptor_set = try allocDescSet(instance.device, dispatch.descriptor_pool, pipeline.descriptor_set_layout);
-        var infos = [7]vk.c.VkDescriptorBufferInfo{
-            .{ .buffer = slots[init_count].conv.handle, .offset = 0, .range = slots[init_count].conv.size },
-            .{ .buffer = slots[init_count].dt_bias.handle, .offset = 0, .range = slots[init_count].dt_bias.size },
-            .{ .buffer = slots[init_count].alpha.handle, .offset = 0, .range = slots[init_count].alpha.size },
-            .{ .buffer = slots[init_count].beta.handle, .offset = 0, .range = slots[init_count].beta.size },
-            .{ .buffer = slots[init_count].ssm_a.handle, .offset = 0, .range = slots[init_count].ssm_a.size },
-            .{ .buffer = slots[init_count].state.handle, .offset = 0, .range = slots[init_count].state.size },
-            .{ .buffer = slots[init_count].output.handle, .offset = 0, .range = slots[init_count].output.size },
-        };
-        writeDescSet(7, instance.device, slots[init_count].descriptor_set, &infos);
+        if (!pipeline.uses_push_descriptors) {
+            const ds = try allocDescSet(instance.device, dispatch.descriptor_pool, pipeline.descriptor_set_layout);
+            slots[init_count].descriptor_set = ds;
+            var infos = [7]vk.c.VkDescriptorBufferInfo{
+                .{ .buffer = slots[init_count].conv.handle, .offset = 0, .range = slots[init_count].conv.size },
+                .{ .buffer = slots[init_count].dt_bias.handle, .offset = 0, .range = slots[init_count].dt_bias.size },
+                .{ .buffer = slots[init_count].alpha.handle, .offset = 0, .range = slots[init_count].alpha.size },
+                .{ .buffer = slots[init_count].beta.handle, .offset = 0, .range = slots[init_count].beta.size },
+                .{ .buffer = slots[init_count].ssm_a.handle, .offset = 0, .range = slots[init_count].ssm_a.size },
+                .{ .buffer = slots[init_count].state.handle, .offset = 0, .range = slots[init_count].state.size },
+                .{ .buffer = slots[init_count].output.handle, .offset = 0, .range = slots[init_count].output.size },
+            };
+            writeDescSet(7, instance.device, ds, &infos);
+        }
     }
     defer {
         for (slots[0..slot_count]) |*slot| slot.deinit();
     }
-
-    const descriptor_sets = try allocator.alloc(vk.c.VkDescriptorSet, slot_count);
-    defer allocator.free(descriptor_sets);
-    for (slots, 0..) |slot, i| descriptor_sets[i] = slot.descriptor_set;
 
     const push = elementwise.SsmDeltaNetPush{
         .d_inner = d_inner,
@@ -645,16 +702,20 @@ fn runSsmDeltaCase(
         .dt_bias_is_f16 = 1,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .n_tok = 1,
+        .conv_stride_tok = conv_channels,
+        .ab_stride_tok = dt_rank,
+        .y_stride_tok = d_inner,
     };
 
     try cmd.reset();
     try cmd.beginOneTime();
-    try recordRepeatedSsmDelta(cmd, timer, dispatch, descriptor_sets, push, warmup);
+    try recordRepeatedSsmDelta(cmd, timer, dispatch, instance.push_descriptor_fn, slots, push, warmup);
     try warmupRecorded(cmd, queue);
 
     try cmd.reset();
     try cmd.beginOneTime();
-    try recordRepeatedSsmDelta(cmd, timer, dispatch, descriptor_sets, push, iterations);
+    try recordRepeatedSsmDelta(cmd, timer, dispatch, instance.push_descriptor_fn, slots, push, iterations);
     const measured = try runRecorded(cmd, queue, timer);
 
     const bytes_per_iter = ssmDeltaApproxBytesPerIter(d_inner, dt_rank, d_state, n_group);
@@ -717,10 +778,11 @@ pub fn main() !void {
         if (leaked == .leak) log.err("memory leak detected", .{});
     }
     const allocator = gpa.allocator();
+    const io = std.Io.buffered(std.Io.default);
 
     var args = try parseArgs(allocator);
     defer args.deinit(allocator);
-    const shader_dir = try resolveShaderDir(allocator, args.shader_dir);
+    const shader_dir = try resolveShaderDir(io, allocator, args.shader_dir);
     defer allocator.free(shader_dir);
 
     const model_cfg = try loadBenchModelConfig(args.model_path, allocator);
@@ -737,7 +799,7 @@ pub fn main() !void {
     var timer = try TimestampTimer.init(&instance);
     defer timer.deinit();
 
-    var dmmv = try DmmvDispatch.init(&instance, &gpu_cfg, shader_dir, @max(model_cfg.hidden_dim, model_cfg.ssm_d_inner), allocator);
+    var dmmv = try DmmvDispatch.init(io, &instance, &gpu_cfg, shader_dir, @max(model_cfg.hidden_dim, model_cfg.ssm_d_inner), allocator);
     defer dmmv.deinit();
     var elt = try ElementwiseDispatch.init(&instance, shader_dir, allocator);
     defer elt.deinit();
@@ -746,11 +808,11 @@ pub fn main() !void {
     if (args.model_path) |model_path| {
         log.info("Shape source: {s}", .{model_path});
     } else {
-        log.info("Shape source: built-in Qwen3.5-35B defaults", .{});
+        log.info("Shape source: built-in Qwen3.6-35B defaults", .{});
     }
     log.info("Working set: {d} rotating buffer sets", .{args.working_set});
 
-    var results: std.ArrayList(BenchResult) = .{};
+    var results: std.ArrayList(BenchResult) = .empty;
     defer results.deinit(allocator);
 
     for (cases) |case| {
@@ -772,7 +834,7 @@ pub fn main() !void {
     if (results.items.len == 0) return error.NoCasesMatched;
 
     if (args.json) {
-        var stdout = std.fs.File.stdout().writerStreaming(&.{});
+        var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
         defer stdout.end() catch {};
         try std.json.Stringify.value(results.items, .{ .whitespace = .indent_2 }, &stdout.interface);
         try stdout.interface.writeByte('\n');

@@ -1,26 +1,13 @@
 #version 460
-// ZINC — Q8_0 weight × Q8_1 activation integer-dot matvec (mmq).
+// ZINC - Q8_0 weights x Q8_1 activation matrix-vector multiply.
 //
-// Used on the prefill path when the activation has been pre-quantized with
-// quantize_q8_1.comp. Same dispatch shape as dmmv_q8_0.comp: 64 threads per
-// workgroup, 2 output rows per workgroup, subgroupAdd reduction over the wave.
-//
-// The win vs dmmv_q8_0 is bandwidth + integer dot:
-// - Activation read shrinks from K f32 (4K bytes) to K/32 * 36 bytes (~1.125
-//   bytes per element), ~3.6x smaller.
-// - Inner dot is int8 * int8 -> int32, scaled by d_weight * d_activation once
-//   per 32-element block, instead of int8 * f32 -> f32 per element.
-//
-// Weight A (Q8_0 block, 34 bytes):
-//   [0..1]   f16 d        — block scale
-//   [2..33]  int8 qs[32]
-// Activation X (Q8_1 block, 36 bytes, matches quantize_q8_1.comp output):
-//   qs[8]: 32 int8 values packed 4-per-uint (little-endian)
-//   ds:    packFloat2x16(f16(d), f16(d*sum)) — we only use the low 16 bits (d)
-// Output Y: f32
+// This mirrors llama.cpp's Vulkan mmvq idea for Q8_0: quantize the F32
+// activation into Q8_1 blocks, then use integer dot products against Q8_0
+// weight blocks. Intended first for the Qwen 3.6 Q8_0 LM head.
 
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -28,80 +15,80 @@
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PushConstants {
-    uint M;           // output rows
-    uint K;           // shared dim (must be a multiple of 32)
-    uint a_offset;    // byte offset into A
-    uint x_offset;    // byte offset into X (must be 4-byte aligned)
-    uint y_offset;    // byte offset into Y
-    uint acc_mode;    // 0 = overwrite, 1 = accumulate
+    uint M;
+    uint K;
+    uint a_offset;
+    uint x_offset;
+    uint y_offset;
+    uint acc_mode;
 };
 
 layout(set = 0, binding = 0) readonly buffer MatrixA { uint8_t a_data[]; };
-layout(set = 0, binding = 1) readonly buffer VectorX { uint    x_data[]; };
+layout(set = 0, binding = 1) readonly buffer VectorXQ81 { uint x_q81[]; };
 layout(set = 0, binding = 2) buffer VectorY { float y_data[]; };
 
-const uint Q80_BLOCK_SIZE = 32;   // elements per block (both Q8_0 and Q8_1)
-const uint Q80_BYTES      = 34;   // Q8_0 block size in bytes
-const uint Q81_UINTS      = 9;    // Q8_1 block size in 4-byte words (32 qs + 4 byte ds)
+const uint Q8_0_BLOCK_SIZE = 32u;
+const uint Q8_0_BYTES = 34u;
+const uint Q8_1_U32_PER_BLOCK = 9u; // 8 packed int8 quads + packed f16(d, d*sum)
 
-shared float s_sum0[2];
-shared float s_sum1[2];
+shared float s_sum0[4];
+shared float s_sum1[4];
 
-// Integer dot of one Q8_0 weight block and one Q8_1 activation block,
-// scaled by d_weight * d_activation.
-float mmq_block(uint a_block_off, uint x_u32_off) {
-    // Weight scale
-    uint dw_bits = uint(a_data[a_block_off]) | (uint(a_data[a_block_off + 1u]) << 8);
-    float dw = unpackHalf2x16(dw_bits).x;
-    uint qs_off_a = a_block_off + 2u;
+uint load_q8_0_u32(uint qs_off, uint i) {
+    const uint q_off = qs_off + i * 4u;
+    return
+        uint(a_data[q_off + 0u]) |
+        (uint(a_data[q_off + 1u]) << 8) |
+        (uint(a_data[q_off + 2u]) << 16) |
+        (uint(a_data[q_off + 3u]) << 24);
+}
 
-    // Activation scale: low 16 bits of the ds word (ds word sits at offset 8 within the block).
-    uint ds_word = x_data[x_u32_off + 8u];
-    float dx = unpackHalf2x16(ds_word).x;
+int unpack_i8(uint packed, uint lane) {
+    const uint byte_val = (packed >> (lane * 8u)) & 0xffu;
+    return byte_val < 128u ? int(byte_val) : int(byte_val) - 256;
+}
 
-    int isum = 0;
-    for (uint i = 0u; i < 8u; i++) {
-        // 4 int8 weights
-        uint q_a_off = qs_off_a + i * 4u;
-        int qa0 = int(int8_t(a_data[q_a_off + 0u]));
-        int qa1 = int(int8_t(a_data[q_a_off + 1u]));
-        int qa2 = int(int8_t(a_data[q_a_off + 2u]));
-        int qa3 = int(int8_t(a_data[q_a_off + 3u]));
-
-        // 4 int8 activations packed into one uint (sign-extend via int8_t cast).
-        uint qx_word = x_data[x_u32_off + i];
-        int qx0 = int(int8_t(uint8_t(qx_word        & 0xFFu)));
-        int qx1 = int(int8_t(uint8_t((qx_word >>  8) & 0xFFu)));
-        int qx2 = int(int8_t(uint8_t((qx_word >> 16) & 0xFFu)));
-        int qx3 = int(int8_t(uint8_t((qx_word >> 24) & 0xFFu)));
-
-        isum += qa0 * qx0 + qa1 * qx1 + qa2 * qx2 + qa3 * qx3;
+int dot_i8x4(uint a, uint b) {
+    int sum = 0;
+    [[unroll]] for (uint lane = 0u; lane < 4u; lane++) {
+        sum += unpack_i8(a, lane) * unpack_i8(b, lane);
     }
+    return sum;
+}
 
-    return dw * dx * float(isum);
+float dot_q8_0_q8_1_block(uint qs_off, uint x_block_u32, float d_a) {
+    const vec2 ds_b = unpackHalf2x16(x_q81[x_block_u32 + 8u]);
+    int q_sum = 0;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        q_sum += dot_i8x4(load_q8_0_u32(qs_off, i), x_q81[x_block_u32 + i]);
+    }
+    return float(q_sum) * d_a * ds_b.x;
 }
 
 void main() {
-    const uint wg_id = gl_WorkGroupID.x;
-    const uint row0  = wg_id * 2u;
-    const uint row1  = row0 + 1u;
-    const uint tid   = gl_LocalInvocationID.x;
-
-    const uint blocks_per_row = K / Q80_BLOCK_SIZE;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * 2u;
+    const uint row1 = row0 + 1u;
+    const uint blocks_per_row = K / Q8_0_BLOCK_SIZE;
+    const uint row_stride_bytes = blocks_per_row * Q8_0_BYTES;
+    const uint x_base_block = x_offset / 36u;
 
     float sum0 = 0.0;
     float sum1 = 0.0;
 
     for (uint blk = tid; blk < blocks_per_row; blk += 64u) {
-        const uint x_u32_off = x_offset / 4u + blk * Q81_UINTS;
+        const uint x_block_u32 = (x_base_block + blk) * Q8_1_U32_PER_BLOCK;
 
         if (row0 < M) {
-            const uint a_block_off = a_offset + row0 * blocks_per_row * Q80_BYTES + blk * Q80_BYTES;
-            sum0 += mmq_block(a_block_off, x_u32_off);
+            const uint byte_off0 = a_offset + row0 * row_stride_bytes + blk * Q8_0_BYTES;
+            const float d0 = unpackHalf2x16(uint(a_data[byte_off0]) | (uint(a_data[byte_off0 + 1u]) << 8)).x;
+            sum0 += dot_q8_0_q8_1_block(byte_off0 + 2u, x_block_u32, d0);
         }
+
         if (row1 < M) {
-            const uint a_block_off = a_offset + row1 * blocks_per_row * Q80_BYTES + blk * Q80_BYTES;
-            sum1 += mmq_block(a_block_off, x_u32_off);
+            const uint byte_off1 = a_offset + row1 * row_stride_bytes + blk * Q8_0_BYTES;
+            const float d1 = unpackHalf2x16(uint(a_data[byte_off1]) | (uint(a_data[byte_off1 + 1u]) << 8)).x;
+            sum1 += dot_q8_0_q8_1_block(byte_off1 + 2u, x_block_u32, d1);
         }
     }
 
@@ -115,8 +102,12 @@ void main() {
         }
         barrier();
         if (tid == 0u) {
-            sum0 = s_sum0[0] + s_sum0[1];
-            sum1 = s_sum1[0] + s_sum1[1];
+            sum0 = s_sum0[0];
+            sum1 = s_sum1[0];
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                sum0 += s_sum0[sg];
+                sum1 += s_sum1[sg];
+            }
         }
     }
 

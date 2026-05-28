@@ -48,12 +48,157 @@ pub const MoeDmmvPushConstants = extern struct {
     y_offset: u32,
 };
 
+/// Push constants for the cross-token batched MoE DMMV
+/// (src/shaders/dmmv_q4k_moe_batched.comp). Each WG handles one
+/// (row_pair, expert_slot, token_idx) triple; the routing buffer is
+/// flattened [n_tokens × n_experts_used] of expert IDs.
+pub const MoeBatchedDmmvPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    n_experts_used: u32,
+    x_token_stride: u32,
+    y_token_stride: u32,
+};
+
+/// Push constants for the fused MoE down + weighted_acc shader
+/// (src/shaders/dmmv_q4k_moe_fused_down_acc.comp). Same layout as
+/// MoeDmmvPushConstants plus n_used (the expert loop is internal to
+/// the shader so the dispatch grid drops the Y=n_experts_used dim).
+pub const MoeFusedDownAccPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    y_offset: u32,
+    n_used: u32,
+};
+
+/// Push constants for Gemma's packed Q4_K MoE gate+up+GEGLU shader.
+/// The shader reads expert ids from the routing buffer, so `expert_stride`
+/// spans the full packed gate+up expert and `up_offset` selects the up half.
+pub const MoeGateUpGegluPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    up_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+};
+
+/// Push constants for the fused split-K merge + o_proj DMMV-acc shader
+/// (src/shaders/dmmv_q4k_o_proj_merge.comp). Adds the merge-pass parameters
+/// to the standard DmmvPushConstants so a single dispatch reads partials,
+/// computes per-head LSE merge weights, stages attn_out into LDS, and runs
+/// the Q4_K matmul with residual accumulation.
+pub const OprojMergePushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    acc_mode: u32 = 1,
+    n_heads: u32,
+    n_i_chunks: u32,
+    sink_offset: u32,
+    head_dim: u32,
+};
+
+/// Push constants for the fused Q8_0 DMMV + sigmoid-gated scale-accumulate
+/// shader (src/shaders/dmmv_q8_0_sigmoid_acc.comp). Same prefix as
+/// DmmvPushConstants but `acc_mode` is replaced by `gate_offset` (the
+/// shader always accumulates and always sigmoid-gates; gate_offset selects
+/// which f32 in the gate buffer holds the shexp_gate scalar — typically 0).
+pub const DmmvSigmoidAccPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    gate_offset: u32,
+};
+
+/// Push constants for the Gemma CPU-MoE fused gate+up+GEGLU shader.
+/// Gate/up offsets are byte offsets into the same packed Q4_K expert tensor;
+/// x/y offsets follow the standard DMMV byte convention.
+pub const DmmvGateUpGegluPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    gate_offset: u32,
+    up_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+};
+
+/// Push constants for quantized DMMV fused with `y += scale * dot(W, x)`.
+pub const DmmvScaleAccPushConstants = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    scale_bits: u32,
+};
+
+/// Push constants for the fused Q8_0 pair DMMV shader. Computes two
+/// independent Q8_0 matvecs that share one F32 input vector.
+pub const DmmvQ8PairPushConstants = extern struct {
+    M0: u32,
+    M1: u32,
+    K: u32,
+    a0_offset: u32 = 0,
+    a1_offset: u32 = 0,
+    x_offset: u32 = 0,
+    y0_offset: u32 = 0,
+    y1_offset: u32 = 0,
+};
+
 /// Push constants for the quantize_q8_1 shader.
 /// `ne` = number of f32 input elements (must be a multiple of 32).
 /// `num_blocks` = ne / 32. Pass explicitly so the shader does not have to divide.
 pub const QuantizeQ8_1Push = extern struct {
     ne: u32,
     num_blocks: u32,
+};
+
+/// Push constants for `count_experts.comp` (effort-6 Step 3 helper). Mirrors
+/// llama.cpp's count_experts push so the shader is structurally identical
+/// to the upstream version. All strides are in u32 units (not bytes).
+///
+/// For the prefill routing capture buffer with layout
+///   slot(token, layer) = (token * n_layers + layer) * (2 * n_experts_used)
+/// where the first n_experts_used u32s are expert IDs and the second
+/// n_experts_used u32s are f32 weights, configure as:
+///   ne00 = n_experts_used                (cells per token row)
+///   ne01 = n_tokens                      (number of token rows)
+///   nb00 = 1                             (consecutive within slot)
+///   nb01 = 2 * n_experts_used * n_layers (skip n_layers slots per row step)
+///   a_offset = layer * 2 * n_experts_used (jump to layer's slot in token 0)
+pub const CountExpertsPush = extern struct {
+    ne00: u32,
+    ne01: u32,
+    nb00: u32,
+    nb01: u32,
+    a_offset: u32,
+};
+
+/// Push constants for `mul_mm_q4k.comp` (effort-6 Step 1 of 5 foundation:
+/// tiled Q4_K dense GEMM). Mirrors the dispatch-side argument shape needed
+/// to address an M×K Q4_K weight tensor against a K×N f32 activation tile.
+/// All offsets follow the existing dmmv convention:
+///   `a_offset` is in BYTES (the shader divides by 4 to index a_u32[]),
+///   `b_offset` and `d_offset` are in FLOATS.
+/// Layout for B/D is column-major: B[col][k] = data_b[b_offset + col*stride_b + k].
+pub const MulMmQ4KPush = extern struct {
+    M: u32,
+    N: u32,
+    K: u32,
+    stride_b: u32,
+    stride_d: u32,
+    a_offset: u32,
+    b_offset: u32,
+    d_offset: u32,
 };
 
 /// Size in bytes of a single Q8_1 output block (32 int8 values + f16 d + f16 d*sum).
@@ -63,10 +208,25 @@ pub const Q8_1_BLOCK_BYTES: u32 = 36;
 pub const DmmvDispatch = struct {
     /// Q4K pipeline, or null.
     pipeline_q4k: ?Pipeline,
+    /// Q4K wide-vocab variant (NUM_ROWS=8) for tall matrices like the Gemma
+    /// 4 31B LM head (M=262144). Same binding layout as pipeline_q4k — swap
+    /// in at the call site when M is large enough to benefit from 4× fewer
+    /// workgroups with 4× more hidden-vector reuse per workgroup.
+    pipeline_q4k_wide: ?Pipeline,
+    /// Cross-token batched MoE DMMV. Same Q4_K weight layout as
+    /// pipeline_q4k_moe_kpar but the dispatch grid adds a token_idx
+    /// dimension (grid.z) so one dispatch covers all N prompt tokens'
+    /// MoE FFN work for a given (gate, up, or down) projection. Routing
+    /// buffer is flattened to [n_tokens × n_experts_used]. Foundation for
+    /// batched MoE prefill on qwen35moe / qwen36moe — pipeline registered,
+    /// dispatch helper available, but not yet wired into prefillBatched.
+    pipeline_q4k_moe_batched: ?Pipeline,
     /// Q5K pipeline, or null.
     pipeline_q5k: ?Pipeline,
     /// Q6K pipeline, or null.
     pipeline_q6k: ?Pipeline,
+    /// Q6K wide-vocab variant (NUM_ROWS=8) for tall LM heads.
+    pipeline_q6k_wide: ?Pipeline,
     /// MXFP4 pipeline, or null.
     pipeline_mxfp4: ?Pipeline,
     /// Q5_0 pipeline, or null.
@@ -75,6 +235,22 @@ pub const DmmvDispatch = struct {
     pipeline_q5_1: ?Pipeline,
     /// Q8 0 pipeline, or null.
     pipeline_q8_0: ?Pipeline,
+    /// Q8_0 one-row-per-thread batch-style variant for very tall matrices.
+    pipeline_q8_0_batch: ?Pipeline,
+    /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=64 (K=2048).
+    pipeline_q8_0_spec64: ?Pipeline,
+    /// Q8_0 pipeline with SPEC_BLOCKS_PER_ROW=128 (K=4096).
+    pipeline_q8_0_spec128: ?Pipeline,
+    /// Q8_0 wide-vocab LM-head variant. Same two-row workgroup shape and
+    /// binding layout as pipeline_q8_0, but shares x-vector loads across rows.
+    pipeline_q8_0_wide: ?Pipeline,
+    /// Q8_0 x Q8_1 integer-dot DMMV. Binding 1 is a quantized Q8_1 activation
+    /// buffer produced by pipeline_quantize_q8_1.
+    pipeline_q8_0_q8_1: ?Pipeline,
+    /// Fused Q8_0 pair DMMV. Five bindings: A0, A1, X, Y0, Y1. Used as an
+    /// opt-in SSM projection experiment for wqkv + z/gate, whose matrices
+    /// share the same normalized hidden vector.
+    pipeline_q8_0_fused_pair: ?Pipeline,
     /// F16 pipeline, or null.
     pipeline_f16: ?Pipeline,
     /// F32 pipeline, or null.
@@ -103,6 +279,81 @@ pub const DmmvDispatch = struct {
     /// Y_up, routing). Halves the dispatch count for the MoE gate+up phase
     /// and reads the shared input once per block.
     pipeline_q4k_fused_gate_up_moe: ?Pipeline,
+    /// Cycle 154: same shader as pipeline_q4k_fused_gate_up_moe but with
+    /// SPEC_BLOCKS_PER_ROW=8 baked in at pipeline-spec time. Used when
+    /// hidden_dim=2048 (Qwen 3.5/3.6 MoE catalog), so the inner block loop
+    /// has a compile-time bound and the SPIR-V → AMDGPU compiler can unroll
+    /// + fold the per-block index arithmetic. Falls back to the unspec'd
+    /// pipeline_q4k_fused_gate_up_moe for other K values.
+    pipeline_q4k_fused_gate_up_moe_spec8: ?Pipeline,
+    /// MoE-specific fused gate+up+SwiGLU variant (5 bindings: W_gate, W_up,
+    /// X, activatedY, routing). Writes silu(gate) * up straight into the
+    /// per-expert activation buffer so the forward path can skip the separate
+    /// MoE SwiGLU dispatch.
+    pipeline_q4k_fused_gate_up_swiglu_moe: ?Pipeline,
+    /// Same shader as pipeline_q4k_fused_gate_up_swiglu_moe with
+    /// SPEC_BLOCKS_PER_ROW=8 baked for hidden_dim=2048 Qwen A3B experts.
+    pipeline_q4k_fused_gate_up_swiglu_moe_spec8: ?Pipeline,
+    /// Fused gate+up+SwiGLU Q4_K dense pipeline (4 bindings: W_gate, W_up,
+    /// X, swiglu_out). Replaces the dense FFN front-end dispatch trio
+    /// (gate DMMV + up DMMV + swiglu element-wise) with a single dispatch
+    /// that computes silu(W_gate·x) * (W_up·x) inline. Eliminates gate_buf
+    /// and up_buf from the dense decode datapath. Saves one global compute
+    /// barrier per layer (gate+up → swiglu), and reads the shared input
+    /// once per block. Same DmmvPushConstants layout as pipeline_q4k.
+    pipeline_q4k_fused_gate_up_swiglu: ?Pipeline,
+    /// Same shader as pipeline_q4k_fused_gate_up_swiglu with NUM_ROWS=1 via
+    /// specialization constant. Targets Qwen3.6-27B's wide dense FFN gate/up
+    /// shape where the regular NUM_ROWS=2 fused path was register-pressure
+    /// sensitive.
+    pipeline_q4k_fused_gate_up_swiglu_row1: ?Pipeline,
+    /// Gemma CPU-routed MoE expert front-end fusion. Gemma packs expert
+    /// gate/up rows into one Q4_K tensor, so this takes independent byte
+    /// offsets into that tensor and writes GEGLU(gate, up) directly.
+    pipeline_q4k_fused_gate_up_geglu: ?Pipeline,
+    /// Gemma batched MoE front-end: reads CPU-selected expert ids from the
+    /// routing buffer and writes GEGLU activations for all selected experts
+    /// into contiguous activation slabs.
+    pipeline_q4k_moe_fused_gate_up_geglu: ?Pipeline,
+    /// Q8_0 sibling of pipeline_q4k_fused_gate_up_swiglu. Targets the
+    /// shared expert in Qwen 3.5 / 3.6 MoE packs where shared FFN
+    /// weights ship as Q8_0 (rather than Q4_K). Same 4-binding layout
+    /// (W_gate, W_up, X, swiglu_out) and same DmmvPushConstants. Used
+    /// to fuse the per-token shared-expert (gate DMMV + up DMMV +
+    /// SwiGLU) trio into one dispatch.
+    pipeline_q8_0_fused_gate_up_swiglu: ?Pipeline,
+    /// Q8_0 fused shared-expert gate+up+SwiGLU plus the f32 shared gate
+    /// scalar (`ffn_gate_inp_shexp`) computed by WG 0. Saves the separate
+    /// one-row f32 DMMV before the shared down tail.
+    pipeline_q8_0_fused_gate_up_swiglu_gate: ?Pipeline,
+    /// Q8_0 DMMV fused with sigmoid-gated scale-accumulate. Replaces
+    /// the (down_shexp DMMV → barrier → sigmoid_scale_acc) pair on the
+    /// Qwen 3.5 / 3.6 shared-expert tail when the shared down weights
+    /// are Q8_0. 4 bindings (W, X=gate_buf, Y=hidden_buf, gate=router_logits_buf).
+    /// Push: DmmvSigmoidAccPushConstants. Saves 1 dispatch + 1 barrier
+    /// per layer per token.
+    pipeline_q8_0_sigmoid_acc: ?Pipeline,
+    /// Fused split-K merge + Q4_K o_proj DMMV-acc pipeline (4 bindings:
+    /// W_o, partial_attn_out_buf, hidden_buf, sinks). Replaces the
+    /// (flash_attn_split_merge → o_proj DMMV-acc) pair with one dispatch:
+    /// each WG reads per-head M, L, computes LSE merge weights with sink
+    /// fold-in, stages the merged attn_out (hidden_dim floats) into LDS,
+    /// then runs the standard Q4_K matmul reading the B-vector from LDS
+    /// and accumulating into hidden_buf. Saves 1 dispatch + 1 barrier per
+    /// attention layer when split-K is active. Push constants:
+    /// OprojMergePushConstants. Gated behind ZINC_FUSED_OPROJ_MERGE.
+    pipeline_q4k_o_proj_merge: ?Pipeline,
+    /// Fused Q4_K MoE down + weighted_acc pipeline (4 bindings: A, X,
+    /// Y=hidden_buf, routing). Each WG owns NUM_ROWS=2 hidden rows and
+    /// loops over n_used experts internally, eliminating the separate
+    /// moe_weighted_acc dispatch on call sites where Y can be hidden_buf
+    /// directly (no post_ffw_norm, no ffn_down_exps_scale).
+    pipeline_q4k_moe_fused_down_acc: ?Pipeline,
+    /// Q5_K analogue of pipeline_q4k_moe_fused_down_acc. Same 4-binding
+    /// shape and MoeFusedDownAccPushConstants layout. Targets Q4_K_M / XL
+    /// packs where the down projection ships as Q5_K (e.g.
+    /// Qwen3.6-35B-A3B-UD-Q4_K_XL) so the fused path can engage there too.
+    pipeline_q5k_moe_fused_down_acc: ?Pipeline,
     /// MoE Q5K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q5k_moe: ?Pipeline,
     /// Experimental K-parallel Q5K MoE pipeline (same 4 bindings, wave64 subgroupAdd).
@@ -111,16 +362,55 @@ pub const DmmvDispatch = struct {
     pipeline_mxfp4_moe: ?Pipeline,
     /// MoE Q5_1 pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q5_1_moe: ?Pipeline,
+    /// Q5_1 DMMV fused with scaled accumulation. Used by Gemma CPU-routed
+    /// MoE to fold down projection + weighted accumulation into one dispatch.
+    pipeline_q5_1_acc: ?Pipeline,
+    /// Gemma Q5_1 MoE down projection fused across all selected experts.
+    /// Reads ids/weights from the routing buffer and writes the accumulated
+    /// hidden vector directly, replacing per-expert down+acc dispatches.
+    pipeline_q5_1_moe_fused_down_acc: ?Pipeline,
+    /// Same as pipeline_q5_1_moe_fused_down_acc, but also reads
+    /// ffn_down_exps.scale on-GPU. This lets Gemma use GPU top-k without
+    /// CPU-side routing weight patch-up.
+    pipeline_q5_1_moe_fused_down_acc_scaled: ?Pipeline,
+    /// Q8_0 sibling of pipeline_q5_1_moe_fused_down_acc_scaled for Gemma
+    /// layers whose down experts are stored as Q8_0.
+    pipeline_q8_0_moe_fused_down_acc_scaled: ?Pipeline,
     /// MoE Q6K pipeline (4 bindings: A, x, y, routing), or null.
     pipeline_q6k_moe: ?Pipeline,
-    /// Foundation for mul_mmq: quantize an F32 activation into Q8_1 blocks.
-    /// 2 bindings (A f32 vec4 in, D u32 stream out), push constants {ne, num_blocks}.
+    /// Foundation for future mul_mmq work: quantize an F32 activation into
+    /// Q8_1 blocks. 2 bindings (A f32 vec4 in, D u32 stream out), push
+    /// constants {ne, num_blocks}. Activation pre-quantizer preserved as
+    /// reusable infrastructure (per effort-6 plan); the SSM proj mmq DMMV
+    /// consumers (dmmv_q8_0_q8_1, dmmv_q4k_q8_1) were measured flat in
+    /// cycles 8 + 33 of the loop and removed in cycle 60's pivot.
     pipeline_quantize_q8_1: ?Pipeline,
-    /// mul_mmq variant: Q8_0 weight × Q8_1 activation -> f32. Same 3-binding
-    /// shape as pipeline_q8_0 but the second binding is a Q8_1 block stream
-    /// produced by pipeline_quantize_q8_1. Enables integer dot product on the
-    /// SSM proj hot path when ZINC_MMQ_SSM=1.
-    pipeline_q8_0_q8_1: ?Pipeline,
+    /// Effort-6 Step 3 foundation for the MUL_MAT_ID tiled GEMM port.
+    /// Counts how many tokens were routed to each expert. Output is a
+    /// `[n_experts]` u32 buffer that the future MUL_MAT_ID GEMM uses for the
+    /// per-expert early-exit. Pipeline loads at startup; no production
+    /// callers until the tiled GEMM (Steps 1+2) lands. 2 bindings (A routing
+    /// in, D counts out), push = CountExpertsPush.
+    pipeline_count_experts: ?Pipeline,
+    /// Effort-6 Step 1 of 5 foundation: tiled Q4_K dense GEMM. First port
+    /// of llama.cpp's mul_mm.comp #ifndef COOPMAT branch adapted to ZINC's
+    /// wave64 / Q4_K conventions. WG produces a 32×16 output tile with 64
+    /// threads; BK=32 (one Q4_K sub-block) per outer step. Pipeline loads
+    /// at startup; this cycle wires it under ZINC_MUL_MM_LM_HEAD=1 to the
+    /// final-tail LM head dispatch as a correctness-exercise (LM head
+    /// fires once per prefill so the perf-hotpath impact is small). Step 2
+    /// will add the MUL_MAT_ID variant. 3 bindings (A weights, B f32
+    /// activations, D f32 outputs), push = MulMmQ4KPush.
+    pipeline_mul_mm_q4k: ?Pipeline,
+    /// Batched dense FFN front-end for Qwen3.6-27B: gate/up Q4_K GEMMs plus
+    /// SwiGLU in one tiled dispatch.
+    pipeline_mul_mm_q4k_gate_up_swiglu: ?Pipeline,
+    /// Branchless full-tile variant of the fused Q4_K gate/up/SwiGLU GEMM.
+    pipeline_mul_mm_q4k_gate_up_swiglu_full: ?Pipeline,
+    /// Tiled Q6_K dense GEMM for Qwen3.6-27B batched dense-down prefill.
+    pipeline_mul_mm_q6k: ?Pipeline,
+    /// Branchless full-tile Q6_K GEMM. Host routes only 32-aligned M/N tiles here.
+    pipeline_mul_mm_q6k_full: ?Pipeline,
     /// Descriptor pool for this dispatch.
     descriptor_pool: vk.c.VkDescriptorPool,
     /// Logical device.
@@ -133,6 +423,7 @@ pub const DmmvDispatch = struct {
     /// @param allocator Allocator used for temporary pipeline creation state.
     /// @returns A DmmvDispatch ready to record projection work.
     pub fn init(
+        io: std.Io,
         /// Vulkan instance.
         instance: *const Instance,
         /// GPU capabilities.
@@ -143,7 +434,7 @@ pub const DmmvDispatch = struct {
         /// Allocator for owned resources.
         allocator: std.mem.Allocator,
     ) !DmmvDispatch {
-        _ = gpu_config;
+        const use_wave64 = gpu_config.wave_size == 64;
 
         // Create descriptor pool
         const pool_size = vk.c.VkDescriptorPoolSize{
@@ -181,61 +472,123 @@ pub const DmmvDispatch = struct {
             .require_full_subgroups = true,
             .push_descriptors = has_push_desc,
         };
+        // On non-wave64 GPUs (e.g. Intel Xe2 with SIMD16), requesting
+        // required_subgroup_size=64 is outside the supported range and silently
+        // dropped by the driver. Use plain push_desc_options instead; the shader
+        // multi-subgroup merge path handles the cross-subgroup reduction.
+        const effective_wave64_options: pipeline_mod.PipelineOptions = if (use_wave64)
+            push_desc_wave64_options
+        else
+            push_desc_options;
 
         var path_buf: [512]u8 = undefined;
 
         const q4k_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k = pipeline_mod.createFromSpirvWithOptions(instance, q4k_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q4k = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q4_K shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
+        // Wide-vocab Q4_K variant (NUM_ROWS=8). Same binding layout — used by
+        // the LM-head dispatch on models with vocab ≥ 100_000 where the
+        // default NUM_ROWS=2 would spawn hundreds of thousands of workgroups
+        // and thrash the L1 cache with redundant hidden-vector reads.
+        const q4k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_wide = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_wide_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q4_K wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         const q8_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q8_0 = pipeline_mod.createFromSpirvWithOptions(instance, q8_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q8_0 = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q8_0 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_batch.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_batch = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_batch_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 batch shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_spec64 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 64 }};
+        const q8_spec64_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_spec64 = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_spec64_path, 3, push_size, &q8_spec64, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 spec64 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_spec128 = [_]pipeline_mod.SpecConst{.{ .id = 2, .value = 128 }};
+        const q8_spec128_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_spec128 = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_spec128_path, 3, push_size, &q8_spec128, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 spec128 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_wide = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_wide_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 wide shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_q8_1.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_q8_1 = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_q81_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 x Q8_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_pair_push_size = @sizeOf(DmmvQ8PairPushConstants);
+        const q8_pair_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_fused_pair.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_fused_pair = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_pair_path, 5, q8_pair_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused-pair shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const mxfp4_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4.spv", .{shader_dir}) catch unreachable;
-        const pipeline_mxfp4 = pipeline_mod.createFromSpirvWithOptions(instance, mxfp4_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_mxfp4 = pipeline_mod.createFromSpirvWithOptions(io, instance, mxfp4_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("MXFP4 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q5_0_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_0.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q5_0 = pipeline_mod.createFromSpirvWithOptions(instance, q5_0_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q5_0 = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_0_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_0 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q5_1_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q5_1 = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q5_1 = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_1_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q5_1_acc_push_size = @sizeOf(DmmvScaleAccPushConstants);
+        const q5_1_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_acc = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_1_acc_path, 3, q5_1_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 scaled-acc shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q5k_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k.spv", .{shader_dir}) catch unreachable;
-        // Q5_K K-parallel shader uses subgroupAdd over a 64-thread WG; require wave64
-        // so the reduction is correct on devices that would otherwise pick wave32.
-        const pipeline_q5k = pipeline_mod.createFromSpirvWithOptions(instance, q5k_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        // Q5_K K-parallel shader: cross-subgroup shared-memory reduction handles
+        // wave64 (1 subgroup), wave32 (2 subgroups), and SIMD16 (4 subgroups).
+        const pipeline_q5k = pipeline_mod.createFromSpirvWithOptions(io, instance, q5k_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_K shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q6k_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q6k = pipeline_mod.createFromSpirvWithOptions(instance, q6k_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q6k = pipeline_mod.createFromSpirvWithOptions(io, instance, q6k_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q6_K shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q6k_wide_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_wide.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q6k_wide = pipeline_mod.createFromSpirvWithOptions(io, instance, q6k_wide_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("Q6_K wide shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const f16_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_f16.spv", .{shader_dir}) catch unreachable;
-        const pipeline_f16 = pipeline_mod.createFromSpirvWithOptions(instance, f16_path, 3, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_f16 = pipeline_mod.createFromSpirvWithOptions(io, instance, f16_path, 3, push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("F16 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const f32_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_f32.spv", .{shader_dir}) catch unreachable;
-        const pipeline_f32 = pipeline_mod.createFromSpirvWithOptions(instance, f32_path, 3, push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_f32 = pipeline_mod.createFromSpirvWithOptions(io, instance, f32_path, 3, push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("F32 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -243,25 +596,25 @@ pub const DmmvDispatch = struct {
         // Batch DMMV for prefill: 3 bindings (A, X_batch, Y_batch), batch push constants
         const batch_push_size = @sizeOf(BatchDmmvPushConstants);
         const q4k_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_batch.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_batch = pipeline_mod.createFromSpirvWithOptions(instance, q4k_batch_path, 3, batch_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q4k_batch = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_batch_path, 3, batch_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q4_K batch shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q6k_batch_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_batch.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q6k_batch = pipeline_mod.createFromSpirvWithOptions(instance, q6k_batch_path, 3, batch_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q6k_batch = pipeline_mod.createFromSpirvWithOptions(io, instance, q6k_batch_path, 3, batch_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q6_K batch shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q4k_batch_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_batch_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q4k_batch_kpar_path, 3, batch_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q4k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_batch_kpar_path, 3, batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K batch kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q6k_batch_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_batch_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q6k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q6k_batch_kpar_path, 3, batch_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q6k_batch_kpar = pipeline_mod.createFromSpirvWithOptions(io, instance, q6k_batch_kpar_path, 3, batch_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q6_K batch kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -270,7 +623,7 @@ pub const DmmvDispatch = struct {
         const moe_push_size = @sizeOf(MoeDmmvPushConstants);
 
         const q4k_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_moe = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q4k_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q4_K MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -278,48 +631,179 @@ pub const DmmvDispatch = struct {
         // K-parallel Q4_K MoE variant: wave64 subgroupAdd reduction, no shared s_x array.
         // Experimental — enabled only when ZINC_MOE_KPAR=1 in forward.zig.
         const q4k_moe_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_moe_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q4k_moe_kpar_path, 4, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q4k_moe_kpar = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_moe_kpar_path, 4, moe_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K MoE kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
+
+        // Cross-token batched MoE Q4_K DMMV. Same 4-binding shape as kpar
+        // (A, X, Y, routing) but with the larger MoeBatchedDmmvPushConstants
+        // struct that adds n_experts_used / x_token_stride / y_token_stride.
+        // Dispatch grid is (M+1)/2, n_experts_used, n_tokens.
+        const moe_batched_push_size = @sizeOf(MoeBatchedDmmvPushConstants);
+        const q4k_moe_batched_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_batched.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_moe_batched = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_moe_batched_path, 4, moe_batched_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE batched shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_q4k_moe_batched != null) {
+            log.info("dmmv_q4k_moe_batched pipeline loaded (cross-token MoE; not yet wired)", .{});
+        }
 
         // Fused gate+up Q4_K MoE: reads expert_input_buf once per block and
         // writes to both gate_buf and up_buf. 6 bindings (W_gate, W_up, X,
         // Y_gate, Y_up, routing). Same MoeDmmvPushConstants as kpar.
         const q4k_fused_gate_up_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q4k_fused_gate_up_moe = pipeline_mod.createFromSpirvWithOptions(instance, q4k_fused_gate_up_path, 6, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q4k_fused_gate_up_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_path, 6, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
             log.warn("Q4_K MoE fused gate+up shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_fused_gate_up_spec8 = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 8 }};
+        const pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_path, 6, moe_push_size, &q4k_fused_gate_up_spec8, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up spec8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q4k_fused_gate_up_swiglu_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu_moe.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_swiglu_moe_path, 5, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_swiglu_moe_path, 5, moe_push_size, &q4k_fused_gate_up_spec8, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused gate+up+SwiGLU spec8 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Dense fused gate+up+SwiGLU: reads ffn_norm_buf once per block,
+        // dot-products against W_gate and W_up, applies silu(gate)*up
+        // inline, and writes a single swiglu_buf row. 4 bindings (W_gate,
+        // W_up, X, swiglu). Same DmmvPushConstants as pipeline_q4k.
+        const q4k_fused_gate_up_swiglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_swiglu.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_fused_gate_up_swiglu = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_swiglu_path, 4, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K dense fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_fused_gate_up_swiglu_row1_spec = [_]pipeline_mod.SpecConst{.{ .id = 0, .value = 1 }};
+        const pipeline_q4k_fused_gate_up_swiglu_row1 = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_swiglu_path, 4, push_size, &q4k_fused_gate_up_swiglu_row1_spec, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K dense fused gate+up+SwiGLU row1 shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q4k_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
+        const gate_up_geglu_push_size = @sizeOf(DmmvGateUpGegluPushConstants);
+        const pipeline_q4k_fused_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_gate_up_geglu_path, 3, gate_up_geglu_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q4k_moe_fused_gate_up_geglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_gate_up_geglu.spv", .{shader_dir}) catch unreachable;
+        const moe_gate_up_geglu_push_size = @sizeOf(MoeGateUpGegluPushConstants);
+        const pipeline_q4k_moe_fused_gate_up_geglu = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_moe_fused_gate_up_geglu_path, 4, moe_gate_up_geglu_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K Gemma MoE fused gate+up+GEGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Q8_0 fused gate+up+SwiGLU. 4 bindings, same push struct as the
+        // Q4_K variant. Used by the shared expert path on Qwen 3.5 / 3.6
+        // MoE packs where shared FFN weights are Q8_0 (rather than Q4_K).
+        const q8_0_fused_gate_up_swiglu_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_fused_gate_up_swiglu.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_fused_gate_up_swiglu = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_0_fused_gate_up_swiglu_path, 4, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused gate+up+SwiGLU shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_0_fused_gate_up_swiglu_gate_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_fused_gate_up_swiglu_gate.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_0_fused_gate_up_swiglu_gate_path, 6, push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused gate+up+SwiGLU+gate shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Q8_0 DMMV fused with sigmoid-gated scale-accumulate. Replaces the
+        // (down_shexp DMMV → barrier → sigmoid_scale_acc) pair on the
+        // Qwen 3.5 / 3.6 shared-expert tail. 4 bindings (W, X=gate_buf,
+        // Y=hidden_buf, gate=router_logits_buf). Push: DmmvSigmoidAccPushConstants.
+        const sigmoid_acc_push_size = @sizeOf(DmmvSigmoidAccPushConstants);
+        const q8_0_sigmoid_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_sigmoid_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_sigmoid_acc = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_0_sigmoid_acc_path, 4, sigmoid_acc_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 fused sigmoid-acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Fused split-K merge + Q4_K o_proj DMMV-acc. 4 bindings (W_o,
+        // partial_attn_out_buf, hidden_buf, sinks). Push uses
+        // OprojMergePushConstants — same DmmvPushConstants prefix plus
+        // n_heads, n_i_chunks, sink_offset, head_dim. Used when
+        // ZINC_FUSED_OPROJ_MERGE=1 and split-K is active to fold the
+        // merge dispatch into o_proj.
+        const oproj_merge_push_size = @sizeOf(OprojMergePushConstants);
+        const q4k_o_proj_merge_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_o_proj_merge.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_o_proj_merge = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_o_proj_merge_path, 4, oproj_merge_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K fused o_proj+merge shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Fused Q4_K MoE down + weighted_acc: each WG accumulates over
+        // n_used experts and writes hidden_buf[row] += sum (NUM_ROWS=2).
+        // 4 bindings (A, X=swiglu_buf, Y=hidden_buf, routing). Push struct
+        // adds n_used (the expert loop is internal to the shader so the
+        // dispatch grid drops the Y dim used by kpar).
+        const fused_down_acc_push_size = @sizeOf(MoeFusedDownAccPushConstants);
+        const q4k_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q4k_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q4k_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(io, instance, q4k_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q4_K MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // Q5_K analogue of the fused down+acc shader. Targets Q4_K_M / XL
+        // packs whose down projection is Q5_K (Qwen3.6-35B-A3B-UD-Q4_K_XL).
+        const q5k_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5k_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(io, instance, q5k_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_K MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        const q5_1_fused_down_acc_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_fused_down_acc.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_fused_down_acc = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_1_fused_down_acc_path, 4, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 Gemma MoE fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q5_1_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_1_fused_down_acc_scaled_path, 5, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q5_1 Gemma MoE scaled fused down+acc shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const q8_0_fused_down_acc_scaled_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_moe_fused_down_acc_scaled.spv", .{shader_dir}) catch unreachable;
+        const pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_mod.createFromSpirvWithOptions(io, instance, q8_0_fused_down_acc_scaled_path, 5, fused_down_acc_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
+            log.warn("Q8_0 Gemma MoE scaled fused down+acc shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q5k_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q5k_moe = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q5k_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q5k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q5_K MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         // K-parallel Q5_K MoE variant: wave64 subgroupAdd reduction (targets the
-        // ~713 ms MoE down bucket in the Qwen3.5-35B flagship prefill).
+        // ~713 ms MoE down bucket in the Qwen3.6-35B flagship prefill).
         const q5k_moe_kpar_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5k_moe_kpar.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q5k_moe_kpar = pipeline_mod.createFromSpirvWithOptions(instance, q5k_moe_kpar_path, 4, moe_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+        const pipeline_q5k_moe_kpar = pipeline_mod.createFromSpirvWithOptions(io, instance, q5k_moe_kpar_path, 4, moe_push_size, &.{}, effective_wave64_options, allocator) catch |err| blk: {
             log.warn("Q5_K MoE kpar shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const mxfp4_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_mxfp4_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_mxfp4_moe = pipeline_mod.createFromSpirvWithOptions(instance, mxfp4_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_mxfp4_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, mxfp4_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("MXFP4 MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q5_1_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q5_1_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q5_1_moe = pipeline_mod.createFromSpirvWithOptions(instance, q5_1_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q5_1_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q5_1_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q5_1 MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         const q6k_moe_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q6k_moe.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q6k_moe = pipeline_mod.createFromSpirvWithOptions(instance, q6k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_q6k_moe = pipeline_mod.createFromSpirvWithOptions(io, instance, q6k_moe_path, 4, moe_push_size, &spec_k, push_desc_options, allocator) catch |err| blk: {
             log.warn("Q6_K MoE shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -332,7 +816,7 @@ pub const DmmvDispatch = struct {
         // 2 bindings (A, D), push = QuantizeQ8_1Push {ne, num_blocks}.
         const q81_push_size = @sizeOf(QuantizeQ8_1Push);
         const q81_path = std.fmt.bufPrint(&path_buf, "{s}/quantize_q8_1.spv", .{shader_dir}) catch unreachable;
-        const pipeline_quantize_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q81_path, 2, q81_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+        const pipeline_quantize_q8_1 = pipeline_mod.createFromSpirvWithOptions(io, instance, q81_path, 2, q81_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
             log.warn("quantize_q8_1 shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -340,25 +824,81 @@ pub const DmmvDispatch = struct {
             log.info("quantize_q8_1 pipeline loaded (mul_mmq foundation)", .{});
         }
 
-        // mul_mmq consumer: Q8_0 weight × Q8_1 activation -> f32.
-        // Reuses DmmvPushConstants (M, K, a_offset, x_offset, y_offset, acc_mode).
-        const q8q81_path = std.fmt.bufPrint(&path_buf, "{s}/dmmv_q8_0_q8_1.spv", .{shader_dir}) catch unreachable;
-        const pipeline_q8_0_q8_1 = pipeline_mod.createFromSpirvWithOptions(instance, q8q81_path, 3, push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
-            log.warn("dmmv_q8_0_q8_1 shader not loaded: {s}", .{@errorName(err)});
+        // Effort 6 Step 3: foundation helper for MUL_MAT_ID GEMM port.
+        // Counts tokens-per-expert from a per-(token, layer) routing buffer.
+        // 2 bindings (A routing in, D counts out), push = CountExpertsPush.
+        const count_experts_push_size = @sizeOf(CountExpertsPush);
+        const count_experts_path = std.fmt.bufPrint(&path_buf, "{s}/count_experts.spv", .{shader_dir}) catch unreachable;
+        const pipeline_count_experts = pipeline_mod.createFromSpirvWithOptions(io, instance, count_experts_path, 2, count_experts_push_size, &.{}, push_desc_options, allocator) catch |err| blk: {
+            log.warn("count_experts shader not loaded: {s}", .{@errorName(err)});
             break :blk null;
         };
-        if (pipeline_q8_0_q8_1 != null) {
-            log.info("dmmv_q8_0_q8_1 pipeline loaded (mul_mmq consumer)", .{});
+        if (pipeline_count_experts != null) {
+            log.info("count_experts pipeline loaded (MUL_MAT_ID GEMM foundation; not yet wired)", .{});
+        }
+
+        // Effort-6 Step 1 of 5: tiled Q4_K dense GEMM foundation. Single
+        // wave64 subgroup per WG (BM=32 × BN=16 output tile), so request
+        // wave64 specialization. 3 bindings (A weights, B f32, D f32),
+        // push = MulMmQ4KPush.
+        const mul_mm_q4k_push_size = @sizeOf(MulMmQ4KPush);
+        const mul_mm_q4k_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k = pipeline_mod.createFromSpirvWithOptions(io, instance, mul_mm_q4k_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k != null) {
+            log.info("mul_mm_q4k pipeline loaded (tiled Q4_K dense GEMM; LM head opt-in via ZINC_MUL_MM_LM_HEAD=1)", .{});
+        }
+        const mul_mm_q4k_gate_up_swiglu_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_swiglu.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mod.createFromSpirvWithOptions(io, instance, mul_mm_q4k_gate_up_swiglu_path, 4, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_swiglu shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_swiglu != null) {
+            log.info("mul_mm_q4k_gate_up_swiglu pipeline loaded (Qwen3.6-27B batched dense FFN)", .{});
+        }
+        const mul_mm_q4k_gate_up_swiglu_full_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q4k_gate_up_swiglu_full.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mod.createFromSpirvWithOptions(io, instance, mul_mm_q4k_gate_up_swiglu_full_path, 4, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q4k_gate_up_swiglu_full shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q4k_gate_up_swiglu_full != null) {
+            log.info("mul_mm_q4k_gate_up_swiglu_full pipeline loaded (branchless Qwen3.6-27B dense FFN full tiles)", .{});
+        }
+        const mul_mm_q6k_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k = pipeline_mod.createFromSpirvWithOptions(io, instance, mul_mm_q6k_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k != null) {
+            log.info("mul_mm_q6k pipeline loaded (Qwen3.6-27B batched Q6_K prefill projections)", .{});
+        }
+        const mul_mm_q6k_full_path = std.fmt.bufPrint(&path_buf, "{s}/mul_mm_q6k_full.spv", .{shader_dir}) catch unreachable;
+        const pipeline_mul_mm_q6k_full = pipeline_mod.createFromSpirvWithOptions(io, instance, mul_mm_q6k_full_path, 3, mul_mm_q4k_push_size, &.{}, push_desc_wave64_options, allocator) catch |err| blk: {
+            log.warn("mul_mm_q6k_full shader not loaded: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (pipeline_mul_mm_q6k_full != null) {
+            log.info("mul_mm_q6k_full pipeline loaded (branchless full-tile Q6_K prefill GEMM)", .{});
         }
 
         return DmmvDispatch{
             .pipeline_q4k = pipeline_q4k,
+            .pipeline_q4k_wide = pipeline_q4k_wide,
             .pipeline_mxfp4 = pipeline_mxfp4,
             .pipeline_q5_0 = pipeline_q5_0,
             .pipeline_q5_1 = pipeline_q5_1,
             .pipeline_q5k = pipeline_q5k,
             .pipeline_q6k = pipeline_q6k,
+            .pipeline_q6k_wide = pipeline_q6k_wide,
             .pipeline_q8_0 = pipeline_q8_0,
+            .pipeline_q8_0_batch = pipeline_q8_0_batch,
+            .pipeline_q8_0_spec64 = pipeline_q8_0_spec64,
+            .pipeline_q8_0_spec128 = pipeline_q8_0_spec128,
+            .pipeline_q8_0_wide = pipeline_q8_0_wide,
+            .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
+            .pipeline_q8_0_fused_pair = pipeline_q8_0_fused_pair,
             .pipeline_f16 = pipeline_f16,
             .pipeline_f32 = pipeline_f32,
             .pipeline_q4k_batch = pipeline_q4k_batch,
@@ -367,14 +907,37 @@ pub const DmmvDispatch = struct {
             .pipeline_q6k_batch_kpar = pipeline_q6k_batch_kpar,
             .pipeline_q4k_moe = pipeline_q4k_moe,
             .pipeline_q4k_moe_kpar = pipeline_q4k_moe_kpar,
+            .pipeline_q4k_moe_batched = pipeline_q4k_moe_batched,
             .pipeline_q4k_fused_gate_up_moe = pipeline_q4k_fused_gate_up_moe,
+            .pipeline_q4k_fused_gate_up_moe_spec8 = pipeline_q4k_fused_gate_up_moe_spec8,
+            .pipeline_q4k_fused_gate_up_swiglu_moe = pipeline_q4k_fused_gate_up_swiglu_moe,
+            .pipeline_q4k_fused_gate_up_swiglu_moe_spec8 = pipeline_q4k_fused_gate_up_swiglu_moe_spec8,
+            .pipeline_q4k_fused_gate_up_swiglu = pipeline_q4k_fused_gate_up_swiglu,
+            .pipeline_q4k_fused_gate_up_swiglu_row1 = pipeline_q4k_fused_gate_up_swiglu_row1,
+            .pipeline_q4k_fused_gate_up_geglu = pipeline_q4k_fused_gate_up_geglu,
+            .pipeline_q4k_moe_fused_gate_up_geglu = pipeline_q4k_moe_fused_gate_up_geglu,
+            .pipeline_q8_0_fused_gate_up_swiglu = pipeline_q8_0_fused_gate_up_swiglu,
+            .pipeline_q8_0_fused_gate_up_swiglu_gate = pipeline_q8_0_fused_gate_up_swiglu_gate,
+            .pipeline_q8_0_sigmoid_acc = pipeline_q8_0_sigmoid_acc,
+            .pipeline_q4k_o_proj_merge = pipeline_q4k_o_proj_merge,
+            .pipeline_q4k_moe_fused_down_acc = pipeline_q4k_moe_fused_down_acc,
+            .pipeline_q5k_moe_fused_down_acc = pipeline_q5k_moe_fused_down_acc,
             .pipeline_mxfp4_moe = pipeline_mxfp4_moe,
             .pipeline_q5_1_moe = pipeline_q5_1_moe,
+            .pipeline_q5_1_acc = pipeline_q5_1_acc,
+            .pipeline_q5_1_moe_fused_down_acc = pipeline_q5_1_moe_fused_down_acc,
+            .pipeline_q5_1_moe_fused_down_acc_scaled = pipeline_q5_1_moe_fused_down_acc_scaled,
+            .pipeline_q8_0_moe_fused_down_acc_scaled = pipeline_q8_0_moe_fused_down_acc_scaled,
             .pipeline_q5k_moe = pipeline_q5k_moe,
             .pipeline_q5k_moe_kpar = pipeline_q5k_moe_kpar,
             .pipeline_q6k_moe = pipeline_q6k_moe,
             .pipeline_quantize_q8_1 = pipeline_quantize_q8_1,
-            .pipeline_q8_0_q8_1 = pipeline_q8_0_q8_1,
+            .pipeline_count_experts = pipeline_count_experts,
+            .pipeline_mul_mm_q4k = pipeline_mul_mm_q4k,
+            .pipeline_mul_mm_q4k_gate_up_swiglu = pipeline_mul_mm_q4k_gate_up_swiglu,
+            .pipeline_mul_mm_q4k_gate_up_swiglu_full = pipeline_mul_mm_q4k_gate_up_swiglu_full,
+            .pipeline_mul_mm_q6k = pipeline_mul_mm_q6k,
+            .pipeline_mul_mm_q6k_full = pipeline_mul_mm_q6k_full,
             .descriptor_pool = descriptor_pool,
             .device = instance.device,
         };
@@ -446,6 +1009,59 @@ pub const DmmvDispatch = struct {
         };
 
         cmd.dispatchWithPush(pip, descriptor_set, std.mem.asBytes(&push), workgroups_x, n_experts_y, 1);
+    }
+
+    /// Record a cross-token batched MoE DMMV dispatch. Reads N tokens'
+    /// inputs from `X_batch[N × K]`, dispatches one WG per (row_pair,
+    /// expert_slot, token_idx), routes via flattened
+    /// `routing[N × n_experts_used]`, writes to
+    /// `Y_batch[N × n_experts_used × M]`. Q4_K only for now.
+    pub fn recordMoeBatchedDispatch(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        x_buf: vk.c.VkBuffer,
+        x_size: vk.c.VkDeviceSize,
+        y_buf: vk.c.VkBuffer,
+        y_size: vk.c.VkDeviceSize,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        M: u32,
+        K: u32,
+        expert_stride: u32,
+        n_experts_used: u32,
+        n_tokens: u32,
+        x_token_stride: u32,
+        y_token_stride: u32,
+    ) !void {
+        const pip = if (self.pipeline_q4k_moe_batched) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        const push = MoeBatchedDmmvPushConstants{
+            .M = M,
+            .K = K,
+            .expert_stride = expert_stride,
+            .n_experts_used = n_experts_used,
+            .x_token_stride = x_token_stride,
+            .y_token_stride = y_token_stride,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = x_buf, .offset = 0, .range = x_size },
+            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = routing_buf, .offset = 0, .range = routing_size },
+        };
+        const wg_x = (M + 1) / 2;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            n_experts_used,
+            n_tokens,
+        );
     }
 
     /// Record a decode-time matrix-vector multiply dispatch.
@@ -618,51 +1234,344 @@ pub const DmmvDispatch = struct {
         );
     }
 
-    /// Record a push-descriptor Q8_0 × Q8_1 integer-dot matvec dispatch.
-    /// The activation buffer `x_buf` must be Q8_1-encoded output from
-    /// `recordQuantizeQ8_1`, and `x_offset` must be 4-byte aligned. Same push
-    /// layout as DmmvPushConstants (M, K, a_offset, x_offset, y_offset,
-    /// acc_mode). Dispatch grid: (M+1)/2 workgroups (2 rows per WG, 64 threads).
-    pub fn recordMmqQ8_0_Q8_1(
+    /// Effort 6 Step 3: dispatch the count_experts shader. For one layer,
+    /// scan a routing buffer that stores per-(token, layer) topk expert IDs
+    /// and produce a `[n_experts]` u32 count buffer.
+    ///
+    /// Layout assumed for `routing_buf`:
+    ///   slot(token, layer) starts at byte offset
+    ///       (token * n_layers + layer) * (2 * n_experts_used) * 4
+    ///   the first n_experts_used u32s are expert IDs, the next n_experts_used
+    ///   u32s are f32 weights (mirrors router_output_buf packing in
+    ///   forward.zig:5316+).
+    ///
+    /// `counts_buf` must be sized for at least `n_experts * sizeof(u32)`.
+    /// Caller is responsible for clearing or overwriting it (the shader
+    /// writes one element per expert, indexed by gl_WorkGroupID.x).
+    ///
+    /// Returns `error.PipelineNotLoaded` if the count_experts shader is
+    /// unavailable, `error.InvalidArgument` for zero token counts.
+    pub fn recordCountExperts(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        routing_buf: vk.c.VkBuffer,
+        routing_size: vk.c.VkDeviceSize,
+        counts_buf: vk.c.VkBuffer,
+        counts_size: vk.c.VkDeviceSize,
+        n_tokens: u32,
+        n_layers: u32,
+        layer: u32,
+        n_experts_used: u32,
+        n_experts: u32,
+        /// Byte offset into `counts_buf` where this dispatch's `n_experts`
+        /// u32 outputs should land. Must be aligned to the device's storage
+        /// buffer offset alignment (typically 4-256 B; n_experts × 4 is a
+        /// natural multiple). Pass 0 to write to the start of the buffer.
+        d_offset_bytes: vk.c.VkDeviceSize,
+    ) !void {
+        const pip = if (self.pipeline_count_experts) |*p| p else return error.PipelineNotLoaded;
+        if (n_tokens == 0 or n_experts == 0 or n_experts_used == 0 or n_layers == 0) {
+            return error.InvalidArgument;
+        }
+        if (layer >= n_layers) return error.InvalidArgument;
+        const out_bytes: vk.c.VkDeviceSize = @as(vk.c.VkDeviceSize, n_experts) * @sizeOf(u32);
+        if (d_offset_bytes + out_bytes > counts_size) return error.InvalidArgument;
+        const slot_stride_u32: u32 = 2 * n_experts_used;
+        const push = CountExpertsPush{
+            .ne00 = n_experts_used,
+            .ne01 = n_tokens,
+            .nb00 = 1,
+            .nb01 = slot_stride_u32 * n_layers,
+            .a_offset = layer * slot_stride_u32,
+        };
+        const infos = [2]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = routing_buf, .offset = 0, .range = routing_size },
+            .{ .buffer = counts_buf, .offset = d_offset_bytes, .range = out_bytes },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            n_experts,
+            1,
+            1,
+        );
+    }
+
+    /// Effort-6 Step 1: dispatch the tiled Q4_K dense GEMM
+    /// (`mul_mm_q4k.comp`). Computes D[M, N] = A[M, K] (Q4_K) × B[K, N] (f32),
+    /// where B and D are column-major (B[col][k] = data_b[b_offset +
+    /// col*stride_b + k], analogously for D).
+    ///
+    /// Tile shape: WG = 64 threads producing a 32 × 16 output tile.
+    /// Dispatch grid: ((M+31)/32) × ((N+15)/16) × 1.
+    ///
+    /// Constraints:
+    /// - K must be a multiple of 256 (Q4_K super-block size).
+    /// - `a_offset` is in BYTES; `b_offset` and `d_offset` are in FLOATS.
+    /// - Caller is responsible for any preceding clear of D.
+    ///
+    /// Returns `error.PipelineNotLoaded` if mul_mm_q4k.spv isn't loaded,
+    /// `error.InvalidArgument` for K-misaligned inputs.
+    pub fn recordMulMmQ4K(
         self: *const DmmvDispatch,
         cmd: *CommandBuffer,
         push_desc_fn: ?PushDescriptorFn,
         a_buf: vk.c.VkBuffer,
         a_size: vk.c.VkDeviceSize,
-        x_buf: vk.c.VkBuffer,
-        x_size: vk.c.VkDeviceSize,
-        y_buf: vk.c.VkBuffer,
-        y_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
         M: u32,
+        N: u32,
         K: u32,
+        stride_b: u32,
+        stride_d: u32,
         a_offset: u32,
-        x_offset: u32,
-        y_offset: u32,
-        acc_mode: u32,
+        b_offset: u32,
+        d_offset: u32,
     ) !void {
-        const pip = if (self.pipeline_q8_0_q8_1) |*p| p else return error.PipelineNotLoaded;
-        if (K == 0 or (K & 31) != 0) return error.InvalidArgument;
-        const push = DmmvPushConstants{
+        const pip = if (self.pipeline_mul_mm_q4k) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
             .M = M,
+            .N = N,
             .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
             .a_offset = a_offset,
-            .x_offset = x_offset,
-            .y_offset = y_offset,
-            .acc_mode = acc_mode,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
         };
         const infos = [3]vk.c.VkDescriptorBufferInfo{
             .{ .buffer = a_buf, .offset = 0, .range = a_size },
-            .{ .buffer = x_buf, .offset = 0, .range = x_size },
-            .{ .buffer = y_buf, .offset = 0, .range = y_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
         };
-        const wg_x = (M + 1) / 2;
+        // BM=32, BN=32 in the shader; keep these in sync.
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
         cmd.pushDescAndDispatch(
             pip,
             push_desc_fn,
             infos[0..],
             std.mem.asBytes(&push),
             wg_x,
+            wg_y,
             1,
+        );
+    }
+
+    /// Tiled Q4_K batched dense FFN front-end: computes
+    /// silu(gate_weight * B) * (up_weight * B) directly into D.
+    pub fn recordMulMmQ4KGateUpSwiglu(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
+    /// Branchless full-tile Q4_K gate/up/SwiGLU GEMM.
+    /// Requires M and N to be multiples of 32; ragged token tails use the
+    /// checked recordMulMmQ4KGateUpSwiglu path.
+    pub fn recordMulMmQ4KGateUpSwigluFull(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        gate_buf: vk.c.VkBuffer,
+        gate_size: vk.c.VkDeviceSize,
+        up_buf: vk.c.VkBuffer,
+        up_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [4]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf, .offset = 0, .range = gate_size },
+            .{ .buffer = up_buf, .offset = 0, .range = up_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
+            1,
+        );
+    }
+
+    /// Tiled Q6_K dense GEMM. Same push/layout as recordMulMmQ4K.
+    /// Used by Qwen3.6-27B layer-major prefill for dense-down and SSM wqkv.
+    pub fn recordMulMmQ6K(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        const wg_x = (M + 31) / 32;
+        const wg_y = (N + 31) / 32;
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            wg_x,
+            wg_y,
+            1,
+        );
+    }
+
+    /// Branchless full-tile Q6_K GEMM. Requires M and N to be multiples of 32.
+    pub fn recordMulMmQ6KFull(
+        self: *const DmmvDispatch,
+        cmd: *CommandBuffer,
+        push_desc_fn: ?PushDescriptorFn,
+        a_buf: vk.c.VkBuffer,
+        a_size: vk.c.VkDeviceSize,
+        b_buf: vk.c.VkBuffer,
+        b_size: vk.c.VkDeviceSize,
+        d_buf: vk.c.VkBuffer,
+        d_size: vk.c.VkDeviceSize,
+        M: u32,
+        N: u32,
+        K: u32,
+        stride_b: u32,
+        stride_d: u32,
+        a_offset: u32,
+        b_offset: u32,
+        d_offset: u32,
+    ) !void {
+        const pip = if (self.pipeline_mul_mm_q6k_full) |*p| p else return error.PipelineNotLoaded;
+        if (K == 0 or (K & 255) != 0) return error.InvalidArgument;
+        if (M == 0 or N == 0 or (M & 31) != 0 or (N & 31) != 0) return error.InvalidArgument;
+        const push = MulMmQ4KPush{
+            .M = M,
+            .N = N,
+            .K = K,
+            .stride_b = stride_b,
+            .stride_d = stride_d,
+            .a_offset = a_offset,
+            .b_offset = b_offset,
+            .d_offset = d_offset,
+        };
+        const infos = [3]vk.c.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf, .offset = 0, .range = a_size },
+            .{ .buffer = b_buf, .offset = 0, .range = b_size },
+            .{ .buffer = d_buf, .offset = 0, .range = d_size },
+        };
+        cmd.pushDescAndDispatch(
+            pip,
+            push_desc_fn,
+            infos[0..],
+            std.mem.asBytes(&push),
+            M / 32,
+            N / 32,
             1,
         );
     }
@@ -671,10 +1580,18 @@ pub const DmmvDispatch = struct {
     /// @param self Dispatch wrapper to tear down in place.
     pub fn deinit(self: *DmmvDispatch) void {
         if (self.pipeline_q4k) |*p| p.deinit();
+        if (self.pipeline_q4k_wide) |*p| p.deinit();
         if (self.pipeline_q5_1) |*p| p.deinit();
         if (self.pipeline_q5k) |*p| p.deinit();
         if (self.pipeline_q6k) |*p| p.deinit();
+        if (self.pipeline_q6k_wide) |*p| p.deinit();
         if (self.pipeline_q8_0) |*p| p.deinit();
+        if (self.pipeline_q8_0_batch) |*p| p.deinit();
+        if (self.pipeline_q8_0_spec64) |*p| p.deinit();
+        if (self.pipeline_q8_0_spec128) |*p| p.deinit();
+        if (self.pipeline_q8_0_wide) |*p| p.deinit();
+        if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
+        if (self.pipeline_q8_0_fused_pair) |*p| p.deinit();
         if (self.pipeline_f16) |*p| p.deinit();
         if (self.pipeline_f32) |*p| p.deinit();
         if (self.pipeline_q4k_batch) |*p| p.deinit();
@@ -683,12 +1600,35 @@ pub const DmmvDispatch = struct {
         if (self.pipeline_q6k_batch_kpar) |*p| p.deinit();
         if (self.pipeline_q4k_moe) |*p| p.deinit();
         if (self.pipeline_q4k_moe_kpar) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_batched) |*p| p.deinit();
         if (self.pipeline_q4k_fused_gate_up_moe) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_moe_spec8) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_moe) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_moe_spec8) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_swiglu_row1) |*p| p.deinit();
+        if (self.pipeline_q4k_fused_gate_up_geglu) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_gate_up_geglu) |*p| p.deinit();
+        if (self.pipeline_q8_0_fused_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_q8_0_fused_gate_up_swiglu_gate) |*p| p.deinit();
+        if (self.pipeline_q8_0_sigmoid_acc) |*p| p.deinit();
+        if (self.pipeline_q4k_o_proj_merge) |*p| p.deinit();
+        if (self.pipeline_q4k_moe_fused_down_acc) |*p| p.deinit();
+        if (self.pipeline_q5k_moe_fused_down_acc) |*p| p.deinit();
         if (self.pipeline_q5k_moe) |*p| p.deinit();
         if (self.pipeline_q5k_moe_kpar) |*p| p.deinit();
+        if (self.pipeline_q5_1_acc) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_fused_down_acc) |*p| p.deinit();
+        if (self.pipeline_q5_1_moe_fused_down_acc_scaled) |*p| p.deinit();
+        if (self.pipeline_q8_0_moe_fused_down_acc_scaled) |*p| p.deinit();
         if (self.pipeline_q6k_moe) |*p| p.deinit();
         if (self.pipeline_quantize_q8_1) |*p| p.deinit();
-        if (self.pipeline_q8_0_q8_1) |*p| p.deinit();
+        if (self.pipeline_count_experts) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_swiglu) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q4k_gate_up_swiglu_full) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k) |*p| p.deinit();
+        if (self.pipeline_mul_mm_q6k_full) |*p| p.deinit();
         vk.c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.* = undefined;
     }

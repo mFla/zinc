@@ -2,7 +2,92 @@
 
 ## Status
 
-**Blocked.** `canUseBatchedPrefillRdna` rejects Gemma on `cfg.architecture == .gemma` and on `cfg.sliding_window_size != 0`. Opening those gates alone produces structurally wrong output because the `prefillBatched` body assumes LLaMA-shaped layers; Gemma has five architectural deltas from what the body handles today.
+**Shipped at commit `5f5a779`.** Gate re-opened for Gemma (and for
+`sliding_window_size != 0`). The last-token logits match per-token at
+`max_abs_diff=0.000075` on gemma4-31b-q4k-m, R9700 — pure float noise.
+
+Root cause of the 60+ absolute-diff validate divergence was twofold:
+
+1. **Missing V RMS norm.** Per-token applies a plain unit-weight RMS norm
+   to V on every Gemma 4 layer (matches forward_metal.zig and llama.cpp's
+   gemma graph). Batched was skipping this entirely.
+2. **V aliased to scratch_k on full-attn layers.** Gemma 4's full-attention
+   layers omit `attn_v` and expect V to equal the raw K projection. Batched
+   was feeding scratch_k directly into the KV cache write and flash-attn as
+   V — but scratch_k had already been K-normed (learned weights) and
+   RoPE'd. V should be the K projection *before* those steps. Per-token
+   handles this by dispatching a second DMMV of `k_tensor` into a separate
+   `v_buf` so K norm/rope mutate only `k_buf`; the batched fix mirrors this
+   by dispatching a second projection of `k_t` into `scratch_v`.
+
+Measured prefill on R9700 with batched on:
+
+| prompt size | baseline (per-token) | batched | speedup |
+|---|---:|---:|---:|
+| 21 tokens   | 4.96 tok/s | 33.32 tok/s | 6.7× |
+| 369 tokens  | 4.97 tok/s | 43.62 tok/s | 8.8× |
+| 613 tokens  | 4.96 tok/s | 57.58 tok/s | 11.6× |
+
+Output coherence verified on all 6 RDNA catalog models.
+
+## Follow-on: decode LM-head (commit `ed0c9d9`)
+
+Profiling the decode path on gemma4-31b-q4k-m surfaced a second pathology
+unrelated to the batched prefill path. With `--profile`:
+
+```
+avg GPU decode token=250.28 ms over 5 sampled decode steps
+avg GPU phases embed=0.01 ms attention=62.53 ms tail=44.89 ms
+```
+
+The **tail** phase is the final `output_norm` + LM-head DMMV. 44.9 ms on
+a 0.79 GB Q4_K matrix (262 144 vocab × 5376 hidden) is 30× the bandwidth
+ceiling on R9700 (1.4 ms at 576 GB/s). The cause was the default
+`dmmv_q4k` shader's `NUM_ROWS = 2u` spawning 131 072 workgroups for that
+tall vocab and thrashing the L1 cache with redundant hidden-vector reads
+— even though each row's compute is tiny (21 Q4_K blocks).
+
+Fix: a `dmmv_q4k_wide` shader variant with `NUM_ROWS = 8u`, identical
+everywhere else. One workgroup handles 8 output rows instead of 2;
+hidden reads amortize 4× and workgroup count drops to 32 768. Gated on
+`M ≥ 100 000` in `dispatchDmmvInner` so only the LM-head path picks it
+up.
+
+```
+Before: tail=44.89 ms, total=250.28 ms/tok,  3.87 tok/s
+After:  tail= 1.64 ms, total=207.54 ms/tok,  5.62 tok/s  (+45%)
+```
+
+Other catalog models with large vocabs also picked up small decode wins
+(Qwen3-8B vocab 152k).
+
+## Follow-on: Gemma MoE long decode
+
+The current RDNA site matrix shows a separate sustained-decode gap on
+Gemma 4 26B A4B IT Q4K M:
+
+| scenario | ZINC decode | llama.cpp decode | ZINC / llama |
+|---|---:|---:|---:|
+| context-long | 125.60 tok/s | 105.76 tok/s | 119% |
+| decode-extended | 53.69 tok/s | 102.72 tok/s | 52% |
+
+The context-long "win" is not a reliable sustained-decode comparison:
+ZINC generated 2 tokens in that case while llama.cpp generated 8. The
+decode-extended scenario generates 32 tokens and exposes the real gap.
+
+Latest llama.cpp (`389ff61d7`, 2026-05-10) keeps MoE top-k selection and
+selected-expert matvecs on GPU through `topk_moe` and `mul_mat_id`.
+ZINC still explicitly excludes `.gemma` from the GPU MoE path and uses
+router readback + CPU `topKSoftmax` + serial selected-expert dispatch.
+That is now tracked as **Effort 13**:
+
+```bash
+bun loops/optimize_perf.ts --effort 13 --model gemma426ba4b --cycles 999
+```
+
+Do not fold that work into this prefill effort. Effort 9 remains about
+batched prefill and the dense Gemma LM-head/tail fix. Effort 13 owns the
+decode-time Gemma MoE CPU-fallback removal.
 
 ## Measured baseline (`main` @ `a41c185`, AMD R9700 RDNA4 gfx1201)
 

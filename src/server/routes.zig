@@ -3,6 +3,50 @@
 //! Handles /v1/chat/completions, /v1/completions, /v1/models, /health,
 //! and a built-in chat UI. Supports both streaming (SSE) and non-streaming responses.
 const std = @import("std");
+
+fn unixTimestamp() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return ts.sec;
+}
+
+fn getenv(key: [*:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(key) orelse return null;
+    return std.mem.span(ptr);
+}
+
+const FutexMutex = struct {
+    state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+
+    fn lock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        while (@cmpxchgWeak(i32, &self.state.raw, 0, 1, .acquire, .monotonic) != null) {
+            _ = linux.futex_4arg(
+                @ptrCast(&self.state.raw),
+                .{ .cmd = .WAIT, .private = true },
+                1,
+                null,
+            );
+        }
+    }
+
+    fn unlock(self: *FutexMutex) void {
+        const linux = std.os.linux;
+        @atomicStore(i32, &self.state.raw, 0, .release);
+        _ = linux.futex_3arg(
+            @ptrCast(&self.state.raw),
+            .{ .cmd = .WAKE, .private = true },
+            1,
+        );
+    }
+};
+
+
+fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 const http = @import("http.zig");
 const runtime = @import("runtime.zig");
 const forward_mod = runtime.forward_mod;
@@ -12,8 +56,39 @@ const model_manager_mod = runtime.model_manager_mod;
 const tokenizer_mod = runtime.tokenizer_mod;
 const Model = runtime.Model;
 const memory_plan = @import("../gpu/memory_plan.zig");
+const tool_format = @import("tool_format.zig");
 
 const log = std.log.scoped(.routes);
+
+/// Cached three-state probe of `ZINC_TOOL_CALLING`. Negative = uncached;
+/// 0 = disabled; 1 = enabled. The check happens once per process, lazily.
+var tool_calling_state: std.atomic.Value(i8) = .init(-1);
+
+/// Return true if OpenAI-compatible tool calling is enabled. Default on.
+/// Set `ZINC_TOOL_CALLING=0` (or `false`) to opt out — useful as a kill
+/// switch for clients that misbehave when seeing the new `tool_calls`
+/// response shape, or for debugging.
+pub fn toolCallingEnabled() bool {
+    const cached = tool_calling_state.load(.acquire);
+    if (cached >= 0) return cached == 1;
+    const enabled = blk: {
+        const val = getenv("ZINC_TOOL_CALLING") orelse break :blk true;
+        break :blk !std.mem.eql(u8, val, "0") and !std.mem.eql(u8, val, "false");
+    };
+    tool_calling_state.store(if (enabled) 1 else 0, .release);
+    if (!enabled) log.info("ZINC_TOOL_CALLING=0: OpenAI-compatible tool calling disabled", .{});
+    return enabled;
+}
+
+/// Test-only override of the tool-calling gate. Sets the cached state directly
+/// to bypass the env-var probe. Tests should reset to -1 (uncached) on exit so
+/// later tests pick up the real env value.
+fn setToolCallingForTest(enabled: bool) void {
+    tool_calling_state.store(if (enabled) 1 else 0, .release);
+}
+fn resetToolCallingForTest() void {
+    tool_calling_state.store(-1, .release);
+}
 
 const chat_reuse_max_sessions: usize = 32;
 const chat_reuse_idle_timeout_ns: i128 = 30 * 60 * std.time.ns_per_s;
@@ -34,7 +109,7 @@ const ChatReuseEntry = struct {
 
 const ChatReuseCache = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .{},
+    entries: std.ArrayListUnmanaged(ChatReuseEntry) = .empty,
 
     fn init(allocator: std.mem.Allocator) ChatReuseCache {
         return .{ .allocator = allocator };
@@ -134,7 +209,7 @@ pub const ServerState = struct {
     active_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     queued_requests: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     active_context_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    generation_mutex: std.Thread.Mutex = .{},
+    generation_mutex: FutexMutex = .{},
     downloads: DownloadTracker = .{},
     chat_reuse_cache: ChatReuseCache,
 
@@ -221,7 +296,7 @@ const DownloadSnapshot = struct {
 };
 
 const DownloadTracker = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: FutexMutex = .{},
     active: bool = false,
     phase: DownloadPhase = .idle,
     model_id_len: usize = 0,
@@ -390,7 +465,7 @@ fn buildHealthJson(
     memory_usage: model_manager_mod.ModelManager.MemoryUsage,
     buf: []u8,
 ) ![]const u8 {
-    const now = std.time.timestamp();
+    const now = unixTimestamp();
     const snapshot = server_state.snapshot(now);
     const active_context_tokens = memory_usage.activeContextTokens(snapshot.active_context_tokens);
     const active_context_bytes = memory_usage.activeContextBytes(active_context_tokens);
@@ -431,10 +506,10 @@ fn handleModels(
     const memory_usage = manager.currentMemoryUsage();
     const download = server_state.downloads.snapshot();
 
-    var body: std.ArrayList(u8) = .{};
+    var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
 
-    try body.writer(allocator).print(
+    try body.print(allocator, 
         "{{\"object\":\"list\",\"profile\":\"{s}\",\"active_memory_used_bytes\":{d},\"active_memory_budget_bytes\":{d},\"active_memory_weights_bytes\":{d},\"active_memory_runtime_bytes\":{d},\"active_context_reserved_bytes\":{d},\"active_context_active_bytes\":{d},\"active_context_tokens\":{d},\"active_context_capacity_tokens\":{d},\"data\":[",
         .{
             view.profile,
@@ -448,7 +523,7 @@ fn handleModels(
             memory_usage.context_capacity_tokens,
         },
     );
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(unixTimestamp(), 1);
     for (view.data, 0..) |entry, i| {
         if (i != 0) try body.append(allocator, ',');
         const fit_source = if (entry.exact_fit) "exact" else "catalog";
@@ -456,11 +531,13 @@ fn handleModels(
         const downloading = is_download_target and download.active;
         const download_phase = if (is_download_target) @tagName(download.phase) else "idle";
         const download_error = if (is_download_target) download.errorMessage() else "";
-        try body.writer(allocator).print(
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"zinc","display_name":"{s}","release_date":"{s}","homepage_url":"{s}","family":"{s}","quantization":"{s}","size_bytes":{d},"installed":{s},"active":{s},"managed":{s},"supported_on_current_gpu":{s},"fits_current_gpu":{s},"required_vram_bytes":{d},"fit_source":"{s}","status":"{s}","supports_thinking_toggle":{s},"downloading":{s},"download_phase":"{s}","downloaded_bytes":{d},"download_total_bytes":{d},"download_error":"{s}"}}
+        const entry_context_length: u32 = if (entry.active) memory_usage.context_capacity_tokens else 0;
+        try body.print(allocator, 
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"zinc","context_length":{d},"display_name":"{s}","release_date":"{s}","homepage_url":"{s}","family":"{s}","quantization":"{s}","size_bytes":{d},"installed":{s},"active":{s},"managed":{s},"supported_on_current_gpu":{s},"fits_current_gpu":{s},"required_vram_bytes":{d},"required_vram_with_offload_bytes":{d},"requires_offload_to_fit":{s},"fit_source":"{s}","status":"{s}","supports_thinking_toggle":{s},"downloading":{s},"download_phase":"{s}","downloaded_bytes":{d},"download_total_bytes":{d},"download_error":"{s}"}}
         , .{
             entry.id,
             ts,
+            entry_context_length,
             entry.display_name,
             entry.release_date,
             entry.homepage_url,
@@ -473,6 +550,8 @@ fn handleModels(
             if (entry.supported_on_current_gpu) "true" else "false",
             if (entry.fits_current_gpu) "true" else "false",
             entry.required_vram_bytes,
+            entry.required_vram_with_offload_bytes,
+            if (entry.requires_offload_to_fit) "true" else "false",
             fit_source,
             entry.status_label,
             if (entry.supports_thinking_toggle) "true" else "false",
@@ -612,6 +691,7 @@ const NullLogWriter = struct {
 const DownloadWorker = struct {
     entry: catalog_mod.CatalogEntry,
     tracker: *DownloadTracker,
+    io: std.Io,
 
     fn run(self: *DownloadWorker) void {
         defer std.heap.page_allocator.destroy(self);
@@ -625,7 +705,7 @@ const DownloadWorker = struct {
             .on_complete = downloadObserverComplete,
         };
 
-        managed_mod.pullModelWithObserver(self.entry, std.heap.page_allocator, &sink, &observer) catch |err| {
+        managed_mod.pullModelWithObserver(self.io, self.entry, std.heap.page_allocator, &sink, &observer) catch |err| {
             self.tracker.markFailed(@errorName(err));
             return;
         };
@@ -683,7 +763,7 @@ fn handlePullModel(
         return;
     }
 
-    if (managed_mod.isInstalled(parsed.model_id, _allocator)) {
+    if (managed_mod.isInstalled(_manager.io, parsed.model_id, _allocator)) {
         var installed_buf: [512]u8 = undefined;
         const installed_response = std.fmt.bufPrint(&installed_buf,
             \\{{"object":"model.pull","id":"{s}","state":"installed"}}
@@ -710,6 +790,7 @@ fn handlePullModel(
     worker.* = .{
         .entry = entry.*,
         .tracker = &server_state.downloads,
+        .io = _manager.io,
     };
 
     const thread = std.Thread.spawn(.{}, DownloadWorker.run, .{worker}) catch |err| {
@@ -768,6 +849,7 @@ const default_chat_system_prompt =
 const FinishReason = enum {
     stop,
     length,
+    tool_calls,
 };
 
 fn completionFinishReason(requested_max_tokens: u32, effective_max_tokens: u32, produced_tokens: usize) FinishReason {
@@ -777,9 +859,102 @@ fn completionFinishReason(requested_max_tokens: u32, effective_max_tokens: u32, 
     return .stop;
 }
 
+/// One block inside an OpenAI-style content array, e.g. `{type: "text", text: "..."}`.
+/// Unknown block types (image_url, tool_use, etc.) are accepted but ignored downstream.
+const ContentBlock = struct {
+    type: []const u8 = "",
+    text: []const u8 = "",
+};
+
+/// Message content. OpenAI-compatible clients send three shapes:
+///   1. plain string             — `"hello"`
+///   2. content-block array      — `[{"type":"text","text":"hello"}]`
+///   3. null (assistant tool call) — `null`
+/// We flatten all three to a single string. Non-text blocks are skipped silently.
+const Content = struct {
+    text: []const u8 = "",
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Content {
+        switch (try source.peekNextTokenType()) {
+            .null => {
+                _ = try source.next();
+                return .{ .text = "" };
+            },
+            .string => {
+                const s = try std.json.innerParse([]const u8, allocator, source, options);
+                return .{ .text = s };
+            },
+            .array_begin => {
+                _ = try source.next();
+                var pieces: std.ArrayList([]const u8) = .empty;
+                defer pieces.deinit(allocator);
+                while (true) {
+                    if ((try source.peekNextTokenType()) == .array_end) {
+                        _ = try source.next();
+                        break;
+                    }
+                    const block = try std.json.innerParse(ContentBlock, allocator, source, options);
+                    if (std.mem.eql(u8, block.type, "text") and block.text.len > 0) {
+                        try pieces.append(allocator, block.text);
+                    }
+                }
+                if (pieces.items.len == 0) return .{ .text = "" };
+                if (pieces.items.len == 1) return .{ .text = pieces.items[0] };
+                return .{ .text = try std.mem.concat(allocator, u8, pieces.items) };
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+};
+
+const HistoricalToolCallFunction = struct {
+    name: []const u8 = "",
+    arguments: []const u8 = "",
+};
+
+const HistoricalToolCall = struct {
+    id: []const u8 = "",
+    type: []const u8 = "function",
+    function: HistoricalToolCallFunction = .{},
+};
+
+const RequestToolFunction = struct {
+    name: []const u8 = "",
+    description: []const u8 = "",
+    parameters: std.json.Value = .null,
+};
+
+const RequestTool = struct {
+    type: []const u8 = "function",
+    function: RequestToolFunction = .{},
+};
+
+/// Resolution of the OpenAI `tool_choice` request field. `auto` lets the model
+/// decide whether to invoke a tool; `none` suppresses tool rendering even when
+/// `tools` is non-empty. Other OpenAI values (`required`, `{type:function,...}`)
+/// are not yet supported and downcast to `auto`.
+pub const ToolChoice = enum { auto, none };
+
+fn parseToolChoice(value: ?std.json.Value) ToolChoice {
+    const v = value orelse return .auto;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "none")) return .none;
+            return .auto;
+        },
+        else => return .auto,
+    }
+}
+
 const ChatMessage = struct {
     role: []const u8 = "",
-    content: []const u8 = "",
+    content: Content = .{},
+    tool_calls: []const HistoricalToolCall = &.{},
+    tool_call_id: []const u8 = "",
 };
 
 const ChatRequestBody = struct {
@@ -791,6 +966,8 @@ const ChatRequestBody = struct {
     temperature: f32 = 0.0,
     top_p: f32 = 1.0,
     enable_thinking: ?bool = null,
+    tools: []const RequestTool = &.{},
+    tool_choice: ?std.json.Value = null,
 };
 
 const ParsedChatRequest = struct {
@@ -803,9 +980,14 @@ const ParsedChatRequest = struct {
     temperature: f32,
     top_p: f32,
     enable_thinking: ?bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
+    /// Owns parameters_json strings and tool_calls rendering.
+    arena: std.heap.ArenaAllocator,
 
     fn deinit(self: *ParsedChatRequest) void {
         self.parsed.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -813,24 +995,71 @@ const ParsedChatRequest = struct {
 fn countValidChatMessages(messages: []const ChatMessage) usize {
     var count: usize = 0;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0) continue;
+        if (message.content.text.len == 0 and message.tool_calls.len == 0) continue;
         count += 1;
     }
     return count;
 }
 
-fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const u8, thinking_enabled: bool) usize {
+fn estimateChatPromptBytes(roles: []const []const u8, contents: []const []const u8, thinking_enabled: bool, tools: []const tool_format.ToolDefinition) usize {
     var total: usize = 128;
     const n = @min(roles.len, contents.len);
     for (0..n) |i| {
         total += roles[i].len + contents[i].len + 32;
     }
     if (thinking_enabled) total += thinking_prefix.len + 32 else total += 32;
+    // Add budget for injected tool definitions: ~400 byte Qwen3 header + ~256 bytes per tool.
+    if (tools.len > 0) {
+        total += 512;
+        for (tools) |t| {
+            total += t.name.len + t.description.len + t.parameters_json.len + 64;
+        }
+    }
     return total;
 }
 
-fn buildChatPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, buf: []u8) ![]const u8 {
-    return tokenizer.applyChatTemplateWithOptions(roles, contents, .{ .enable_thinking = enable_thinking, .skip_thinking_template = skip_thinking_template }, buf);
+fn buildChatPrompt(allocator: std.mem.Allocator, tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, skip_thinking_template: bool, tools: []const tool_format.ToolDefinition, tool_choice: ToolChoice, buf: []u8) ![]const u8 {
+    const tf = tool_format.forTemplate(tokenizer.detectTemplateKind());
+    const tools_for_template = if (tool_choice == .none) @as([]const tool_format.ToolDefinition, &.{}) else tools;
+    return tokenizer.applyChatTemplateWithOptions(roles, contents, .{
+        .enable_thinking = enable_thinking,
+        .skip_thinking_template = skip_thinking_template,
+        .tools = tools_for_template,
+        .tool_format = tf,
+        .tool_render_allocator = allocator,
+    }, buf);
+}
+
+fn allocChatPrompt(
+    allocator: std.mem.Allocator,
+    tokenizer: *const tokenizer_mod.Tokenizer,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    enable_thinking: ?bool,
+    skip_thinking_template: bool,
+    tools: []const tool_format.ToolDefinition,
+    tool_choice: ToolChoice,
+) ![]u8 {
+    var capacity = estimateChatPromptBytes(roles, contents, supportsEnabledThinking(tokenizer, enable_thinking), tools);
+    var attempts: u8 = 0;
+    while (attempts < 4) : (attempts += 1) {
+        const prompt_buf = try allocator.alloc(u8, capacity);
+        errdefer allocator.free(prompt_buf);
+
+        const prompt = buildChatPrompt(allocator, tokenizer, roles, contents, enable_thinking, skip_thinking_template, tools, tool_choice, prompt_buf) catch |err| {
+            allocator.free(prompt_buf);
+            if (err == error.BufferTooSmall) {
+                capacity *= 2;
+                continue;
+            }
+            return err;
+        };
+
+        return prompt_buf[0..prompt.len];
+    }
+
+    return error.BufferTooSmall;
 }
 
 fn buildChatTranscriptPrompt(tokenizer: *const tokenizer_mod.Tokenizer, roles: []const []const u8, contents: []const []const u8, enable_thinking: ?bool, buf: []u8) ![]const u8 {
@@ -862,7 +1091,7 @@ fn warmChatReuseCache(
     allocator: std.mem.Allocator,
 ) !void {
     if (session_id.len == 0) return;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = nanoTimestamp();
 
     const processed_prefix_len = prompt_tokens.len + processed_generated_tokens.len;
     const transcript_count = roles.len + 1;
@@ -876,7 +1105,7 @@ fn warmChatReuseCache(
     transcript_roles[roles.len] = "assistant";
     transcript_contents[contents.len] = assistant_content;
 
-    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, false) + assistant_content.len + 64;
+    const transcript_capacity = estimateChatPromptBytes(transcript_roles, transcript_contents, false, &.{}) + assistant_content.len + 64;
     const transcript_buf = try allocator.alloc(u8, transcript_capacity);
     defer allocator.free(transcript_buf);
     const transcript_prompt = try buildChatTranscriptPrompt(tokenizer, transcript_roles, transcript_contents, thinking_enabled, transcript_buf);
@@ -954,15 +1183,23 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     });
     errdefer parsed.deinit();
 
-    const arena_allocator = parsed.arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const tools_enabled = toolCallingEnabled();
+
+    const json_arena_allocator = parsed.arena.allocator();
     const messages = parsed.value.messages;
-    const roles = try arena_allocator.alloc([]const u8, messages.len + 1);
-    const contents = try arena_allocator.alloc([]const u8, messages.len + 1);
+    const roles = try json_arena_allocator.alloc([]const u8, messages.len + 1);
+    const contents = try json_arena_allocator.alloc([]const u8, messages.len + 1);
 
     var count: usize = 0;
     var has_guiding_message = false;
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0) continue;
+        const has_tool_calls = tools_enabled and message.tool_calls.len > 0;
+        if (message.content.text.len == 0 and !has_tool_calls) continue;
         if (std.mem.eql(u8, message.role, "system") or std.mem.eql(u8, message.role, "developer")) {
             has_guiding_message = true;
         }
@@ -980,13 +1217,46 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
     }
 
     for (messages) |message| {
-        if (message.role.len == 0 or message.content.len == 0) continue;
+        if (message.role.len == 0) continue;
+        // Assistant message with tool_calls but no text content — render as <tool_call> blocks.
+        // Only when tool calling is enabled; otherwise the assistant turn is treated as
+        // empty and skipped (matching pre-tool-calling behavior).
+        if (tools_enabled and std.mem.eql(u8, message.role, "assistant") and message.content.text.len == 0 and message.tool_calls.len > 0) {
+            var rendered: std.ArrayList(u8) = .empty;
+            for (message.tool_calls) |tc| {
+                try rendered.appendSlice(arena_alloc, "<tool_call>\n{\"name\": \"");
+                try rendered.appendSlice(arena_alloc, tc.function.name);
+                try rendered.appendSlice(arena_alloc, "\", \"arguments\": ");
+                try rendered.appendSlice(arena_alloc, tc.function.arguments);
+                try rendered.appendSlice(arena_alloc, "}\n</tool_call>\n");
+            }
+            roles[count] = "assistant";
+            contents[count] = try rendered.toOwnedSlice(arena_alloc);
+            count += 1;
+            continue;
+        }
+        if (message.content.text.len == 0) continue;
         roles[count] = message.role;
         contents[count] = if (std.mem.eql(u8, message.role, "assistant"))
-            sanitizeAssistantHistoryContent(message.content)
+            sanitizeAssistantHistoryContent(message.content.text)
         else
-            message.content;
+            message.content.text;
         count += 1;
+    }
+
+    // Convert RequestTool → ToolDefinition. When tool calling is disabled,
+    // pretend the request had no tools — downstream code (prompt builder,
+    // response emitter, streaming detector) sees an empty slice and runs
+    // the existing chat path unchanged.
+    const tools_in: []const RequestTool = if (tools_enabled) parsed.value.tools else &.{};
+    const tools_out = try arena_alloc.alloc(tool_format.ToolDefinition, tools_in.len);
+    for (tools_in, 0..) |t, ti| {
+        const params_json = try std.json.Stringify.valueAlloc(arena_alloc, t.function.parameters, .{});
+        tools_out[ti] = .{
+            .name = t.function.name,
+            .description = t.function.description,
+            .parameters_json = params_json,
+        };
     }
 
     return .{
@@ -999,6 +1269,9 @@ fn parseChatRequest(allocator: std.mem.Allocator, body: []const u8) !ParsedChatR
         .temperature = parsed.value.temperature,
         .top_p = parsed.value.top_p,
         .enable_thinking = parsed.value.enable_thinking,
+        .tools = tools_out,
+        .tool_choice = if (tools_enabled) parseToolChoice(parsed.value.tool_choice) else .auto,
+        .arena = arena,
     };
 }
 fn findFirstStop(text: []const u8, stop_strs: []const []const u8) ?usize {
@@ -1017,7 +1290,7 @@ fn trimTrailingChatArtifacts(text: []const u8) []const u8 {
     var out = text;
     while (true) {
         const trimmed_left = trimLeadingStandaloneQuote(out);
-        const trimmed = std.mem.trimRight(u8, trimmed_left, " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, trimmed_left, " \t\r\n");
         if (std.mem.endsWith(u8, trimmed, "<|endoftext|>")) {
             out = trimmed[0 .. trimmed.len - "<|endoftext|>".len];
             continue;
@@ -1047,7 +1320,7 @@ fn trimDanglingListMarker(text: []const u8) ?[]const u8 {
     const line_start = (std.mem.lastIndexOfScalar(u8, text, '\n') orelse return null) + 1;
     const line = std.mem.trim(u8, text[line_start..], " \t\r\n");
     if (line.len == 1 and (line[0] == '-' or line[0] == '*')) {
-        return std.mem.trimRight(u8, text[0..line_start], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..line_start], " \t\r\n");
     }
     return null;
 }
@@ -1073,7 +1346,7 @@ const leaked_reasoning_start_markers = [_][]const u8{
 };
 
 fn startsWithLeakedReasoning(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     for (leaked_reasoning_start_markers) |marker| {
         if (trimmed.len >= marker.len and std.ascii.eqlIgnoreCase(trimmed[0..marker.len], marker)) return true;
     }
@@ -1092,7 +1365,7 @@ fn findLeakedReasoningStart(text: []const u8) ?usize {
 
 fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
     if (findLeakedReasoningStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -1100,7 +1373,7 @@ fn trimLeakedNoThinkingOutput(text: []const u8) []const u8 {
 fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
     // If text starts with <think>, skip past the first </think> so we detect REOPENED blocks
     var search_start: usize = 0;
-    const trimmed_start = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed_start = std.mem.trimStart(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed_start, "<think>")) {
         if (std.mem.indexOf(u8, text, "</think>")) |close_idx| {
             search_start = close_idx + "</think>".len;
@@ -1118,7 +1391,7 @@ fn findUnexpectedThinkingTailStart(text: []const u8) ?usize {
 
 fn trimUnexpectedThinkingTail(text: []const u8) []const u8 {
     if (findUnexpectedThinkingTailStart(text)) |idx| {
-        const trimmed = std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        const trimmed = std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
         if (trimmed.len > 0) {
             return trimmed;
         }
@@ -1289,7 +1562,7 @@ fn findRestartedAnswerStart(text: []const u8) ?usize {
 
 fn trimRestartedAnswer(text: []const u8) []const u8 {
     if (findRestartedAnswerStart(text)) |idx| {
-        return std.mem.trimRight(u8, text[0..idx], " \t\r\n");
+        return std.mem.trimEnd(u8, text[0..idx], " \t\r\n");
     }
     return text;
 }
@@ -1297,13 +1570,13 @@ fn trimRestartedAnswer(text: []const u8) []const u8 {
 fn sanitizeAssistantHistoryContent(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, empty_thinking_prefix)) {
         const body = sanitizeAnswerTail(text[empty_thinking_prefix.len..]);
-        return if (body.len == 0) text else std.mem.trimRight(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
+        return if (body.len == 0) text else std.mem.trimEnd(u8, text[0 .. empty_thinking_prefix.len + body.len], " \t\r\n");
     }
     return sanitizeAnswerTail(text);
 }
 
 fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
-    var s = std.mem.trimLeft(u8, text, " \t\r\n");
+    var s = std.mem.trimStart(u8, text, " \t\r\n");
     if (s.len == 0 or s[0] != '"') return text;
     var i: usize = 1;
     var saw_newline = false;
@@ -1317,7 +1590,7 @@ fn trimLeadingStandaloneQuote(text: []const u8) []const u8 {
         break;
     }
     if (!saw_newline) return text;
-    return std.mem.trimLeft(u8, s[i..], " \t\r\n");
+    return std.mem.trimStart(u8, s[i..], " \t\r\n");
 }
 
 fn supportsEnabledThinking(tokenizer: *const tokenizer_mod.Tokenizer, enable_thinking: ?bool) bool {
@@ -1378,7 +1651,7 @@ fn compactHistoryAnswer(answer: []const u8) []const u8 {
             break;
         }
     }
-    return std.mem.trimRight(u8, trimmed[0..cut], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0..cut], " \t\r\n");
 }
 
 fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
@@ -1436,7 +1709,7 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
     const stripped = std.mem.trim(u8, buf[0..out_len], " \t\r\n");
     if (stripped.len > 0) return stripped;
 
-    const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, thinking_open_tag)) return stripped;
 
     const after_open = thinking_open_tag.len;
@@ -1452,13 +1725,13 @@ fn stripThinkingForDisabledResponse(text: []const u8, buf: []u8) ![]const u8 {
 }
 
 fn hasDanglingTrailingQuote(text: []const u8) bool {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '"') return false;
     var body = trimmed[0 .. trimmed.len - 1];
     while (std.mem.endsWith(u8, body, utf8_replacement)) {
         body = body[0 .. body.len - utf8_replacement.len];
     }
-    body = std.mem.trimRight(u8, body, " \t\r\n");
+    body = std.mem.trimEnd(u8, body, " \t\r\n");
     if (body.len == 0) return true;
     var quote_count: usize = 0;
     for (body) |c| {
@@ -1477,8 +1750,38 @@ fn isReplacementArtifact(text: []const u8) bool {
     return true;
 }
 
+// Returns the byte length of the longest prefix of `bytes` that ends on a
+// complete UTF-8 codepoint boundary. Trailing bytes that form an incomplete
+// sequence (e.g. one or two bytes of a 4-byte emoji) are excluded so they can
+// be carried into the next streaming chunk. Byte-level BPE tokenizers (Qwen,
+// GPT-2) routinely split multi-byte characters across single-byte tokens; if
+// those bytes are shipped to the browser one event at a time, TextDecoder
+// emits U+FFFD per orphan byte.
+fn lastCompleteUtf8End(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    // Walk back over up to 3 trailing continuation bytes (10xxxxxx).
+    var i: usize = bytes.len;
+    var continuations: usize = 0;
+    while (i > 0 and continuations < 3) {
+        const b = bytes[i - 1];
+        if ((b & 0xC0) != 0x80) break;
+        i -= 1;
+        continuations += 1;
+    }
+    if (i == 0) return bytes.len; // all continuations, nothing to anchor on — flush as-is
+    const lead = bytes[i - 1];
+    const expected: usize = if (lead < 0x80) 1
+        else if ((lead & 0xE0) == 0xC0) 2
+        else if ((lead & 0xF0) == 0xE0) 3
+        else if ((lead & 0xF8) == 0xF0) 4
+        else 1; // malformed lead — let it through
+    const have = bytes.len - (i - 1);
+    if (have >= expected) return bytes.len;
+    return i - 1;
+}
+
 fn trimDanglingHeading(text: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimRight(u8, text, " \t\r\n");
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
     if (trimmed.len == 0) return null;
     const line_start = (std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return checkHeading(trimmed, 0));
     return checkHeading(trimmed, line_start + 1);
@@ -1491,7 +1794,66 @@ fn checkHeading(trimmed: []const u8, start: usize) ?[]const u8 {
         if (c != '#') return null;
     }
     if (start == 0) return "";
-    return std.mem.trimRight(u8, trimmed[0 .. start - 1], " \t\r\n");
+    return std.mem.trimEnd(u8, trimmed[0 .. start - 1], " \t\r\n");
+}
+
+/// Validates that the model the client requested is the one currently loaded;
+/// if not, attempts to swap to it. Returns `true` if generation may proceed,
+/// `false` if an error response was already sent.
+///
+/// Caller must already hold the shared generation lock (i.e. have an active
+/// `GenerationGuard`), since `activateManagedModel` requires it.
+fn ensureRequestedModelActive(
+    conn: *http.Connection,
+    manager: *model_manager_mod.ModelManager,
+    server_state: *ServerState,
+    requested_model: []const u8,
+) !bool {
+    if (requested_model.len == 0) return true;
+
+    if (manager.currentResources()) |current| {
+        if (current.managed_id) |active_id| {
+            if (std.mem.eql(u8, active_id, requested_model)) return true;
+        }
+        if (comptime runtime.supports_model_management) {
+            // The model may have been loaded by --model <path> with no managed_id;
+            // resolve the catalog entry that corresponds to the on-disk file so
+            // a request for that catalog id is treated as a no-op rather than a swap.
+            if (catalog_mod.findForLoadedModel(current.managed_id, current.model_path, current.display_name)) |entry| {
+                if (std.mem.eql(u8, entry.id, requested_model)) return true;
+            }
+        }
+    }
+
+    if (comptime !runtime.supports_model_management) {
+        try conn.sendError(404, "model_not_found", "Requested model is not loaded; this build does not support runtime model swapping");
+        return false;
+    }
+
+    manager.activateManagedModel(requested_model, true) catch |err| {
+        const status: u16 = switch (err) {
+            error.UnknownManagedModel, error.ModelNotInstalled => 404,
+            error.GpuAlreadyReserved => 409,
+            else => 400,
+        };
+        const code = switch (err) {
+            error.UnknownManagedModel, error.ModelNotInstalled => "model_not_found",
+            else => "invalid_request_error",
+        };
+        const msg = switch (err) {
+            error.UnknownManagedModel => "Unknown model id",
+            error.ModelNotInstalled => "Model is not installed in the local cache",
+            error.ModelUnsupportedOnThisGpu => "Model is not supported on the current GPU",
+            error.ModelDoesNotFit => "Model does not fit the current GPU memory budget",
+            error.GpuAlreadyReserved => "Another zinc process owns this GPU",
+            else => @errorName(err),
+        };
+        log.warn("Model activation failed for '{s}': {s}", .{ requested_model, @errorName(err) });
+        try conn.sendError(status, code, msg);
+        return false;
+    };
+    server_state.clearChatReuseCache();
+    return true;
 }
 
 fn handleChatCompletions(
@@ -1514,6 +1876,7 @@ fn handleChatCompletions(
 
     var generation_guard = GenerationGuard.acquire(server_state);
     defer generation_guard.release();
+    if (!try ensureRequestedModelActive(conn, manager, server_state, parsed.parsed.value.model)) return;
     const resources = manager.currentResources() orelse {
         try conn.sendError(503, "service_unavailable", "No model is currently loaded");
         return;
@@ -1546,14 +1909,11 @@ fn handleChatCompletions(
     }
     defer runtime.setLogitsReadbackEnabled(engine, previous_logits_readback);
 
-    const prompt_capacity = estimateChatPromptBytes(parsed.roles, parsed.contents, supportsEnabledThinking(tokenizer, parsed.enable_thinking));
-    const prompt_buf = allocator.alloc(u8, prompt_capacity) catch {
-        try conn.sendError(500, "internal_error", "Prompt allocation failed");
-        return;
-    };
-    defer allocator.free(prompt_buf);
-
-    const prompt = buildChatPrompt(tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, prompt_buf) catch |err| {
+    const prompt = allocChatPrompt(allocator, tokenizer, parsed.roles, parsed.contents, parsed.enable_thinking, skip_thinking_template, parsed.tools, parsed.tool_choice) catch |err| {
+        if (err == error.OutOfMemory) {
+            try conn.sendError(500, "internal_error", "Prompt allocation failed");
+            return;
+        }
         if (err == error.BufferTooSmall) {
             try conn.sendError(400, "invalid_request_error", "Prompt too long");
             return;
@@ -1561,6 +1921,7 @@ fn handleChatCompletions(
         try conn.sendError(500, "internal_error", "Prompt formatting failed");
         return;
     };
+    defer allocator.free(prompt);
 
     // Tokenize
     // `encode` uses the tokenizer's allocator, which differs from the per-request
@@ -1584,14 +1945,14 @@ fn handleChatCompletions(
     }
     server_state.setActiveContextTokens(prompt_token_count);
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
+    const ts = @divTrunc(unixTimestamp(), 1);
     const request_budget = memory_plan.requestBudget(
         prompt_token_count,
         parsed.max_tokens,
         resources.context_capacity_tokens,
     );
     const max_tokens = request_budget.completion_tokens;
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const seed_ns: i128 = nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "chatcmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "chatcmpl-0";
     const thinking_enabled = supportsEnabledThinking(tokenizer, parsed.enable_thinking);
@@ -1612,7 +1973,7 @@ fn handleChatCompletions(
         });
     }
 
-    var processed_generated_tokens: std.ArrayList(u32) = .{};
+    var processed_generated_tokens: std.ArrayList(u32) = .empty;
     defer processed_generated_tokens.deinit(allocator);
 
     var cache_assistant_text: ?[]u8 = null;
@@ -1661,7 +2022,7 @@ fn handleChatCompletions(
     }
 
     const reused_prefix_len = if (cacheable_session)
-        server_state.chat_reuse_cache.matchingPrefixLen(parsed.session_id, resources.model_path, prompt_tokens, std.time.nanoTimestamp())
+        server_state.chat_reuse_cache.matchingPrefixLen(parsed.session_id, resources.model_path, prompt_tokens, nanoTimestamp())
     else
         0;
     if (reused_prefix_len > 0) {
@@ -1707,8 +2068,6 @@ fn handleChatCompletions(
             }
         }.check;
         const stop_strs = chat_stop_strs[0..];
-        var pending_tokens: [16]u32 = undefined; // tokens waiting to be sent
-        var pending_count: usize = 0;
         var gen_text_buf: [32768]u8 = undefined; // accumulated decoded text for stop check
         var gen_text_len: usize = 0;
         var sent_text_len: usize = 0; // how much of gen_text has been confirmed safe to send
@@ -1716,6 +2075,20 @@ fn handleChatCompletions(
         var visible_buf: [4096]u8 = undefined;
         var stopped = false;
         var finish_reason: FinishReason = if (max_tokens == 0 and parsed.max_tokens > 0) .length else .stop;
+
+        // Streaming tool-call detector. The detector is allocated unconditionally
+        // (so deinit always works) but `tools_active` short-circuits the per-chunk
+        // detection logic when the request didn't ask for tools — in that case
+        // bytes flow through directly via streamText, matching mainline latency.
+        const tools_active = parsed.tools.len > 0;
+        const stream_tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const stream_detector = try stream_tool_fmt.newStreamingDetector(allocator);
+        defer {
+            stream_detector.deinit();
+            allocator.destroy(stream_detector);
+        }
+        var any_tool_call_emitted = false;
+        var tool_call_index: u32 = 0;
 
         if (max_tokens > 0) {
             var prev_token = runtime.sample(engine, &state, sampling, random);
@@ -1789,12 +2162,6 @@ fn handleChatCompletions(
                     }
                 }
 
-                // Add to pending queue
-                if (thinking_enabled and pending_count < pending_tokens.len) {
-                    pending_tokens[pending_count] = prev_token;
-                    pending_count += 1;
-                }
-
                 // Check for explicit chat stops, reopened think blocks, and leaked prompt-analysis tails.
                 if (findStreamingStopStart(gen_text_buf[0..gen_text_len])) |stop_idx| {
                     gen_text_len = stop_idx;
@@ -1802,10 +2169,9 @@ fn handleChatCompletions(
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     gen_text_len = sent_text_len + cleaned_pending.len;
                     if (cleaned_pending.len > 0) {
-                        streamText(conn, cleaned_pending, req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                     sent_text_len = gen_text_len;
-                    pending_count = 0;
                     stopped = true;
                 }
                 if (stopped) break;
@@ -1830,19 +2196,24 @@ fn handleChatCompletions(
 
                 if (!is_partial) {
                     if (thinking_enabled) {
-                        // Safe to send all pending tokens
-                        for (pending_tokens[0..pending_count]) |tid| {
-                            streamToken(conn, tid, tokenizer, req_id, ts, model_name) catch return;
+                        // Stream the accumulated bytes since the last safe send,
+                        // trimmed to a UTF-8 codepoint boundary so partial multi-
+                        // byte chars (emojis, CJK) carry into the next iteration.
+                        const pending_slice = gen_text_buf[sent_text_len..gen_text_len];
+                        const safe_end_rel = lastCompleteUtf8End(pending_slice);
+                        if (safe_end_rel > 0) {
+                            streamTextViaDetector(conn, pending_slice[0..safe_end_rel], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                         }
-                        pending_count = 0;
+                        sent_text_len += safe_end_rel;
                     } else {
                         const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
-                        if (visible.len > sent_visible_len) {
-                            streamText(conn, visible[sent_visible_len..], req_id, ts, model_name) catch return;
-                            sent_visible_len = visible.len;
+                        const safe_visible = lastCompleteUtf8End(visible);
+                        if (safe_visible > sent_visible_len) {
+                            streamTextViaDetector(conn, visible[sent_visible_len..safe_visible], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
+                            sent_visible_len = safe_visible;
                         }
+                        sent_text_len = gen_text_len;
                     }
-                    sent_text_len = gen_text_len;
                 }
 
                 generated += 1;
@@ -1868,19 +2239,29 @@ fn handleChatCompletions(
                     const pending_text = gen_text_buf[sent_text_len..gen_text_len];
                     const cleaned_pending = trimTrailingChatArtifacts(pending_text);
                     if (cleaned_pending.len > 0) {
-                        streamText(conn, cleaned_pending, req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_pending, req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
                 } else {
                     const visible = stripThinkingForDisabledResponse(gen_text_buf[0..gen_text_len], &visible_buf) catch gen_text_buf[0..gen_text_len];
                     const cleaned_visible = trimTrailingChatArtifacts(visible);
                     if (cleaned_visible.len > sent_visible_len) {
-                        streamText(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name) catch return;
+                        streamTextViaDetector(conn, cleaned_visible[sent_visible_len..], req_id, ts, model_name, stream_detector, &any_tool_call_emitted, &tool_call_index, allocator, tools_active) catch return;
                     }
+                }
+            }
+            // Flush detector tail (bytes held while waiting for a potential tool call tag)
+            {
+                const tail = stream_detector.finalize();
+                if (tail.len > 0) {
+                    streamText(conn, tail, req_id, ts, model_name) catch return;
                 }
             }
         }
 
         // Final chunk with finish_reason
+        if (any_tool_call_emitted and finish_reason == .stop) {
+            finish_reason = .tool_calls;
+        }
         {
             var chunk_buf: [1024]u8 = undefined;
             const chunk = std.fmt.bufPrint(&chunk_buf,
@@ -1898,7 +2279,7 @@ fn handleChatCompletions(
         }
     } else {
         // Non-streaming: use same prefill+decode loop with stop detection
-        var text_buf: std.ArrayList(u8) = .{};
+        var text_buf: std.ArrayList(u8) = .empty;
         defer text_buf.deinit(allocator);
         var ns_gen: u32 = 0;
         const nsIsEog = struct {
@@ -1953,21 +2334,65 @@ fn handleChatCompletions(
             sanitizeThinkingOutput(prefixed_text, &sanitized_thinking_buf) catch prefixed_text
         else
             prefixed_text;
-        var escaped_buf: [16384]u8 = undefined;
-        const escaped_text = jsonEscape(response_text, &escaped_buf);
 
-        var resp_buf: [32768]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf,
-            \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{
-            req_id,       ts,                         model_name,
-            escaped_text, @tagName(finish_reason),    prompt_tokens.len,
-            ns_gen,       prompt_tokens.len + ns_gen,
-        }) catch {
-            try conn.sendError(500, "internal_error", "Response too large");
-            return;
+        // Parse tool calls from the response text — only when the request
+        // actually carried tools (and tool calling is enabled). Skipping for
+        // tool-less requests avoids spending a parser pass on every chat
+        // completion and keeps the path identical to mainline pre-merge.
+        const tool_fmt = tool_format.forTemplate(tokenizer.detectTemplateKind());
+        const parsed_output = if (parsed.tools.len > 0)
+            try tool_fmt.parseAssistantToolCalls(response_text, allocator)
+        else
+            tool_format.ParsedAssistantOutput{ .text_content = "", .tool_calls = &.{} };
+        defer if (parsed.tools.len > 0) {
+            for (parsed_output.tool_calls) |c| {
+                allocator.free(c.id);
+                allocator.free(c.name);
+                allocator.free(c.arguments_json);
+            }
+            allocator.free(parsed_output.tool_calls);
+            allocator.free(parsed_output.text_content);
         };
-        try conn.sendJson(200, resp);
+
+        if (parsed_output.tool_calls.len > 0 and finish_reason == .stop) {
+            finish_reason = .tool_calls;
+        }
+
+        if (parsed_output.tool_calls.len > 0) {
+            // Emit response with tool_calls, content null
+            var wb: std.ArrayList(u8) = .empty;
+            defer wb.deinit(allocator);
+            try wb.print(allocator, 
+                \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":[
+            , .{ req_id, ts, model_name });
+            for (parsed_output.tool_calls, 0..) |tc, ti| {
+                if (ti > 0) try wb.appendSlice(allocator, ",");
+                var args_esc_buf: [16384]u8 = undefined;
+                const args_esc = jsonEscape(tc.arguments_json, &args_esc_buf);
+                try wb.print(allocator, 
+                    \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
+                , .{ tc.id, tc.name, args_esc });
+            }
+            try wb.print(allocator, 
+                \\]}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{ @tagName(finish_reason), prompt_tokens.len, ns_gen, prompt_tokens.len + ns_gen });
+            try conn.sendJson(200, wb.items);
+        } else {
+            var escaped_buf: [16384]u8 = undefined;
+            const escaped_text = jsonEscape(response_text, &escaped_buf);
+            var resp_fixed_buf: [32768]u8 = undefined;
+            const resp = std.fmt.bufPrint(&resp_fixed_buf,
+                \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+            , .{
+                req_id,       ts,                         model_name,
+                escaped_text, @tagName(finish_reason),    prompt_tokens.len,
+                ns_gen,       prompt_tokens.len + ns_gen,
+            }) catch {
+                try conn.sendError(500, "internal_error", "Response too large");
+                return;
+            };
+            try conn.sendJson(200, resp);
+        }
         if (cacheable_session) {
             var transport_buf: [32768]u8 = undefined;
             const transport_text = historyAssistantContent(tokenizer, response_text, &transport_buf) catch response_text;
@@ -1998,6 +2423,7 @@ fn handleCompletions(
 
     var generation_guard = GenerationGuard.acquire(server_state);
     defer generation_guard.release();
+    if (!try ensureRequestedModelActive(conn, manager, server_state, parsed.model_id)) return;
     const resources = manager.currentResources() orelse {
         try conn.sendError(503, "service_unavailable", "No model is currently loaded");
         return;
@@ -2038,8 +2464,8 @@ fn handleCompletions(
         });
     }
 
-    const ts = @divTrunc(std.time.timestamp(), 1);
-    const seed_ns: i128 = std.time.nanoTimestamp();
+    const ts = @divTrunc(unixTimestamp(), 1);
+    const seed_ns: i128 = nanoTimestamp();
     var req_id_buf: [32]u8 = undefined;
     const req_id = std.fmt.bufPrint(&req_id_buf, "cmpl-{x}", .{@as(u64, @truncate(@as(u128, @bitCast(seed_ns))))}) catch "cmpl-0";
 
@@ -2049,7 +2475,7 @@ fn handleCompletions(
     };
     defer allocator.free(output_tokens);
 
-    var text_buf: std.ArrayList(u8) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(allocator);
     var decode_buf: [512]u8 = undefined;
     for (output_tokens) |tid| {
@@ -2274,7 +2700,7 @@ fn parseRequestBody(body: []const u8, allocator: std.mem.Allocator) !ParsedReque
 fn decodeJsonText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     if (input.len == 0) return &[_]u8{};
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var i: usize = 0;
@@ -2430,21 +2856,6 @@ fn jsonEscape(input: []const u8, buf: []u8) []const u8 {
     return buf[0..out];
 }
 
-/// Send a single token as an SSE ChatCompletionChunk event.
-fn streamToken(
-    conn: *http.Connection,
-    token_id: u32,
-    tokenizer: *const tokenizer_mod.Tokenizer,
-    req_id: []const u8,
-    ts: i64,
-    model_name: []const u8,
-) !void {
-    // Decode GPT-2 byte encoding to real UTF-8
-    var decode_buf: [256]u8 = undefined;
-    const token_text = tokenizer.decodeToken(token_id, &decode_buf);
-    try streamText(conn, token_text, req_id, ts, model_name);
-}
-
 fn streamText(
     conn: *http.Connection,
     text: []const u8,
@@ -2461,14 +2872,92 @@ fn streamText(
     try conn.writeSseEvent(chunk);
 }
 
+/// Send content text through the streaming detector.
+/// Returns whether we should stop streaming (peer closed, etc.).
+fn streamTextViaDetector(
+    conn: *http.Connection,
+    text: []const u8,
+    req_id: []const u8,
+    ts: i64,
+    model_name: []const u8,
+    detector: *tool_format.StreamingDetector,
+    any_tool_call_emitted: *bool,
+    tool_call_index: *u32,
+    allocator: std.mem.Allocator,
+    tools_active: bool,
+) !void {
+    // When the request didn't carry tools (or tool calling is disabled),
+    // bypass the detector and stream bytes directly. This avoids the
+    // detector's hold-on-'<' buffering, restoring mainline streaming
+    // latency for the common no-tools path.
+    if (!tools_active) return streamText(conn, text, req_id, ts, model_name);
+
+    const fr = try detector.feed(text);
+    switch (fr) {
+        .emit_as_content => {
+            const c = detector.takeContentDelta();
+            if (c.len > 0) try streamText(conn, c, req_id, ts, model_name);
+        },
+        .hold => {},
+        .tool_call_complete => {
+            const c = detector.takeContentDelta();
+            if (c.len > 0) try streamText(conn, c, req_id, ts, model_name);
+            while (detector.takePendingToolCall()) |tc| {
+                defer {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments_json);
+                }
+                const ev = try formatStreamingToolCallChunk(allocator, req_id, ts, model_name, tool_call_index.*, tc.id, tc.name, tc.arguments_json);
+                defer allocator.free(ev);
+                try conn.writeSseEvent(ev);
+                any_tool_call_emitted.* = true;
+                tool_call_index.* += 1;
+            }
+        },
+    }
+}
+
+fn formatStreamingToolCallChunk(
+    allocator: std.mem.Allocator,
+    req_id: []const u8,
+    ts: i64,
+    model_name: []const u8,
+    tool_call_index: u32,
+    id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    var wb: std.ArrayList(u8) = .empty;
+    errdefer wb.deinit(allocator);
+
+    try wb.print(allocator, 
+        \\{{"id":"{s}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"
+    , .{ req_id, ts, model_name, tool_call_index, id, name });
+
+    for (arguments_json) |c| {
+        switch (c) {
+            '"' => try wb.appendSlice(allocator, "\\\""),
+            '\\' => try wb.appendSlice(allocator, "\\\\"),
+            '\n' => try wb.appendSlice(allocator, "\\n"),
+            '\r' => try wb.appendSlice(allocator, "\\r"),
+            '\t' => try wb.appendSlice(allocator, "\\t"),
+            else => try wb.append(allocator, c),
+        }
+    }
+
+    try wb.appendSlice(allocator, "\"}}]},\"finish_reason\":null}]}");
+    return wb.toOwnedSlice(allocator);
+}
+
 // ── Built-in Chat UI ─────────────────────────────────────────
 
 fn serveChatUi(conn: *http.Connection) !void {
     const html = @embedFile("chat.html");
     var buf: [256]u8 = undefined;
     const header = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{html.len}) catch return error.HeaderTooLarge;
-    try conn.stream.writeAll(header);
-    try conn.stream.writeAll(html);
+    try conn.streamWriteAll(header);
+    try conn.streamWriteAll(html);
 }
 
 fn fallbackModelName(model: *const Model) []const u8 {
@@ -2574,9 +3063,9 @@ test "shouldForceDisableThinking keeps qwen thinking enabled" {
         "Qwen3.6-35B-A3B-UD-Q4_K_XL",
     ));
     try std.testing.expect(!shouldForceDisableThinking(
-        "qwen3-8b-q4k-m",
-        "/Users/test/Library/Caches/zinc/models/models/qwen3-8b-q4k-m/model.gguf",
-        "Qwen3-8B-Q4_K_M",
+        "qwen35-9b-q4k-m",
+        "/Users/test/Library/Caches/zinc/models/models/qwen35-9b-q4k-m/model.gguf",
+        "Qwen3.5-9B-Q4_K_M",
     ));
 }
 
@@ -2646,6 +3135,59 @@ test "jsonEscape plain ASCII passthrough" {
     try std.testing.expectEqualStrings("Hello, World! 123", result);
 }
 
+test "lastCompleteUtf8End passes complete ASCII" {
+    try std.testing.expectEqual(@as(usize, 5), lastCompleteUtf8End("hello"));
+}
+
+test "lastCompleteUtf8End passes complete multi-byte char" {
+    // ⭐ U+2B50 = 0xE2 0xAD 0x90 (3 bytes), preceded by ASCII
+    const s = "hi \xE2\xAD\x90";
+    try std.testing.expectEqual(s.len, lastCompleteUtf8End(s));
+}
+
+test "lastCompleteUtf8End trims partial 4-byte emoji" {
+    // 🔧 U+1F527 = 0xF0 0x9F 0x94 0xA7. Cut at each prefix length 1..3 — should
+    // trim back to before the lead byte. Full sequence passes through.
+    const full = "abc\xF0\x9F\x94\xA7";
+    try std.testing.expectEqual(full.len, lastCompleteUtf8End(full));
+    try std.testing.expectEqual(@as(usize, 3), lastCompleteUtf8End(full[0..4])); // F0
+    try std.testing.expectEqual(@as(usize, 3), lastCompleteUtf8End(full[0..5])); // F0 9F
+    try std.testing.expectEqual(@as(usize, 3), lastCompleteUtf8End(full[0..6])); // F0 9F 94
+}
+
+test "lastCompleteUtf8End trims partial 3-byte sequence" {
+    // ⭐ split mid-codepoint
+    const full = "ok \xE2\xAD\x90";
+    try std.testing.expectEqual(@as(usize, 3), lastCompleteUtf8End(full[0..4])); // E2
+    try std.testing.expectEqual(@as(usize, 3), lastCompleteUtf8End(full[0..5])); // E2 AD
+    try std.testing.expectEqual(full.len, lastCompleteUtf8End(full));
+}
+
+test "lastCompleteUtf8End empty input" {
+    try std.testing.expectEqual(@as(usize, 0), lastCompleteUtf8End(""));
+}
+
+test "lastCompleteUtf8End streams emoji byte-by-byte without dropping bytes" {
+    // Simulate the streaming server's flush boundary: a 4-byte emoji arrives
+    // one byte at a time; each call must hold back the partial bytes until
+    // the next chunk completes the codepoint. Concatenating the emitted
+    // chunks must reproduce the original bytes exactly.
+    const full = "x\xF0\x9F\x94\xA7y";
+    var emitted: std.ArrayList(u8) = .empty;
+    defer emitted.deinit(std.testing.allocator);
+
+    var sent: usize = 0;
+    var len: usize = 0;
+    while (len <= full.len) : (len += 1) {
+        const safe = lastCompleteUtf8End(full[0..len]);
+        if (safe > sent) {
+            try emitted.appendSlice(std.testing.allocator, full[sent..safe]);
+            sent = safe;
+        }
+    }
+    try std.testing.expectEqualSlices(u8, full, emitted.items);
+}
+
 test "findStringEnd no closing quote returns null" {
     try std.testing.expectEqual(@as(?usize, null), findStringEnd("no close"));
 }
@@ -2661,7 +3203,7 @@ test "buildChatPrompt uses tokenizer chat template helper" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>system\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not output labels like 'Thinking Process:'") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
@@ -2848,7 +3390,7 @@ test "buildChatPrompt uses qwen no-thinking generation suffix when template requ
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, null, false, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }
@@ -2869,10 +3411,143 @@ test "buildChatPrompt enables thinking when requested" {
     const roles = [_][]const u8{"user"};
     const contents = [_][]const u8{"hello"};
     var buf: [512]u8 = undefined;
-    const prompt = try buildChatPrompt(&tok, &roles, &contents, true, false, &buf);
+    const prompt = try buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, true, false, &.{}, .auto, &buf);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|im_start|>user\nhello<|im_end|>\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n<think>\n"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "</think>") == null);
+}
+
+test "buildChatPrompt succeeds for large Goose-style tool prompts" {
+    var tok = makeTestTokenizer(null);
+    defer tok.token_to_id.deinit();
+
+    const roles = [_][]const u8{
+        "system",
+        "user",
+    };
+    const contents = [_][]const u8{
+        "You are a general-purpose AI agent called goose, created by AAIF (Agentic AI Foundation).\n" ++
+            "goose is being developed as an open-source software project.\n\n" ++
+            "# Extensions\n\n" ++
+            "Extensions provide additional tools and context from different data sources and applications.\n" ++
+            "You can dynamically enable or disable extensions as needed to help complete tasks.\n\n" ++
+            "Because you dynamically load extensions, your conversation history may refer\n" ++
+            "to interactions with extensions that are not currently active. The currently\n" ++
+            "active extensions are below. Each of these extensions provides tools that are\n" ++
+            "in your tool specification.\n\n" ++
+            "## developer\n\n" ++
+            "### Instructions\n" ++
+            "Use the developer extension to build software and operate a terminal.\n\n" ++
+            "Make sure to use the tools efficiently and minimize unnecessary turns.\n",
+        "hello",
+    };
+
+    const tools = [_]tool_format.ToolDefinition{
+        .{
+            .name = "analyze",
+            .description = "Analyze code structure in 3 modes.",
+            .parameters_json =
+            \\{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"AnalyzeParams","type":"object","properties":{"path":{"description":"File or directory path to analyze","type":"string"},"focus":{"description":"Symbol name to focus on","type":["string","null"],"default":null},"max_depth":{"description":"Directory recursion depth limit","type":"integer","minimum":0,"default":3},"follow_depth":{"description":"Call graph traversal depth","type":"integer","minimum":0,"default":2},"force":{"description":"Allow large outputs without size warning","type":"boolean","default":false}},"required":["path"]}
+            ,
+        },
+        .{
+            .name = "delegate",
+            .description = "Delegate a task to a subagent that runs independently with its own context.",
+            .parameters_json =
+            \\{"type":"object","properties":{"instructions":{"type":"string"},"source":{"type":"string"},"parameters":{"type":"object","additionalProperties":true},"extensions":{"type":"array","items":{"type":"string"}},"provider":{"type":"string"},"model":{"type":"string"},"temperature":{"type":"number"},"max_turns":{"type":"integer","minimum":1},"async":{"type":"boolean","default":false}},"required":[]}
+            ,
+        },
+        .{
+            .name = "shell",
+            .description = "Execute a shell command in the current dir.",
+            .parameters_json =
+            \\{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"ShellParams","type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":["integer","null"],"minimum":0,"default":null}},"required":["command"]}
+            ,
+        },
+    };
+
+    const estimated = estimateChatPromptBytes(&roles, &contents, false, &tools);
+    const prompt_buf = try std.testing.allocator.alloc(u8, estimated);
+    defer std.testing.allocator.free(prompt_buf);
+
+    const prompt = buildChatPrompt(std.testing.allocator, &tok, &roles, &contents, null, false, &tools, .auto, prompt_buf) catch |err| {
+        if (err == error.BufferTooSmall) {
+            std.debug.print("estimated={d}\n", .{estimated});
+        }
+        return err;
+    };
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<tools>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "delegate") != null);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "<|im_start|>assistant\n"));
+}
+
+test "formatStreamingToolCallChunk handles large arguments payloads" {
+    var big_args: [24000]u8 = undefined;
+    @memset(&big_args, 'a');
+
+    const prefix = "{\"path\":\"";
+    const suffix = "\"}";
+    var args: std.ArrayList(u8) = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.appendSlice(std.testing.allocator, prefix);
+    try args.appendSlice(std.testing.allocator, &big_args);
+    try args.appendSlice(std.testing.allocator, suffix);
+
+    const chunk = try formatStreamingToolCallChunk(
+        std.testing.allocator,
+        "chatcmpl-test",
+        123,
+        "qwen36-35b-a3b-q4k-xl",
+        0,
+        "call_0",
+        "shell",
+        args.items,
+    );
+    defer std.testing.allocator.free(chunk);
+
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"name\":\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunk, "\"arguments\":\"{\\\"path\\\":\\\"") != null);
+    try std.testing.expect(chunk.len > 24000);
+}
+
+test "formatStreamingToolCallChunk emits valid JSON" {
+    const chunk = try formatStreamingToolCallChunk(
+        std.testing.allocator,
+        "chatcmpl-test",
+        123,
+        "Qwen3.6-35B-A3B",
+        0,
+        "call_0",
+        "tree",
+        "{\"path\":\"/home/f44/dev/stuff/pwmedia\",\"depth\":3}",
+    );
+    defer std.testing.allocator.free(chunk);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, chunk, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    const choices = parsed.value.object.get("choices") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(choices == .array);
+    try std.testing.expectEqual(@as(usize, 1), choices.array.items.len);
+
+    const choice0 = choices.array.items[0];
+    try std.testing.expect(choice0 == .object);
+    const delta = choice0.object.get("delta") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(delta == .object);
+    const tool_calls = delta.object.get("tool_calls") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tool_calls == .array);
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.array.items.len);
+
+    const tool0 = tool_calls.array.items[0];
+    try std.testing.expect(tool0 == .object);
+    const function = tool0.object.get("function") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(function == .object);
+    const arguments = function.object.get("arguments") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(arguments == .string);
+    try std.testing.expectEqualStrings("{\"path\":\"/home/f44/dev/stuff/pwmedia\",\"depth\":3}", arguments.string);
 }
 
 test "parseChatRequest preserves full message history" {
@@ -2921,9 +3596,9 @@ test "parseChatRequest defaults to greedy temperature when omitted" {
 
 test "countValidChatMessages ignores empty entries" {
     const messages = [_]ChatMessage{
-        .{ .role = "", .content = "ignored" },
-        .{ .role = "user", .content = "" },
-        .{ .role = "user", .content = "hello" },
+        .{ .role = "", .content = .{ .text = "ignored" } },
+        .{ .role = "user", .content = .{ .text = "" } },
+        .{ .role = "user", .content = .{ .text = "hello" } },
     };
     try std.testing.expectEqual(@as(usize, 1), countValidChatMessages(&messages));
 }
@@ -2936,6 +3611,185 @@ test "parseChatRequest leaves empty message array empty before validation" {
     try std.testing.expectEqual(@as(usize, 0), countValidChatMessages(parsed.parsed.value.messages));
     try std.testing.expectEqual(@as(usize, 1), parsed.roles.len);
     try std.testing.expectEqualStrings("system", parsed.roles[0]);
+}
+
+test "parseChatRequest accepts content as a single text block array (OpenAI multimodal shape)" {
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"hello world"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // system prompt + user message
+    try std.testing.expectEqual(@as(usize, 2), parsed.roles.len);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("hello world", parsed.contents[1]);
+}
+
+test "parseChatRequest concatenates multiple text blocks in order" {
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"text","text":"first "},{"type":"text","text":"second"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("first second", parsed.contents[1]);
+}
+
+test "parseChatRequest skips non-text blocks without failing" {
+    // image_url and unknown block types should be silently dropped, not error.
+    const body =
+        \\{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x"}},{"type":"text","text":"caption"}]}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("caption", parsed.contents[1]);
+}
+
+test "parseChatRequest accepts null content (assistant tool-call message)" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
+    // Assistant turn with content: null and tool_calls is preserved in history
+    // — the model needs to see the previous tool invocations rendered as
+    // <tool_call> blocks so subsequent tool_results have context. Pre-tool-
+    // calling the assistant turn used to be skipped here; now it's rendered.
+    const body =
+        \\{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"user","content":"follow up"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // system + user + assistant(rendered tool_calls) + user
+    try std.testing.expectEqual(@as(usize, 4), parsed.roles.len);
+    try std.testing.expectEqualStrings("system", parsed.roles[0]);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("q", parsed.contents[1]);
+    try std.testing.expectEqualStrings("assistant", parsed.roles[2]);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.contents[2], "\"name\": \"f\"") != null);
+    try std.testing.expectEqualStrings("user", parsed.roles[3]);
+    try std.testing.expectEqualStrings("follow up", parsed.contents[3]);
+}
+
+test "parseChatRequest parses tools and tool_choice" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"what time is it?"}],"tools":[{"type":"function","function":{"name":"get_time","description":"Get current time","parameters":{"type":"object"}}}],"tool_choice":"auto"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.tools.len);
+    try std.testing.expectEqualStrings("get_time", parsed.tools[0].name);
+    try std.testing.expectEqualStrings("Get current time", parsed.tools[0].description);
+    try std.testing.expectEqual(ToolChoice.auto, parsed.tool_choice);
+}
+
+test "parseChatRequest tool_choice none suppresses tools" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"fn1","description":"d","parameters":null}}],"tool_choice":"none"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(ToolChoice.none, parsed.tool_choice);
+    // tools array is still populated; callers use tool_choice to decide whether to render them
+    try std.testing.expectEqual(@as(usize, 1), parsed.tools.len);
+}
+
+test "parseChatRequest replays assistant tool_calls as tool_call blocks" {
+    setToolCallingForTest(true);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"call it"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_time","arguments":"{}"}}]},{"role":"tool","content":"12:00","tool_call_id":"c1"},{"role":"user","content":"thanks"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+
+    // Expect: system + user + assistant(tool_call) + tool + user = 5 messages
+    // (default system is prepended since no system message)
+    var found_tool_call_block = false;
+    for (parsed.contents) |c| {
+        if (std.mem.indexOf(u8, c, "<tool_call>") != null) {
+            found_tool_call_block = true;
+            try std.testing.expect(std.mem.indexOf(u8, c, "get_time") != null);
+        }
+    }
+    try std.testing.expect(found_tool_call_block);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Gate-off regression tests for ZINC_TOOL_CALLING.
+//
+// These tests pin the "default behavior is mainline-identical when
+// ZINC_TOOL_CALLING is unset" guarantee. If someone refactors the
+// gate and accidentally enables tool-calling unconditionally — or
+// disables it when it should be on — these will catch it.
+// ──────────────────────────────────────────────────────────────────
+
+test "parseChatRequest with gate off ignores request tools field" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"go"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":null}}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.tools.len);
+}
+
+test "parseChatRequest with gate off skips assistant turn that has only tool_calls" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    // Same body as the gate-on null-content test, but the assistant turn
+    // must be dropped instead of rendered, so we expect 3 roles not 4.
+    const body =
+        \\{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"user","content":"hi"}]}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.roles.len);
+    try std.testing.expectEqualStrings("system", parsed.roles[0]);
+    try std.testing.expectEqualStrings("user", parsed.roles[1]);
+    try std.testing.expectEqualStrings("user", parsed.roles[2]);
+}
+
+test "parseChatRequest with gate off forces tool_choice to auto" {
+    setToolCallingForTest(false);
+    defer resetToolCallingForTest();
+    const body =
+        \\{"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":null}}],"tool_choice":"none"}
+    ;
+    var parsed = try parseChatRequest(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(ToolChoice.auto, parsed.tool_choice);
+    try std.testing.expectEqual(@as(usize, 0), parsed.tools.len);
+}
+
+test "toolCallingEnabled cache state machine" {
+    const prev = tool_calling_state.load(.acquire);
+    defer tool_calling_state.store(prev, .release);
+
+    // Forced-on cache → returns true, cache unchanged.
+    tool_calling_state.store(1, .release);
+    try std.testing.expect(toolCallingEnabled());
+    try std.testing.expectEqual(@as(i8, 1), tool_calling_state.load(.acquire));
+
+    // Forced-off cache → returns false, cache unchanged.
+    tool_calling_state.store(0, .release);
+    try std.testing.expect(!toolCallingEnabled());
+    try std.testing.expectEqual(@as(i8, 0), tool_calling_state.load(.acquire));
+
+    // Uncached → probes env, then caches the result. We don't control the
+    // env here, but the post-call cache must be 0 or 1 (no longer -1).
+    tool_calling_state.store(-1, .release);
+    _ = toolCallingEnabled();
+    try std.testing.expect(tool_calling_state.load(.acquire) >= 0);
 }
 
 test "prefixThinkingEnvelope adds think prefix when enabled" {
@@ -3141,7 +3995,7 @@ test "ServerState snapshot tracks active queued and uptime" {
 }
 
 test "buildHealthJson includes request counts and uptime" {
-    var state = ServerState.init(std.time.timestamp() - 5);
+    var state = ServerState.init(unixTimestamp() - 5);
     _ = state.active_requests.fetchAdd(1, .monotonic);
     _ = state.queued_requests.fetchAdd(1, .monotonic);
     state.setActiveContextTokens(1024);

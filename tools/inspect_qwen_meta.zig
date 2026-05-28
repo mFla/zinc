@@ -1,11 +1,11 @@
 const std = @import("std");
-const gguf = @import("src/model/gguf.zig");
+const gguf = @import("gguf");
 
 fn printValue(key: []const u8, v: anytype) void {
     std.debug.print("{s}=", .{key});
     switch (v) {
         .string => |s| std.debug.print("string:{s}\n", .{s}),
-        .bool => |b| std.debug.print("bool:{}\n", .{b}),
+        .bool_ => |b| std.debug.print("bool:{}\n", .{b}),
         .uint8 => |u| std.debug.print("u8:{}\n", .{u}),
         .uint16 => |u| std.debug.print("u16:{}\n", .{u}),
         .uint32 => |u| std.debug.print("u32:{}\n", .{u}),
@@ -24,10 +24,11 @@ fn printValue(key: []const u8, v: anytype) void {
                     std.debug.print("{}", .{u});
                 } else if (item.asF32()) |f| {
                     std.debug.print("{d}", .{f});
-                } else if (item.asBool()) |b| {
-                    std.debug.print("{}", .{b});
-                } else {
-                    std.debug.print("?", .{});
+                } else switch (item) {
+                    .bool_ => |b| std.debug.print("{}", .{b}),
+                    else => {
+                        std.debug.print("?", .{});
+                    },
                 }
             }
             if (arr.len > 0) std.debug.print("]", .{});
@@ -91,6 +92,16 @@ pub fn main() !void {
         "qwen35.ssm.state_size",
         "qwen35.ssm.time_step_rank",
         "qwen35.ssm.group_count",
+        "qwen3_5.block_count",
+        "qwen3_5.full_attention_interval",
+        "qwen3_5.attention.head_count",
+        "qwen3_5.attention.head_count_kv",
+        "qwen3_5.attention.key_length",
+        "qwen3_5.rope.freq_base",
+        "qwen3_5.rope.dimension_count",
+        "qwen3_5.ssm.conv_kernel",
+        "qwen3_5.ssm.inner_size",
+        "qwen3_5.ssm.state_size",
         "qwen3.block_count",
         "qwen3.attention.head_count",
         "qwen3.attention.head_count_kv",

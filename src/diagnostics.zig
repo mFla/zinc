@@ -4,6 +4,12 @@
 //! preflight report on stdout.
 //! @section Hardware Detection
 const std = @import("std");
+
+fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 const builtin = @import("builtin");
 const gguf = @import("model/gguf.zig");
 const memory_plan = @import("gpu/memory_plan.zig");
@@ -46,16 +52,20 @@ pub const ManagedModelInfo = struct {
     status_label: []const u8,
 };
 
+fn getenv(name: [*:0]const u8) ?[:0]const u8 {
+    return if (std.c.getenv(name)) |p| std.mem.span(p) else null;
+}
+
 const Styles = struct {
     enabled: bool,
 
-    fn detect(stdout_file: std.fs.File) Styles {
-        const no_color = std.posix.getenv("NO_COLOR") != null;
+    fn detect(io: std.Io, stdout_file: std.Io.File) Styles {
+        const no_color = getenv("NO_COLOR") != null;
         const force_color =
-            isTruthy(std.posix.getenv("FORCE_COLOR")) or
-            isTruthy(std.posix.getenv("CLICOLOR_FORCE"));
+            isTruthy(getenv("FORCE_COLOR")) or
+            isTruthy(getenv("CLICOLOR_FORCE"));
         return .{
-            .enabled = shouldUseColor(stdout_file.isTty(), std.posix.getenv("TERM"), no_color, force_color),
+            .enabled = shouldUseColor(stdout_file.isTty(io) catch false, getenv("TERM"), no_color, force_color),
         };
     }
 
@@ -188,66 +198,67 @@ const required_shader_files = [_][]const u8{
 };
 
 /// Run system diagnostics and output a readable preflight report to stdout.
-pub fn run(opts: Options, allocator: std.mem.Allocator) !void {
-    const stdout_file = std.fs.File.stdout();
+pub fn run(io: std.Io, opts: Options, allocator: std.mem.Allocator) !void {
+    const stdout_file = std.Io.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writerStreaming(&stdout_buffer);
+    var stdout_writer = stdout_file.writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    const styles = Styles.detect(stdout_file);
+    const styles = Styles.detect(io, stdout_file);
     var summary = Summary{};
 
     try stdout.print("\n=== ZINC System Diagnostics ===\n", .{});
     try stdout.flush();
 
-    const step1_start = std.time.nanoTimestamp();
+    const step1_start = nanoTimestamp();
     try printStepHeader(stdout, styles, 1, 5, "Host Environment");
     const os_status: CheckStatus = if (builtin.os.tag == .linux) .ok else .warn;
     try printStatusLine(stdout, styles, &summary, os_status, "OS", "{s}", .{@tagName(builtin.os.tag)});
-    try printRadvPerftest(stdout, styles, &summary);
     try printStepDuration(stdout, styles, step1_start);
 
-    const step2_start = std.time.nanoTimestamp();
-    try printStepHeader(stdout, styles, 2, 5, "Linux AMD Prerequisites");
-    if (builtin.os.tag == .linux) {
-        try printCheckingLine(stdout, styles, "Mesa Vulkan driver package");
-        try printMesa(stdout, styles, &summary, allocator);
-        try printCheckingLine(stdout, styles, "GECC / RAS status");
-        try printGecc(stdout, styles, &summary, allocator);
-    } else {
-        try printStatusLine(stdout, styles, &summary, .skip, "Mesa", "Linux-only check", .{});
-        try printStatusLine(stdout, styles, &summary, .skip, "GECC (RAS)", "Linux-only check", .{});
+    var vulkan_probe: ?VulkanProbe = null;
+    var vulkan_probe_err: ?anyerror = null;
+    if (probeVulkan(allocator, opts.device_index)) |probe| {
+        vulkan_probe = probe;
+    } else |err| {
+        vulkan_probe_err = err;
     }
+    defer {
+        if (vulkan_probe) |*probe| probe.deinit();
+    }
+
+    const step2_start = nanoTimestamp();
+    const driver_vendor: ?gpu_detect.GpuVendor = if (vulkan_probe) |*probe| probe.gpu_config.vendor else null;
+    try printStepHeader(stdout, styles, 2, 5, driverStepTitle(driver_vendor));
+    try printLinuxDriverChecks(io, stdout, styles, &summary, allocator, if (vulkan_probe) |*probe| probe else null);
     try printStepDuration(stdout, styles, step2_start);
 
-    const step3_start = std.time.nanoTimestamp();
+    const step3_start = nanoTimestamp();
     try printStepHeader(stdout, styles, 3, 5, "Runtime Assets");
     try printCheckingLine(stdout, styles, "compiled shader assets");
-    try printShaderAssets(stdout, styles, &summary, opts.shader_dir);
+    try printShaderAssets(io, stdout, styles, &summary, opts.shader_dir);
     try printStepDuration(stdout, styles, step3_start);
 
-    const step4_start = std.time.nanoTimestamp();
+    const step4_start = nanoTimestamp();
     try printStepHeader(stdout, styles, 4, 5, "Vulkan Device");
     try printCheckingLine(stdout, styles, "Vulkan loader, device enumeration, and logical device init");
     var vram_budget_bytes: ?u64 = null;
-    if (probeVulkan(allocator, opts.device_index)) |vulkan_probe_value| {
-        var vulkan_probe = vulkan_probe_value;
-        defer vulkan_probe.deinit();
-        vram_budget_bytes = vulkan_probe.instance.vramBytes();
-        try printVulkanProbe(stdout, styles, &summary, &vulkan_probe);
-    } else |err| {
+    if (vulkan_probe) |*probe| {
+        vram_budget_bytes = probe.instance.vramBytes();
+        try printVulkanProbe(stdout, styles, &summary, probe);
+    } else if (vulkan_probe_err) |err| {
         const status: CheckStatus = if (builtin.os.tag == .linux) .fail else .warn;
         try printStatusLine(stdout, styles, &summary, status, "Vulkan", "Initialization failed: {s}", .{@errorName(err)});
     }
     try printStepDuration(stdout, styles, step4_start);
 
-    const step5_start = std.time.nanoTimestamp();
+    const step5_start = nanoTimestamp();
     try printStepHeader(stdout, styles, 5, 5, "Model File");
     if (opts.managed_model != null) {
         try printCheckingLine(stdout, styles, "managed model compatibility");
     } else if (opts.model_path != null) {
         try printCheckingLine(stdout, styles, "GGUF model header");
     }
-    try printModelCheck(stdout, styles, &summary, opts.model_path, opts.managed_model, vram_budget_bytes, opts.requested_context_length, allocator);
+    try printModelCheck(io, stdout, styles, &summary, opts.model_path, opts.managed_model, vram_budget_bytes, opts.requested_context_length, allocator);
     try printStepDuration(stdout, styles, step5_start);
 
     try printSummary(stdout, summary);
@@ -296,7 +307,7 @@ fn printDetailLine(writer: anytype, label: []const u8, comptime value_fmt: []con
 }
 
 fn printStepDuration(writer: anytype, styles: Styles, start_ns: i128) !void {
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = nanoTimestamp() - start_ns;
     try printStyled(writer, styles, "2", "  Step time: ", .{});
     try printDurationValue(writer, elapsed_ns);
     try writer.print("\n", .{});
@@ -337,8 +348,87 @@ fn printDurationValue(writer: anytype, elapsed_ns: i128) !void {
     }
 }
 
+fn driverStepTitle(vendor: ?gpu_detect.GpuVendor) []const u8 {
+    const actual = vendor orelse return "Linux GPU Driver Checks";
+    if (isAmdVendor(actual)) return "Linux AMD Driver Checks";
+    if (isIntelVendor(actual)) return "Linux Intel Driver Checks";
+    return "Linux GPU Driver Checks";
+}
+
+fn printLinuxDriverChecks(
+    io: std.Io,
+    writer: anytype,
+    styles: Styles,
+    summary: *Summary,
+    allocator: std.mem.Allocator,
+    probe: ?*const VulkanProbe,
+) !void {
+    if (builtin.os.tag != .linux) {
+        try printStatusLine(writer, styles, summary, .skip, "GPU driver", "Linux-only check", .{});
+        try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "Linux-only check", .{});
+        try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "Linux-only check", .{});
+        return;
+    }
+
+    const actual = probe orelse {
+        try printStatusLine(writer, styles, summary, .skip, "GPU driver", "Skipped until Vulkan device probe completes", .{});
+        return;
+    };
+
+    if (isAmdVendor(actual.gpu_config.vendor)) {
+        try printCheckingLine(writer, styles, "Mesa Vulkan driver package");
+        try printMesa(io, writer, styles, summary, allocator);
+        try printCheckingLine(writer, styles, "RADV cooperative-matrix flag");
+        try printRadvPerftest(writer, styles, summary);
+        try printCheckingLine(writer, styles, "GECC / RAS status");
+        try printGecc(io, writer, styles, summary, allocator);
+        return;
+    }
+
+    if (isIntelVendor(actual.gpu_config.vendor)) {
+        try printStatusLine(
+            writer,
+            styles,
+            summary,
+            .ok,
+            "Intel Vulkan",
+            "ANV-compatible device detected ({s})",
+            .{actual.gpu_config.nameSlice()},
+        );
+        try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "AMD RADV-only tuning flag", .{});
+        try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "AMD-only reliability check", .{});
+        return;
+    }
+
+    try printStatusLine(
+        writer,
+        styles,
+        summary,
+        .ok,
+        "Vulkan driver",
+        "Device detected ({s})",
+        .{actual.gpu_config.nameSlice()},
+    );
+    try printStatusLine(writer, styles, summary, .skip, "RADV_PERFTEST", "AMD RADV-only tuning flag", .{});
+    try printStatusLine(writer, styles, summary, .skip, "GECC (RAS)", "AMD-only reliability check", .{});
+}
+
+fn isAmdVendor(vendor: gpu_detect.GpuVendor) bool {
+    return switch (vendor) {
+        .amd_rdna3, .amd_rdna4, .amd_rdna4_apu, .amd_other => true,
+        else => false,
+    };
+}
+
+fn isIntelVendor(vendor: gpu_detect.GpuVendor) bool {
+    return switch (vendor) {
+        .intel_arc, .intel_arc_xe2 => true,
+        else => false,
+    };
+}
+
 fn printRadvPerftest(writer: anytype, styles: Styles, summary: *Summary) !void {
-    if (std.posix.getenv("RADV_PERFTEST")) |val| {
+    if (getenv("RADV_PERFTEST")) |val| {
         if (std.mem.indexOf(u8, val, "coop_matrix") != null) {
             try printStatusLine(writer, styles, summary, .ok, "RADV_PERFTEST", "{s}", .{val});
         } else {
@@ -349,8 +439,8 @@ fn printRadvPerftest(writer: anytype, styles: Styles, summary: *Summary) !void {
     }
 }
 
-fn printMesa(writer: anytype, styles: Styles, summary: *Summary, allocator: std.mem.Allocator) !void {
-    if (getMesaVersion(allocator)) |ver| {
+fn printMesa(io: std.Io, writer: anytype, styles: Styles, summary: *Summary, allocator: std.mem.Allocator) !void {
+    if (getMesaVersion(io, allocator)) |ver| {
         defer allocator.free(ver);
 
         if (std.mem.indexOf(u8, ver, "25.0.7") != null) {
@@ -363,8 +453,8 @@ fn printMesa(writer: anytype, styles: Styles, summary: *Summary, allocator: std.
     }
 }
 
-fn printGecc(writer: anytype, styles: Styles, summary: *Summary, allocator: std.mem.Allocator) !void {
-    if (getGeccStatus(allocator)) |status| {
+fn printGecc(io: std.Io, writer: anytype, styles: Styles, summary: *Summary, allocator: std.mem.Allocator) !void {
+    if (getGeccStatus(io, allocator)) |status| {
         defer allocator.free(status);
 
         const trimmed = std.mem.trim(u8, status, " \n\r\t");
@@ -378,17 +468,17 @@ fn printGecc(writer: anytype, styles: Styles, summary: *Summary, allocator: std.
     }
 }
 
-fn printShaderAssets(writer: anytype, styles: Styles, summary: *Summary, shader_dir: []const u8) !void {
-    var dir = std.fs.cwd().openDir(shader_dir, .{}) catch |err| {
+fn printShaderAssets(io: std.Io, writer: anytype, styles: Styles, summary: *Summary, shader_dir: []const u8) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, shader_dir, .{}) catch |err| {
         const status: CheckStatus = if (builtin.os.tag == .linux) .fail else .warn;
         try printStatusLine(writer, styles, summary, status, "Shader dir", "{s} ({s})", .{ shader_dir, @errorName(err) });
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     try printStatusLine(writer, styles, summary, .ok, "Shader dir", "{s}", .{shader_dir});
 
-    const shader_check = inspectShaderAssets(dir);
+    const shader_check = inspectShaderAssets(io, dir);
     if (shader_check.found == shader_check.total) {
         try printStatusLine(writer, styles, summary, .ok, "Required shaders", "{d}/{d} present", .{ shader_check.found, shader_check.total });
     } else {
@@ -432,6 +522,7 @@ fn printVulkanProbe(writer: anytype, styles: Styles, summary: *Summary, probe: *
 }
 
 fn printModelCheck(
+    io: std.Io,
     writer: anytype,
     styles: Styles,
     summary: *Summary,
@@ -443,7 +534,7 @@ fn printModelCheck(
 ) !void {
     if (managed_model) |managed| {
         if (model_path) |path| {
-            const inspection = loader_mod.inspectModel(path, allocator) catch |err| {
+            const inspection = loader_mod.inspectModel(io, path, allocator) catch |err| {
                 try printStatusLine(writer, styles, summary, .fail, "Managed model", "{s} ({s}) ({s})", .{ managed.display_name, managed.id, @errorName(err) });
                 return;
             };
@@ -503,7 +594,7 @@ fn printModelCheck(
         return;
     };
 
-    const inspection = loader_mod.inspectModel(path, allocator) catch |err| {
+    const inspection = loader_mod.inspectModel(io, path, allocator) catch |err| {
         try printStatusLine(writer, styles, summary, .fail, "Model", "{s} ({s})", .{ path, @errorName(err) });
         return;
     };
@@ -613,21 +704,21 @@ fn isTruthy(value: ?[]const u8) bool {
     return std.mem.eql(u8, text, "1") or std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "yes");
 }
 
-fn inspectShaderAssets(dir: std.fs.Dir) ShaderAssetCheck {
+fn inspectShaderAssets(io: std.Io, dir: std.Io.Dir) ShaderAssetCheck {
     var check = ShaderAssetCheck{};
     for (required_shader_files) |name| {
-        const file = dir.openFile(name, .{}) catch {
+        const file = dir.openFile(io, name, .{}) catch {
             if (check.first_missing == null) check.first_missing = name;
             continue;
         };
         var close_file = file;
-        close_file.close();
+        close_file.close(io);
         check.found += 1;
     }
     return check;
 }
 
-fn readGgufHeader(file: std.fs.File) !GgufHeader {
+fn readGgufHeader(file: std.Io.File) !GgufHeader {
     var buf: [24]u8 = undefined;
     const n = try file.preadAll(&buf, 0);
     if (n < buf.len) return error.ShortRead;
@@ -792,29 +883,45 @@ fn probeVulkan(allocator: std.mem.Allocator, preferred_device: u32) !VulkanProbe
     };
 }
 
-fn getMesaVersion(allocator: std.mem.Allocator) ![]u8 {
-    var child = std.process.Child.init(&[_][]const u8{ "dpkg-query", "-W", "-f=${Version}", "mesa-vulkan-drivers" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+fn getMesaVersion(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{ "dpkg-query", "-W", "-f=${Version}", "mesa-vulkan-drivers" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    var buf: [1024]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const read = child.stdout.?.readStreaming(io, &.{buf[n..]}) catch break;
+        if (read == 0) break;
+        n += read;
+    }
+    const term = try child.wait(io);
 
-    try child.spawn();
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 1024);
-    const term = try child.wait();
-
-    if (term != .Exited or term.Exited != 0 or stdout.len == 0) {
-        allocator.free(stdout);
+    if (term != .exited or term.exited != 0 or n == 0) {
         return error.QueryFailed;
     }
-    return stdout;
+    const result = try allocator.alloc(u8, n);
+    @memcpy(result, buf[0..n]);
+    return result;
 }
 
-fn getGeccStatus(allocator: std.mem.Allocator) ![]u8 {
-    const file = std.fs.openFileAbsolute("/sys/module/amdgpu/parameters/ras_enable", .{}) catch return error.NotFound;
+fn getGeccStatus(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, "/sys/module/amdgpu/parameters/ras_enable", .{}) catch return error.NotFound;
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(io);
     }
-    return try file.readToEndAlloc(allocator, 64);
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const read = file.readStreaming(io, &.{buf[n..]}) catch break;
+        if (read == 0) break;
+        n += read;
+    }
+    const result = try allocator.alloc(u8, n);
+    @memcpy(result, buf[0..n]);
+    return result;
 }
 
 test "inspectShaderAssets reports all shaders present" {
@@ -822,10 +929,10 @@ test "inspectShaderAssets reports all shaders present" {
     defer tmp.cleanup();
 
     for (required_shader_files) |name| {
-        try tmp.dir.writeFile(.{ .sub_path = name, .data = "" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "" });
     }
 
-    const check = inspectShaderAssets(tmp.dir);
+    const check = inspectShaderAssets(std.testing.io, tmp.dir);
     try std.testing.expectEqual(required_shader_files.len, check.found);
     try std.testing.expectEqual(required_shader_files.len, check.total);
     try std.testing.expect(check.first_missing == null);
@@ -835,9 +942,9 @@ test "inspectShaderAssets reports first missing shader" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = required_shader_files[0], .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = required_shader_files[0], .data = "" });
 
-    const check = inspectShaderAssets(tmp.dir);
+    const check = inspectShaderAssets(std.testing.io, tmp.dir);
     try std.testing.expectEqual(@as(usize, 1), check.found);
     try std.testing.expectEqualStrings(required_shader_files[1], check.first_missing.?);
 }

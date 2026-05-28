@@ -71,9 +71,15 @@ The test suite covers:
 | `--debug` | Enable verbose logging (same as `ZINC_DEBUG=1`) |
 | `--profile` | Enable per-dispatch GPU profiling (Vulkan only) |
 | `ZINC_DEBUG=1` | Environment variable alternative to `--debug` |
+| `ZINC_PREFILL_PROFILE=1` | Per-phase prefill timing (dense FFN, SSM, attention, projections) |
+| `ZINC_BATCHED_PREFILL=0` | Disable RDNA batched prefill; useful for isolating regressions |
+| `ZINC_FA_SPLIT_K=<n>` | Override the scalar flash-attention split-K count |
+| `ZINC_TOOL_CALLING=0` | Disable OpenAI-compatible tool calling on `/v1/chat/completions` |
 | `RADV_PERFTEST=coop_matrix` | Enable cooperative matrix on RDNA4 (recommended) |
 | `RADV_DEBUG=shaders` | Dump compiled Vulkan shaders |
 | `RADV_DEBUG=shaderstats` | Show VGPR/occupancy/spill stats |
+
+For the full set of `ZINC_*` knobs (fusion gates, per-architecture experiments), grep the codebase: `rg 'getEnvVar.*ZINC_' src/`.
 
 Example debug run:
 
@@ -107,11 +113,14 @@ src/
 │   ├── routes.zig               # OpenAI-compatible API, streaming, stop detection
 │   ├── chat.html                # Built-in chat UI (embedded at compile time)
 │   ├── http.zig                 # HTTP server and connection handling
+│   ├── http.zig                 # HTTP server base (request parsing, response writing)
+│   ├── routes.zig               # OpenAI-compatible request handlers and streaming
 │   ├── model_manager.zig        # Hot model switching and catalog view
 │   ├── model_manager_metal.zig  # Metal-specific model manager extensions
 │   ├── model_manager_runtime.zig # Runtime abstraction for model manager
 │   ├── runtime.zig              # Backend runtime dispatch (Vulkan vs Metal)
-│   └── session.zig              # Chat session state
+│   ├── tool_format.zig          # OpenAI tool-calling output formatting
+│   └── chat.html                # Static chat UI served from /chat
 ├── vulkan/
 │   ├── instance.zig             # Vulkan instance and device init
 │   ├── pipeline.zig             # Compute pipeline and shader loading
@@ -137,8 +146,8 @@ src/
 ├── diagnostics_metal.zig        # --check system diagnostics (Metal)
 ├── regression_tests.zig         # Regression test fixtures
 ├── shaders/
-│   ├── *.comp                   # GLSL compute shaders (Vulkan/SPIR-V) — 24 shaders
-│   └── metal/*.metal            # MSL compute shaders (Apple Silicon) — 31 shaders
+│   ├── *.comp                   # GLSL compute shaders (Vulkan/SPIR-V)
+│   └── metal/*.metal            # MSL compute shaders (Apple Silicon)
 site/                            # zolotukhin.ai Astro site
 docs/                            # Technical documentation (published to site)
 tools/                           # API benchmark, standalone utilities
@@ -185,13 +194,27 @@ bun tools/benchmark_api.mjs --base http://localhost:8080 --mode chat
 
 # Raw completions throughput
 bun tools/benchmark_api.mjs --base http://localhost:8080 --mode raw
+
+# Serving concurrency gate (expected to fail until continuous batching lands)
+bun tools/benchmark_api.mjs \
+  --base http://localhost:8080 \
+  --mode concurrency \
+  --min-c4-aggregate-scale 2.5 \
+  --max-c4-p95-latency-multiplier 2.0
 ```
+
+The concurrency gate compares each `concurrency=4` scenario against its
+matching `concurrency=1` baseline. A serialized server typically shows
+aggregate completion throughput near `1x` and p95 latency near `4x`; continuous
+batching should raise aggregate throughput materially without linear p95 growth.
 
 ### Public performance output
 
 ```bash
-# Generate the benchmark artifact that powers /zinc/performance
+# Generate the benchmark artifact that powers /zinc/performance.
+# Legacy "both" runs RDNA + Metal; use "all" to include the Intel Arc node.
 bun tools/performance_suite.mjs --target both --output /tmp/zinc-performance.json
+bun tools/performance_suite.mjs --target intel --output /tmp/zinc-intel-performance.json
 ```
 
 The generated target entries include the exact ZINC git version/commit for the machine that produced each target and the llama.cpp binary version/commit used for the baseline on that target. The public performance page renders the same provenance so benchmark rows are tied to a concrete source tree and baseline build.
@@ -204,7 +227,7 @@ zig build hot-bench -Doptimize=ReleaseFast
 ./zig-out/bin/zinc-hot-bench --shader-dir zig-out/share/zinc/shaders
 ```
 
-For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) and the [GPU Reference](/zinc/docs/gpu-reference).
+For detailed tuning guidance, see [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning), the [AMD GPU Reference](/zinc/docs/amd-gpu-reference), and the [Intel GPU Reference](/zinc/docs/intel-gpu-reference).
 
 ## RDNA4 Test Node
 
@@ -215,6 +238,23 @@ For AMD GPU testing, the project uses a remote RDNA4 node. Environment setup:
 ZINC_HOST=<ip>
 ZINC_PORT=<ssh-port>
 ZINC_USER=root
+
+# Optional overrides consumed by scripts/deploy_rdna4_server.sh
+ZINC_REMOTE_DIR=/root/zinc                 # remote checkout path
+ZINC_REMOTE_MODEL=/root/models/<file>.gguf # model file the deployed server loads
+ZINC_SERVER_PORT=9090                      # remote server port
+ZINC_REMOTE_LOG=/tmp/zinc_<port>.log       # remote log file
+```
+
+Intel Arc benchmark nodes use separate keys so they do not override the RDNA defaults:
+
+```bash
+ZINC_INTEL_HOST=<ip>
+ZINC_INTEL_PORT=<ssh-port>
+ZINC_INTEL_USER=<ssh-user>
+ZINC_INTEL_WORKDIR=/home/<ssh-user>/zinc-gpu-loop
+ZINC_INTEL_XDG_CACHE_HOME=/home/<ssh-user>/.cache
+ZINC_INTEL_MODEL_ROOT=/home/<ssh-user>/.cache/zinc/models/models
 ```
 
 Deploy and test:
@@ -234,7 +274,7 @@ The deploy script includes a retry health check (30 attempts, 1s apart) to handl
 Before making changes to these areas, understand the existing design:
 
 - **Compute graph IR** — the decode graph is built from GGUF metadata, not hand-coded
-- **Model architectures** — Qwen3, Qwen3.5, Gemma 4, and GPT-OSS (dense transformer, MoE, and SSM hybrid)
+- **Model architectures** — Qwen3, Qwen3.5, and Gemma 4 (dense transformer, MoE, and SSM hybrid)
 - **GGUF parsing** — zero-copy mmap with DMA to GPU VRAM
 - **Vulkan init** — single-device, single-queue, push-constant dispatch
 - **Metal init** — default system device, zero-copy `newBufferWithBytesNoCopy`
@@ -252,6 +292,7 @@ See [Code of Conduct](https://github.com/zolotukhin/zinc/blob/main/CODE_OF_CONDU
 - [API Reference](/zinc/docs/api) — OpenAI-compatible HTTP endpoints
 - [Technical Specification](/zinc/docs/spec) — architecture, kernels, scheduler
 - [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) — performance profiling and optimization
-- [GPU Reference](/zinc/docs/gpu-reference) — RDNA3/RDNA4 hardware details
+- [AMD GPU Reference](/zinc/docs/amd-gpu-reference) — RDNA3/RDNA4 hardware details
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) — Arc B-series hardware, memory bandwidth, and Xe2 opcode notes
 - [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) — M1–M5 capabilities
 - [Apple Metal Reference](/zinc/docs/apple-metal-reference) — MSL kernel optimization

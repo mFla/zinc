@@ -55,6 +55,9 @@ struct _21
     uint _m6;
     uint _m7;
     uint _m8;
+    uint _m9;
+    uint _m10;
+    uint _m11;
 };
 
 struct _105
@@ -275,17 +278,17 @@ kernel void main0(constant _21& _23 [[buffer(0)]], device _105& _107 [[buffer(1)
                 float _596;
                 if (_23._m6 != 0u)
                 {
-                    _596 = _329._m0[gl_WorkGroupID.x] + float(_349._m0[gl_WorkGroupID.x]);
+                    _596 = _329._m0[_23._m9 + gl_WorkGroupID.x] + float(_349._m0[gl_WorkGroupID.x]);
                 }
                 else
                 {
-                    _596 = _329._m0[gl_WorkGroupID.x] + _361._m0[gl_WorkGroupID.x];
+                    _596 = _329._m0[_23._m9 + gl_WorkGroupID.x] + _361._m0[gl_WorkGroupID.x];
                 }
                 _595 = _596;
             }
             else
             {
-                _595 = _329._m0[gl_WorkGroupID.x];
+                _595 = _329._m0[_23._m9 + gl_WorkGroupID.x];
             }
             float _372 = log(1.0 + exp(_595));
             float _598;
@@ -307,7 +310,7 @@ kernel void main0(constant _21& _23 [[buffer(0)]], device _105& _107 [[buffer(1)
                 _598 = -_372;
             }
             _409 = exp(_598);
-            _412 = 1.0 / (1.0 + exp(-_416._m0[gl_WorkGroupID.x]));
+            _412 = 1.0 / (1.0 + exp(-_416._m0[_23._m10 + gl_WorkGroupID.x]));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint _441 = min(_23._m2, _23._m3);
@@ -346,7 +349,7 @@ kernel void main0(constant _21& _23 [[buffer(0)]], device _105& _107 [[buffer(1)
                 _606++;
                 continue;
             }
-            _564._m0[_613] = _609;
+            _564._m0[_23._m11 + _613] = _609;
         }
         break;
     } while(false);

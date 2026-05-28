@@ -9,10 +9,10 @@ Current priorities:
 - make the core Linux AMD path more stable on real hardware
 - improve Windows and cross-platform build reliability
 - harden the OpenAI-compatible server path
-- validate and prioritize support for the next smaller Qwen3.5 variant after the current 35B-A3B target
+- recover Qwen 3.6 27B dense-FFN and SSM-projection prefill on RDNA4 (the active effort behind the 27B prefill gap vs llama.cpp)
 - improve test coverage for scheduler, API, tokenizer, graph, and model loading code
 - make bug reports and regressions easier to reproduce
-- keep RDNA4 performance work measurable and benchmark-driven
+- keep RDNA4 and Metal performance work measurable and benchmark-driven
 
 Good contributions here:
 
@@ -29,7 +29,7 @@ Near-term work:
 - better profiling and graph/runtime inspection
 - more contributor-friendly benchmark workflows
 - broader model validation across supported GGUF architectures
-- make smaller Qwen3.5-family models first-class validation targets in docs, CI, and benchmark workflows
+- expand the perf suite catalog beyond the current Qwen 3.6 and Gemma 4 targets
 - stronger CI coverage across more environments
 - more complete API compatibility and client examples
 

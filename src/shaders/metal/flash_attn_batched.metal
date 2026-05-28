@@ -24,6 +24,8 @@ struct BatchedFlashAttnPush {
     uint kv_len;        // total KV entries (= kv_pos_offset + n_queries for contiguous prefill)
     uint n_queries;     // number of query tokens
     uint kv_pos_offset; // position offset for the first query in the KV cache
+    uint sliding_window_size; // 0 = full causal context
+    uint attn_scale_bits; // 0 = 1/sqrt(head_dim), otherwise bitcast f32 scale
 };
 
 constant uint FLASH_TG_SIZE = 64;
@@ -99,12 +101,15 @@ kernel void main0(
     const uint q_per_kv = max(p.n_heads / max(p.n_kv_heads, 1u), 1u);
     const uint kv_head = head / q_per_kv;
     const uint vec4_dim = p.head_dim >> 2;
-    const float scale = rsqrt((float)p.head_dim);
+    const float scale = p.attn_scale_bits != 0u ? as_type<float>(p.attn_scale_bits) : rsqrt((float)p.head_dim);
     const uint token_stride = p.n_kv_heads * p.head_dim;
 
     // Causal masking: this query at position (kv_pos_offset + query_idx) can attend
     // to KV entries 0..(kv_pos_offset + query_idx) inclusive.
     const uint causal_len = p.kv_pos_offset + query_idx + 1;
+    const uint window_start = (p.sliding_window_size != 0u && causal_len > p.sliding_window_size)
+        ? (causal_len - p.sliding_window_size)
+        : 0u;
 
     // Q base: q[query_idx * n_heads * head_dim + head * head_dim]
     const uint q_base = (query_idx * p.n_heads + head) * p.head_dim;
@@ -130,7 +135,7 @@ kernel void main0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint block_start = 0; block_start < causal_len; block_start += FLASH_BLOCK_TOKENS) {
+    for (uint block_start = window_start; block_start < causal_len; block_start += FLASH_BLOCK_TOKENS) {
         const uint block_tokens = min(FLASH_BLOCK_TOKENS, causal_len - block_start);
         const uint block_base = (block_start * token_stride) + kv_head * p.head_dim;
         float local_max = -INFINITY;

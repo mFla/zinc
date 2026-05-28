@@ -1,0 +1,205 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" role="img" aria-labelledby="title desc">
+  <title id="title">EXL3 decode pipeline on CUDA versus the Vulkan path on RDNA4 gfx1201</title>
+  <desc id="desc">A two-column technical diagram on a soft sage background. The left column titled CUDA path on Ampere and Ada is a vertical pipeline of six pale green stacked boxes connected by downward arrows, each with a green check mark. From top to bottom the boxes read: incoherence Hadamard transform, fused Viterbi bitshift trellis decode, Marlin sixteen by sixteen weight tile, tensor core m sixteen n eight k sixteen mma, FP16 output accumulator, decode loop output. The right column titled Vulkan path on RDNA4 gfx1201 mirrors the same six boxes in pale orange with check marks, caution triangles, or red X marks. The Hadamard box has a check mark and the label compute shader, fits naturally. The Viterbi decode box has a caution triangle and the label needs LDS LUT or 3INST code rewrite. The sixteen by sixteen weight tile box has a check mark and the label VK_KHR_cooperative_matrix in RADV. The mma box has a caution triangle and the label v_wmma_f16_16x16x16_f16 exists but no FP16 by int4 variant. The FP16 accumulator box has a check mark. The decode loop output box has a red X and the label Marlin async copy pattern requires manual rewrite. A horizontal divider below leads to a small inset chart titled Qwen3-30B-A3B perplexity versus bits per weight. The inset is a scatter plot with bpw on the x axis from 1.5 to 5 and perplexity on the y axis from 8.5 to 10.5. Four orange diamonds plot EXL3 at 2.5 bpw 10.10, 3.0 bpw 9.18, 3.5 bpw 9.25, and BF16 16.00 8.90. One blue square plots GGUF Q4 K M at 4.83 bpw 9.21. A dashed horizontal line at perplexity 8.90 is labeled BF16 floor.</desc>
+
+  <style>
+    .bg { fill: #e9eee4; }
+    .ink { fill: #1f2a24; }
+    .ink-soft { fill: #4d574e; }
+    .ink-faint { fill: #7a8378; }
+    .axis { stroke: #b8bfa9; stroke-width: 1; }
+    .axis-grid { stroke: #cad0bd; stroke-width: 0.6; stroke-dasharray: 2 3; }
+    .label { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #1f2a24; }
+    .label-soft { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11px; fill: #4d574e; }
+    .label-faint { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #7a8378; }
+    .label-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; fill: #1f2a24; }
+    .label-bold { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #1f2a24; font-weight: 600; }
+    .title-text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 17px; fill: #1f2a24; font-weight: 600; }
+    .subtitle-text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #4d574e; }
+    .col-title { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; fill: #1f2a24; font-weight: 600; }
+    .stage-cuda { fill: #d4e6cc; stroke: #4d574e; stroke-width: 1.1; }
+    .stage-vulkan { fill: #f3dcc1; stroke: #4d574e; stroke-width: 1.1; }
+    .stage-vulkan-blocked { fill: #e9c5b5; stroke: #4d574e; stroke-width: 1.1; }
+    .arrow { stroke: #4d574e; stroke-width: 1.4; fill: none; }
+    .check { fill: #3b7a4a; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 700; }
+    .warn { fill: #b88419; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 700; }
+    .block { fill: #b14223; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 16px; font-weight: 700; }
+    .panel-divider { stroke: #b8bfa9; stroke-width: 0.8; stroke-dasharray: 4 3; }
+    .dot-exl3 { fill: #d36b1f; stroke: #1f2a24; stroke-width: 1; }
+    .dot-gguf { fill: #4a7ba6; stroke: #1f2a24; stroke-width: 1; }
+    .bf16-line { stroke: #1f2a24; stroke-width: 1; stroke-dasharray: 4 3; }
+  </style>
+
+  <rect class="bg" width="960" height="720"/>
+
+  <!-- Header -->
+  <text class="title-text" x="40" y="42">EXL3 decode pipeline: CUDA today, RDNA4 Vulkan tomorrow</text>
+  <text class="subtitle-text" x="40" y="62">Six stages, six implementations, four still missing on gfx1201</text>
+
+  <!-- Column titles -->
+  <text class="col-title" x="180" y="100" text-anchor="middle">CUDA path on Ampere and Ada</text>
+  <text class="col-title" x="640" y="100" text-anchor="middle">Vulkan path on RDNA4 gfx1201</text>
+
+  <!-- Define box geometry. Left column box centered at x=180, right at x=640. Box width 280, height 56. -->
+  <!-- Row 1: Hadamard. y=120 -->
+  <rect class="stage-cuda" x="40" y="120" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="144" text-anchor="middle">incoherence Hadamard transform</text>
+  <text class="label-soft" x="180" y="162" text-anchor="middle">cuBLAS / custom kernel, per row</text>
+  <text class="check" x="328" y="155">✓</text>
+
+  <rect class="stage-vulkan" x="500" y="120" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="144" text-anchor="middle">incoherence Hadamard transform</text>
+  <text class="label-soft" x="640" y="162" text-anchor="middle">compute shader, fits naturally</text>
+  <text class="check" x="788" y="155">✓</text>
+
+  <line class="arrow" x1="180" y1="176" x2="180" y2="196"/>
+  <polygon points="180,200 175,192 185,192" fill="#4d574e"/>
+  <line class="arrow" x1="640" y1="176" x2="640" y2="196"/>
+  <polygon points="640,200 635,192 645,192" fill="#4d574e"/>
+
+  <!-- Row 2: Viterbi decode. y=200 -->
+  <rect class="stage-cuda" x="40" y="200" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="224" text-anchor="middle">fused Viterbi bitshift trellis decode</text>
+  <text class="label-soft" x="180" y="242" text-anchor="middle">HYB code, L=16 Q=9 V=2, two instr/weight</text>
+  <text class="check" x="328" y="235">✓</text>
+
+  <rect class="stage-vulkan-blocked" x="500" y="200" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="224" text-anchor="middle">fused Viterbi bitshift trellis decode</text>
+  <text class="label-soft" x="640" y="242" text-anchor="middle">needs LDS LUT or 3INST code rewrite</text>
+  <text class="warn" x="788" y="235">!</text>
+
+  <line class="arrow" x1="180" y1="256" x2="180" y2="276"/>
+  <polygon points="180,280 175,272 185,272" fill="#4d574e"/>
+  <line class="arrow" x1="640" y1="256" x2="640" y2="276"/>
+  <polygon points="640,280 635,272 645,272" fill="#4d574e"/>
+
+  <!-- Row 3: 16x16 tile. y=280 -->
+  <rect class="stage-cuda" x="40" y="280" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="304" text-anchor="middle">Marlin 16×16 weight tile</text>
+  <text class="label-soft" x="180" y="322" text-anchor="middle">async copy, double-buffered LDS</text>
+  <text class="check" x="328" y="315">✓</text>
+
+  <rect class="stage-vulkan" x="500" y="280" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="304" text-anchor="middle">16×16 cooperative matrix tile</text>
+  <text class="label-soft" x="640" y="322" text-anchor="middle">VK_KHR_cooperative_matrix in RADV</text>
+  <text class="check" x="788" y="315">✓</text>
+
+  <line class="arrow" x1="180" y1="336" x2="180" y2="356"/>
+  <polygon points="180,360 175,352 185,352" fill="#4d574e"/>
+  <line class="arrow" x1="640" y1="336" x2="640" y2="356"/>
+  <polygon points="640,360 635,352 645,352" fill="#4d574e"/>
+
+  <!-- Row 4: mma. y=360 -->
+  <rect class="stage-cuda" x="40" y="360" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="384" text-anchor="middle">tensor core m16n8k16 mma</text>
+  <text class="label-soft" x="180" y="402" text-anchor="middle">FP16 weights × FP16 acts, FP32 accum</text>
+  <text class="check" x="328" y="395">✓</text>
+
+  <rect class="stage-vulkan-blocked" x="500" y="360" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="384" text-anchor="middle">v_wmma_f16_16x16x16_f16</text>
+  <text class="label-soft" x="640" y="402" text-anchor="middle">exists; no FP16-by-int4 fused variant</text>
+  <text class="warn" x="788" y="395">!</text>
+
+  <line class="arrow" x1="180" y1="416" x2="180" y2="436"/>
+  <polygon points="180,440 175,432 185,432" fill="#4d574e"/>
+  <line class="arrow" x1="640" y1="416" x2="640" y2="436"/>
+  <polygon points="640,440 635,432 645,432" fill="#4d574e"/>
+
+  <!-- Row 5: FP16 accumulator. y=440 -->
+  <rect class="stage-cuda" x="40" y="440" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="464" text-anchor="middle">FP16 output accumulator</text>
+  <text class="label-soft" x="180" y="482" text-anchor="middle">register-resident, no spill</text>
+  <text class="check" x="328" y="475">✓</text>
+
+  <rect class="stage-vulkan" x="500" y="440" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="464" text-anchor="middle">FP16 output accumulator</text>
+  <text class="label-soft" x="640" y="482" text-anchor="middle">VGPR-resident on RDNA4</text>
+  <text class="check" x="788" y="475">✓</text>
+
+  <line class="arrow" x1="180" y1="496" x2="180" y2="516"/>
+  <polygon points="180,520 175,512 185,512" fill="#4d574e"/>
+  <line class="arrow" x1="640" y1="496" x2="640" y2="516"/>
+  <polygon points="640,520 635,512 645,512" fill="#4d574e"/>
+
+  <!-- Row 6: decode loop output. y=520 -->
+  <rect class="stage-cuda" x="40" y="520" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="180" y="544" text-anchor="middle">decode loop output</text>
+  <text class="label-soft" x="180" y="562" text-anchor="middle">memory-bound at 4 bpw on sm_89</text>
+  <text class="check" x="328" y="555">✓</text>
+
+  <rect class="stage-vulkan-blocked" x="500" y="520" width="280" height="56" rx="6"/>
+  <text class="label-bold" x="640" y="544" text-anchor="middle">decode loop output</text>
+  <text class="label-soft" x="640" y="562" text-anchor="middle">Marlin async copy needs manual rewrite</text>
+  <text class="block" x="788" y="555">✗</text>
+
+  <!-- Divider -->
+  <line class="panel-divider" x1="40" y1="600" x2="920" y2="600"/>
+
+  <!-- Inset chart: scatter perplexity vs bpw -->
+  <text class="col-title" x="480" y="624" text-anchor="middle">Qwen3-30B-A3B perplexity vs bits per weight</text>
+
+  <!-- Chart bounds: x=160 to x=820, y=638 to y=700. -->
+  <!-- x: 1.5 to 5.0 bpw -> 3.5 range -> 660px/3.5 = 188.57 px per bpw -->
+  <!-- y: 8.5 to 10.5 ppl -> 2.0 range -> 62px/2.0 = 31 px per ppl -->
+  <!-- Axes -->
+  <line class="axis" x1="160" y1="700" x2="820" y2="700"/>
+  <line class="axis" x1="160" y1="638" x2="160" y2="700"/>
+
+  <!-- X ticks: 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0 -->
+  <g class="label-faint" font-size="9.5">
+    <line class="axis" x1="160" y1="700" x2="160" y2="704"/>
+    <text x="160" y="715" text-anchor="middle">1.5</text>
+    <line class="axis" x1="254" y1="700" x2="254" y2="704"/>
+    <text x="254" y="715" text-anchor="middle">2.0</text>
+    <line class="axis" x1="349" y1="700" x2="349" y2="704"/>
+    <text x="349" y="715" text-anchor="middle">2.5</text>
+    <line class="axis" x1="443" y1="700" x2="443" y2="704"/>
+    <text x="443" y="715" text-anchor="middle">3.0</text>
+    <line class="axis" x1="537" y1="700" x2="537" y2="704"/>
+    <text x="537" y="715" text-anchor="middle">3.5</text>
+    <line class="axis" x1="632" y1="700" x2="632" y2="704"/>
+    <text x="632" y="715" text-anchor="middle">4.0</text>
+    <line class="axis" x1="726" y1="700" x2="726" y2="704"/>
+    <text x="726" y="715" text-anchor="middle">4.5</text>
+    <line class="axis" x1="820" y1="700" x2="820" y2="704"/>
+    <text x="820" y="715" text-anchor="middle">5.0</text>
+  </g>
+
+  <!-- Y ticks at 8.5, 9.0, 9.5, 10.0, 10.5 -->
+  <g class="label-faint" font-size="9.5">
+    <line class="axis-grid" x1="160" y1="700" x2="820" y2="700"/>
+    <text x="155" y="703" text-anchor="end">8.5</text>
+    <line class="axis-grid" x1="160" y1="684.5" x2="820" y2="684.5"/>
+    <text x="155" y="687.5" text-anchor="end">9.0</text>
+    <line class="axis-grid" x1="160" y1="669" x2="820" y2="669"/>
+    <text x="155" y="672" text-anchor="end">9.5</text>
+    <line class="axis-grid" x1="160" y1="653.5" x2="820" y2="653.5"/>
+    <text x="155" y="656.5" text-anchor="end">10.0</text>
+    <line class="axis-grid" x1="160" y1="638" x2="820" y2="638"/>
+    <text x="155" y="641" text-anchor="end">10.5</text>
+  </g>
+
+  <!-- BF16 floor line at ppl 8.90 = y= 700 - (8.90 - 8.5) * 31 = 700 - 12.4 = 687.6 -->
+  <line class="bf16-line" x1="160" y1="687.6" x2="820" y2="687.6"/>
+  <text class="label-faint" x="816" y="685" text-anchor="end">BF16 floor 8.90 ppl</text>
+
+  <!-- EXL3 points: x = 160 + (bpw-1.5)*188.57 -->
+  <!-- 2.5 bpw, 10.10 ppl -> x = 160 + 188.57 = 348.6; y = 700 - (10.10-8.5)*31 = 700 - 49.6 = 650.4 -->
+  <polygon class="dot-exl3" points="348.6,644.4 354.6,650.4 348.6,656.4 342.6,650.4"/>
+  <text class="label-faint" x="356" y="648" text-anchor="start">2.5 bpw EXL3</text>
+
+  <!-- 3.0 bpw, 9.18 ppl -> x = 160 + 282.86 = 442.9; y = 700 - 21.08 = 678.9 -->
+  <polygon class="dot-exl3" points="442.9,672.9 448.9,678.9 442.9,684.9 436.9,678.9"/>
+  <text class="label-faint" x="450" y="676.5" text-anchor="start">3.0 bpw EXL3</text>
+
+  <!-- 3.5 bpw, 9.25 ppl -> x = 160 + 377.14 = 537.1; y = 700 - 23.25 = 676.75 -->
+  <polygon class="dot-exl3" points="537.1,670.75 543.1,676.75 537.1,682.75 531.1,676.75"/>
+  <text class="label-faint" x="545" y="681" text-anchor="start">3.5 bpw EXL3</text>
+
+  <!-- Q4_K_M: 4.86 bpw, 9.04 ppl -> x = 160 + (4.86-1.5)*188.57 = 793.6; y = 700 - (9.04-8.5)*31 = 683.3 -->
+  <rect class="dot-gguf" x="789.6" y="679.3" width="8" height="8"/>
+  <text class="label-faint" x="786" y="673" text-anchor="end">GGUF Q4_K_M 4.86 bpw</text>
+
+  <!-- Footer -->
+  <text class="label-faint" x="40" y="710" text-anchor="start">Perplexity points: Qwen3-30B-A3B, eaddario HF discussion. Kernel availability: ExLlamaV3 README and RADV cooperative-matrix merge (May 2025).</text>
+</svg>

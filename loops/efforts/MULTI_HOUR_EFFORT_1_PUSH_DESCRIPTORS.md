@@ -2,7 +2,7 @@
 
 ## Current State (2026-04-05)
 
-- **Qwen3.5-35B-A3B**: 62.4 tok/s (16.0 ms/tok) on RX 9070 RDNA4
+- **Qwen3.6-35B-A3B**: 62.4 tok/s (16.0 ms/tok) on RX 9070 RDNA4
 - **CPU record time**: 0.55 ms/tok (3.4% of total)
 - **Descriptor allocs**: 1022 per token, 1022 writes, 3266 bindings
 - **Target**: Reduce CPU overhead from 0.55 ms to ~0.1 ms
@@ -221,7 +221,7 @@ Once ALL call sites are converted (no more `allocDescSet` calls remain):
 
 ```bash
 # On RDNA node:
-./zig-out/bin/zinc -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+./zig-out/bin/zinc -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --prompt 'Write a detailed essay.' --profile -n 200
 
 # Check:
@@ -249,7 +249,7 @@ Major categories:
 
 | Model | Prompt | Expected |
 |-------|--------|----------|
-| Qwen3.5-35B | "The capital of France is" | "Paris." |
+| Qwen3.6-35B | "The capital of France is" | "Paris." |
 | Qwen3-8B | "The capital of France is" | "Paris." |
 | Gemma4-31B | "The capital of France is" | "Paris." |
 

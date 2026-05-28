@@ -1,7 +1,8 @@
-//! Continuous batching scheduler for concurrent inference requests.
+//! Continuous-batching scheduler groundwork for concurrent inference requests.
 //! @section Scheduler
-//! Manages multiple active requests, assigns KV cache slots, and
-//! dispatches batched prefill and decode operations to the GPU.
+//! Today this module owns request slot accounting only. The HTTP serving hot
+//! path still serializes generation behind ServerState.generation_mutex; the
+//! batched prefill/decode dispatch loop is not wired yet.
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const RequestState = @import("request.zig").RequestState;

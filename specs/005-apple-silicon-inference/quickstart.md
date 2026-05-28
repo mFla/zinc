@@ -13,18 +13,18 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j16
 
 # Download model (or copy from remote node)
-huggingface-cli download unsloth/Qwen3.5-35B-A3B-GGUF \
-  Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+huggingface-cli download unsloth/Qwen3.6-35B-A3B-GGUF \
+  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --local-dir ./models
 
 # Benchmark (prefill 512 + generate 128)
 ./build/bin/llama-bench \
-  -m ./models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m ./models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -p 512 -n 128
 
 # Interactive test
 ./build/bin/llama-cli \
-  -m ./models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m ./models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -c 4096 -p "The capital of France is" -n 256
 ```
 
@@ -34,15 +34,17 @@ huggingface-cli download unsloth/Qwen3.5-35B-A3B-GGUF \
 # Install
 pip install -U mlx-lm
 
-# Auto-downloads model from HuggingFace on first run (~19 GB)
+# Set this to the closest available Qwen3.6 35B-A3B MLX export.
+export MLX_QWEN36_35B_MODEL=...
+
 mlx_lm.generate \
-  --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --model "$MLX_QWEN36_35B_MODEL" \
   --prompt "The capital of France is" \
   --max-tokens 256 \
   --verbose
 
 # Chat mode
-mlx_lm.chat --model mlx-community/Qwen3.5-35B-A3B-4bit
+mlx_lm.chat --model "$MLX_QWEN36_35B_MODEL"
 ```
 
 ## 3. vllm-mlx (parallel request benchmark)
@@ -52,7 +54,7 @@ mlx_lm.chat --model mlx-community/Qwen3.5-35B-A3B-4bit
 pip install vllm-mlx
 
 # Start server
-vllm serve mlx-community/Qwen3.5-35B-A3B-4bit \
+vllm serve "$MLX_QWEN36_35B_MODEL" \
   --host 0.0.0.0 --port 8080
 
 # Single request

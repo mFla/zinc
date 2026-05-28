@@ -3,17 +3,24 @@ import { randomUUID } from 'node:crypto';
 
 interface Props {
   compact?: boolean;
+  heading?: string;
+  intro?: string;
   placeholder?: string;
+  suggestions?: string[];
+  scope?: 'all' | 'zig-api';
+  maxResults?: number;
 }
 
 const {
   compact = false,
   placeholder = 'Search docs, API modules, symbols, and sections',
+  suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'],
+  scope = 'all',
+  maxResults = 10,
 } = Astro.props;
 
 const componentId = `docs-search-${randomUUID()}`;
 const endpoint = '/zinc/docs/search';
-const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
 ---
 
 <section id={componentId} class:list={['docs-search', { compact }]}>
@@ -48,7 +55,7 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
   <ul class="docs-search-results" data-docs-search-results hidden></ul>
 </section>
 
-<script define:vars={{ componentId, endpoint }}>
+<script define:vars={{ componentId, endpoint, scope, maxResults }}>
   const root = document.getElementById(componentId);
 
   if (root) {
@@ -58,7 +65,8 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
     const status = root.querySelector('[data-docs-search-status]');
     const results = root.querySelector('[data-docs-search-results]');
 
-    const MAX_RESULTS = 10;
+    const MAX_RESULTS = maxResults;
+    const SEARCH_SCOPE = scope;
     const SEARCH_CACHE_KEY = '__zincDocsSearchIndexPromise';
     const SEARCH_ENDPOINTS = [endpoint, `${endpoint}.json`];
 
@@ -72,10 +80,28 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
 
     const termsFor = (query) => normalize(query).split(' ').filter(Boolean);
 
+    const normalizeCode = (value) =>
+      normalize(value)
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const compactCode = (value) => normalize(value).replace(/[^a-z0-9]+/g, '');
+
+    const codeTermsFor = (query) => normalizeCode(query).split(' ').filter(Boolean);
+
     const scoreEntry = (entry, query, terms) => {
       const normalizedTitle = normalize(entry.title);
       const normalizedGroup = normalize(entry.group);
       const haystack = normalize(`${entry.title} ${entry.group} ${entry.preview} ${entry.searchText}`);
+      const codeQuery = normalizeCode(query);
+      const codeTerms = codeTermsFor(query);
+      const codeTitle = normalizeCode(entry.title);
+      const codeGroup = normalizeCode(entry.group);
+      const codeHaystack = normalizeCode(`${entry.title} ${entry.group} ${entry.preview} ${entry.searchText}`);
+      const compactQuery = compactCode(query);
+      const compactTitle = compactCode(entry.title);
+      const compactHaystack = compactCode(`${entry.title} ${entry.group} ${entry.preview} ${entry.searchText}`);
 
       let score = 0;
       if (normalizedTitle === query) score += 260;
@@ -83,6 +109,13 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
       if (normalizedTitle.includes(query)) score += 110;
       if (normalizedGroup.includes(query)) score += 35;
       if (haystack.includes(query)) score += 30;
+      if (codeQuery && codeTitle === codeQuery) score += 190;
+      if (codeQuery && codeTitle.startsWith(codeQuery)) score += 110;
+      if (codeQuery && codeTitle.includes(codeQuery)) score += 85;
+      if (codeQuery && codeGroup.includes(codeQuery)) score += 28;
+      if (codeQuery && codeHaystack.includes(codeQuery)) score += 26;
+      if (compactQuery && compactTitle.includes(compactQuery)) score += 70;
+      if (compactQuery && compactHaystack.includes(compactQuery)) score += 18;
 
       for (const term of terms) {
         if (normalizedTitle.includes(term)) score += 28;
@@ -90,11 +123,18 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
         if (haystack.includes(term)) score += 6;
       }
 
+      for (const term of codeTerms) {
+        if (codeTitle.includes(term)) score += 24;
+        if (codeGroup.includes(term)) score += 9;
+        if (codeHaystack.includes(term)) score += 5;
+      }
+
       if (entry.kind === 'Guide') score += 20;
       if (entry.kind === 'Section') score += 16;
-      if (entry.kind === 'API Module') score += 12;
-      if (entry.kind === 'API Symbol') score += 8;
-      if (entry.kind === 'API Method') score += 4;
+      if (entry.kind === 'API Module') score += 18;
+      if (entry.kind === 'API Symbol') score += 16;
+      if (entry.kind === 'API Method') score += 12;
+      if (entry.kind === 'API Section') score += 8;
 
       return score;
     };
@@ -179,6 +219,13 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
       return window[SEARCH_CACHE_KEY];
     };
 
+    const applyScope = (entries) => {
+      if (SEARCH_SCOPE === 'zig-api') {
+        return entries.filter((entry) => entry.kind.startsWith('API '));
+      }
+      return entries;
+    };
+
     const runSearch = async () => {
       const rawQuery = input.value.trim();
       clearButton.hidden = rawQuery.length === 0;
@@ -194,7 +241,7 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
       status.textContent = 'Searching…';
       const normalizedQuery = normalize(rawQuery);
       const terms = termsFor(rawQuery);
-      const entries = await loadIndex();
+      const entries = applyScope(await loadIndex());
 
       const ranked = entries
         .map((entry) => ({ entry, score: scoreEntry(entry, normalizedQuery, terms) }))
@@ -257,11 +304,12 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
     width: 100%;
     min-width: 0;
     border: 1px solid var(--color-border);
-    border-radius: 999px;
-    padding: 0.7rem 2.4rem 0.7rem 0.95rem;
+    border-radius: 8px;
+    padding: 0.56rem 2.1rem 0.56rem 0.75rem;
     background: var(--color-bg-alt);
     color: var(--color-text);
     font: inherit;
+    font-size: 0.9rem;
   }
 
   .docs-search-shell input:focus {
@@ -280,14 +328,14 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
 
   .docs-search-clear {
     position: absolute;
-    right: 0.65rem;
+    right: 0.58rem;
     top: 50%;
     transform: translateY(-50%);
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 1.35rem;
-    height: 1.35rem;
+    width: 1.18rem;
+    height: 1.18rem;
     border: 0;
     border-radius: 999px;
     padding: 0;
@@ -304,26 +352,26 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
   }
 
   .docs-search-status {
-    margin: var(--space-sm) 0 0;
+    margin: 0.35rem 0 0;
     color: var(--color-text-muted);
-    font-size: 0.82rem;
+    font-size: 0.76rem;
   }
 
   .docs-search-suggestions {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.45rem;
-    margin-top: 0.55rem;
+    gap: 0.35rem;
+    margin-top: 0.45rem;
   }
 
   .docs-search-chip {
     border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-border));
     border-radius: 999px;
-    padding: 0.14rem 0.48rem;
+    padding: 0.1rem 0.42rem;
     background: color-mix(in srgb, var(--color-accent) 10%, transparent);
     color: var(--color-accent);
     font: inherit;
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     line-height: 1.2;
     cursor: pointer;
   }
@@ -336,11 +384,11 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
 
   .docs-search-results {
     list-style: none;
-    margin: var(--space-sm) 0 0;
+    margin: 0.45rem 0 0;
     padding: 0;
     display: grid;
-    gap: var(--space-xs);
-    max-height: 28rem;
+    gap: 0.3rem;
+    max-height: 22rem;
     overflow-y: auto;
   }
 
@@ -350,9 +398,9 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
 
   .docs-search-result-link {
     display: block;
-    padding: 0.75rem 0.85rem;
+    padding: 0.5rem 0.62rem;
     border: 1px solid var(--color-border);
-    border-radius: 10px;
+    border-radius: 8px;
     background: var(--color-bg);
     color: var(--color-text);
     text-decoration: none;
@@ -364,24 +412,24 @@ const suggestions = ['Vulkan', '9070 XT', 'Supported Models', 'Apple Silicon'];
   }
 
   .docs-search-result-meta {
-    font-size: 0.72rem;
+    font-size: 0.62rem;
     color: var(--color-text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    margin-bottom: 0.2rem;
+    margin-bottom: 0.12rem;
   }
 
   .docs-search-result-title {
     display: block;
-    font-size: 0.94rem;
-    margin-bottom: 0.2rem;
+    font-size: 0.84rem;
+    margin-bottom: 0.08rem;
   }
 
   .docs-search-result-preview {
     margin: 0;
-    font-size: 0.82rem;
+    font-size: 0.74rem;
     color: var(--color-text-muted);
-    line-height: 1.45;
+    line-height: 1.35;
   }
 
   .docs-search mark {

@@ -1,7 +1,7 @@
 # Baselines: Apple Silicon Inference
 
 **Hardware**: Mac Studio M4 Max, 64 GB unified memory, 40-core GPU
-**Model**: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (20.7 GB, MoE 35B/3B active)
+**Model**: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (20.7 GB, MoE 35B/3B active)
 
 ## llama.cpp Metal (build afe65aa)
 
@@ -20,7 +20,7 @@ Measured with `llama-bench`:
 
 ## mlx-lm (TBD)
 
-TODO: Install and benchmark `mlx-lm` with `mlx-community/Qwen3.5-35B-A3B-4bit`.
+TODO: Install and benchmark `mlx-lm` with the closest available Qwen3.6 35B-A3B MLX export.
 
 ## ZINC Metal (current)
 

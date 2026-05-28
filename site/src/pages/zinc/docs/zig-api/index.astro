@@ -1,5 +1,6 @@
 ---
 import DocLayout from '../../../../layouts/DocLayout.astro';
+import DocsSearch from '../../../../components/DocsSearch.astro';
 import { loadZigApi } from '../../../../lib/zig-api-loader';
 
 const zigApi = await loadZigApi();
@@ -49,6 +50,11 @@ const description = 'Generated reference for the ZINC Zig codebase, grouped by r
 const keywords = 'ZINC Zig API, generated docs, Zig reference, Vulkan runtime, inference runtime, GGUF parser, AMD GPU';
 const zigCodeLines = zigApi.codeLineCount.toLocaleString('en-US');
 const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
+const apiSearchSuggestions = ['InferenceEngine', 'DmmvDispatch', 'GGUFFile', 'Tokenizer', 'ServerState', 'ModelConfig'];
+const entryModuleSlugs = ['forward', 'forward-metal', 'graph', 'gguf', 'tokenizer', 'dmmv', 'elementwise', 'routes'];
+const entryModules = entryModuleSlugs
+  .map(slug => zigApi.modules.find(module => module.slug === slug))
+  .filter(module => module !== undefined);
 ---
 
 <DocLayout title="Zig API" description={description} keywords={keywords} lastmod={zigApi.lastmod}>
@@ -96,26 +102,20 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     </div>
   </section>
 
-  <section class="supplemental">
+  <section id="api-search" class="api-search-panel">
     <div class="section-header">
       <div>
-        <p class="eyebrow">Agent Access</p>
-        <h2>Machine-Readable Entry Points</h2>
+        <p class="eyebrow">Find Code</p>
+        <h2>Search modules, symbols, and methods</h2>
       </div>
     </div>
-    <p class="section-description">
-      Agents should prefer the generated Zig API exports instead of scraping HTML. The JSON export is the canonical
-      structured surface; <code>llms.txt</code> points callers at the right docs in the right order.
-    </p>
-
-    <div class="module-grid supplemental-grid">
-      {agentArtifacts.map(artifact => (
-        <a href={artifact.href} class="module-card supplemental-card">
-          <h3>{artifact.title}</h3>
-          <p>{artifact.description}</p>
-        </a>
-      ))}
-    </div>
+    <DocsSearch
+      compact={true}
+      placeholder="Search the Zig API by symbol, method, module, or source path"
+      scope="zig-api"
+      suggestions={apiSearchSuggestions}
+      maxResults={12}
+    />
   </section>
 
   <div id="sections" class="section-stack">
@@ -151,6 +151,48 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     ))}
   </div>
 
+  {entryModules.length > 0 && (
+    <section id="entry-points" class="entry-points">
+      <div class="section-header">
+        <div>
+          <p class="eyebrow">Developer Entry Points</p>
+          <h2>Start with the hot paths</h2>
+        </div>
+      </div>
+      <div class="entry-grid">
+        {entryModules.map(module => (
+          <a href={module.href} class="entry-link">
+            <span class="entry-source">{module.sourcePath}</span>
+            <strong>{module.title}</strong>
+            <span>{module.summary}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+  )}
+
+  <section id="machine-readable" class="supplemental">
+    <div class="section-header">
+      <div>
+        <p class="eyebrow">Agent Access</p>
+        <h2>Machine-Readable Entry Points</h2>
+      </div>
+    </div>
+    <p class="section-description">
+      Agents should prefer the generated Zig API exports instead of scraping HTML. The JSON export is the canonical
+      structured surface; <code>llms.txt</code> points callers at the right docs in the right order.
+    </p>
+
+    <div class="module-grid supplemental-grid">
+      {agentArtifacts.map(artifact => (
+        <a href={artifact.href} class="module-card supplemental-card">
+          <h3>{artifact.title}</h3>
+          <p>{artifact.description}</p>
+        </a>
+      ))}
+    </div>
+  </section>
+
   <section class="supplemental">
     <div class="section-header">
       <div>
@@ -177,7 +219,10 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   <aside class="api-nav">
     <p class="nav-title">On This Page</p>
     <ul>
+      <li><a href="#api-search">Search</a></li>
       <li><a href="#sections">API Sections</a></li>
+      {entryModules.length > 0 && <li><a href="#entry-points">Entry Points</a></li>}
+      <li><a href="#machine-readable">Machine-Readable</a></li>
       {zigApi.sections.map(section => (
         <li class="nav-section">
           <a href={`#${section.slug}`}>{section.title}</a>
@@ -196,8 +241,8 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
 <style>
   .api-page {
     display: grid;
-    grid-template-columns: 1fr 170px;
-    gap: var(--space-lg);
+    grid-template-columns: minmax(0, 1fr) 190px;
+    gap: var(--space-md);
     align-items: start;
   }
 
@@ -210,7 +255,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     top: 1rem;
     max-height: calc(100vh - 2rem);
     overflow-y: auto;
-    padding: var(--space-sm) 0;
+    padding: 0.25rem 0;
   }
 
   .nav-title {
@@ -219,7 +264,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--color-text-muted);
-    margin: 0 0 var(--space-sm);
+    margin: 0 0 0.35rem;
   }
 
   .api-nav > ul {
@@ -233,14 +278,14 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .api-nav > ul > li {
-    margin-bottom: 0.15rem;
+    margin-bottom: 0.08rem;
   }
 
   .api-nav a {
     display: block;
-    font-size: 0.72rem;
-    line-height: 1.3;
-    padding: 0.15rem 0;
+    font-size: 0.68rem;
+    line-height: 1.25;
+    padding: 0.1rem 0;
     color: var(--color-text-muted);
   }
 
@@ -252,8 +297,8 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   .nav-section > a {
     font-weight: 600;
     color: var(--color-text);
-    font-size: 0.74rem;
-    margin-top: 0.4rem;
+    font-size: 0.7rem;
+    margin-top: 0.32rem;
   }
 
   .nav-section > ul {
@@ -264,7 +309,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .nav-section > ul a {
-    font-size: 0.68rem;
+    font-size: 0.64rem;
     color: var(--color-text-muted);
   }
 
@@ -279,47 +324,62 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .hero {
-    padding: var(--space-xl);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 0.42fr);
+    grid-template-areas:
+      "eyebrow stats"
+      "title stats"
+      "copy stats"
+      "actions stats";
+    column-gap: var(--space-md);
+    align-items: start;
+    padding: var(--space-md);
     border: 1px solid var(--color-border);
-    border-radius: 16px;
-    background:
-      radial-gradient(circle at top right, rgba(211, 84, 0, 0.14), transparent 30%),
-      linear-gradient(180deg, var(--color-bg-alt), var(--color-bg));
-    margin-bottom: var(--space-xl);
+    border-radius: 8px;
+    background: var(--color-bg);
+    margin-bottom: var(--space-md);
   }
 
   .hero h1 {
-    margin-bottom: var(--space-sm);
+    grid-area: title;
+    margin: 0 0 0.25rem;
+    font-size: 1.75rem;
   }
 
   .hero-copy {
+    grid-area: copy;
     color: var(--color-text-muted);
     max-width: 62ch;
+    margin-bottom: 0;
+    font-size: 0.9rem;
+    line-height: 1.45;
   }
 
   .eyebrow {
+    grid-area: eyebrow;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    font-size: 0.75rem;
+    font-size: 0.65rem;
     color: var(--color-text-muted);
     margin-bottom: var(--space-xs);
   }
 
   .hero-actions {
+    grid-area: actions;
     display: flex;
-    gap: var(--space-sm);
+    gap: 0.4rem;
     flex-wrap: wrap;
-    margin: var(--space-lg) 0;
+    margin: 0.45rem 0 0;
   }
 
   .button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-height: 2.6rem;
-    padding: 0 0.95rem;
-    border-radius: 999px;
-    font-size: 0.9rem;
+    min-height: 2rem;
+    padding: 0 0.65rem;
+    border-radius: 8px;
+    font-size: 0.78rem;
     border: 1px solid var(--color-border);
     text-decoration: none;
   }
@@ -340,8 +400,8 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     align-items: flex-start;
     justify-content: center;
     gap: 0.1rem;
-    min-height: 3.2rem;
-    padding: 0.55rem 1rem 0.6rem;
+    min-height: 2rem;
+    padding: 0.34rem 0.65rem;
     background: color-mix(in srgb, var(--color-accent) 7%, var(--color-bg));
     border-color: color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 10%, transparent);
@@ -363,14 +423,14 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .button-metric-label {
-    font-size: 0.68rem;
+    font-size: 0.58rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--color-accent);
   }
 
   .button-metric strong {
-    font-size: 1.05rem;
+    font-size: 0.9rem;
     line-height: 1.1;
     font-weight: 700;
   }
@@ -385,48 +445,104 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .stats-grid {
+    grid-area: stats;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: var(--space-sm);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem;
   }
 
   .stat-card {
     border: 1px solid var(--color-border);
-    border-radius: 12px;
+    border-radius: 8px;
     background: var(--color-bg);
-    padding: var(--space-md);
+    padding: 0.45rem 0.55rem;
   }
 
   .stat-card span {
     display: block;
     color: var(--color-text-muted);
-    font-size: 0.8rem;
-    margin-bottom: var(--space-xs);
+    font-size: 0.68rem;
+    margin-bottom: 0.08rem;
   }
 
   .stat-card strong {
-    font-size: 1.5rem;
+    font-size: 1.1rem;
   }
 
   .section-stack {
     display: grid;
-    gap: var(--space-lg);
+    gap: var(--space-md);
   }
 
+  .api-search-panel,
+  .entry-points,
   .section-card,
   .supplemental {
     border: 1px solid var(--color-border);
-    border-radius: 16px;
-    padding: var(--space-lg);
+    border-radius: 8px;
+    padding: var(--space-md);
     background: var(--color-bg);
+  }
+
+  .api-search-panel {
+    margin-bottom: var(--space-md);
+  }
+
+  .entry-points {
+    margin-bottom: var(--space-md);
+  }
+
+  .entry-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 0.45rem;
+    margin-top: 0.65rem;
+  }
+
+  .entry-link {
+    display: grid;
+    gap: 0.12rem;
+    min-width: 0;
+    padding: 0.45rem 0.5rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--color-bg-alt);
+    color: var(--color-text);
+  }
+
+  .entry-link:hover {
+    border-color: var(--color-accent);
+    text-decoration: none;
+  }
+
+  .entry-link strong {
+    font-size: 0.78rem;
+    line-height: 1.25;
+  }
+
+  .entry-link span:last-child {
+    color: var(--color-text-muted);
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    font-size: 0.68rem;
+    line-height: 1.3;
+  }
+
+  .entry-source {
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.56rem;
+    overflow-wrap: anywhere;
   }
 
   .section-header {
     display: flex;
     justify-content: space-between;
-    gap: var(--space-md);
+    gap: var(--space-sm);
     align-items: flex-start;
-    margin-bottom: var(--space-sm);
+    margin-bottom: 0.45rem;
   }
 
   .section-header h2 {
@@ -434,7 +550,7 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .section-count {
-    font-size: 0.85rem;
+    font-size: 0.72rem;
     color: var(--color-text-muted);
     white-space: nowrap;
   }
@@ -442,37 +558,40 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   .section-description {
     color: var(--color-text-muted);
     max-width: 70ch;
+    margin-bottom: 0;
+    font-size: 0.82rem;
+    line-height: 1.4;
   }
 
   .module-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: var(--space-md);
-    margin-top: var(--space-lg);
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+    margin-top: 0.75rem;
   }
 
   .module-card {
     display: block;
     border: 1px solid var(--color-border);
-    border-radius: 14px;
-    padding: var(--space-md);
+    border-radius: 8px;
+    padding: 0.65rem 0.75rem;
     color: var(--color-text);
     background: var(--color-bg);
-    transition: transform 0.15s ease, border-color 0.15s ease;
+    transition: border-color 0.15s ease, background 0.15s ease;
   }
 
   .module-card:hover {
     border-color: var(--color-accent);
     text-decoration: none;
-    transform: translateY(-2px);
+    background: color-mix(in srgb, var(--color-accent) 4%, var(--color-bg));
   }
 
   .module-card-top {
     display: flex;
     justify-content: space-between;
     gap: var(--space-sm);
-    margin-bottom: var(--space-sm);
-    font-size: 0.78rem;
+    margin-bottom: 0.25rem;
+    font-size: 0.68rem;
     color: var(--color-text-muted);
   }
 
@@ -482,12 +601,15 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
   }
 
   .module-card h3 {
-    margin-top: 0;
+    margin: 0 0 0.12rem;
+    font-size: 0.95rem;
   }
 
   .module-card p {
     color: var(--color-text-muted);
-    font-size: 0.92rem;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    margin-bottom: 0.45rem;
   }
 
   .symbol-preview {
@@ -496,24 +618,72 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     margin: 0;
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-xs);
+    gap: 0.22rem;
   }
 
   .symbol-preview li {
     margin: 0;
-    padding: 0.2rem 0.45rem;
-    border-radius: 999px;
+    padding: 0.08rem 0.32rem;
+    border-radius: 5px;
     background: var(--color-bg-alt);
-    font-size: 0.8rem;
+    font-size: 0.68rem;
     color: var(--color-text-muted);
   }
 
+  .section-card .module-card {
+    display: grid;
+    grid-template-columns: minmax(145px, 0.8fr) minmax(210px, 1.35fr) minmax(145px, 0.85fr);
+    grid-template-areas:
+      "meta title symbols"
+      "meta summary symbols";
+    column-gap: var(--space-md);
+    row-gap: 0.12rem;
+    align-items: start;
+  }
+
+  .section-card .module-card-top {
+    grid-area: meta;
+    display: grid;
+    justify-content: stretch;
+    gap: 0.18rem;
+    margin: 0;
+  }
+
+  .section-card .module-source {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+
+  .section-card .module-counts {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .section-card .module-card h3 {
+    grid-area: title;
+  }
+
+  .section-card .module-card p {
+    grid-area: summary;
+    margin: 0;
+  }
+
+  .section-card .symbol-preview {
+    grid-area: symbols;
+    justify-content: flex-start;
+  }
+
   .supplemental {
-    margin-top: var(--space-xl);
+    margin-top: var(--space-md);
+  }
+
+  #machine-readable {
+    margin-top: 0;
+    margin-bottom: var(--space-md);
   }
 
   .supplemental-grid {
-    margin-top: var(--space-md);
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    margin-top: 0.65rem;
   }
 
   .supplemental-card h3 {
@@ -522,9 +692,20 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
 
   @media (max-width: 700px) {
     .hero,
+    .api-search-panel,
+    .entry-points,
     .section-card,
     .supplemental {
       padding: var(--space-md);
+    }
+
+    .hero {
+      display: block;
+      padding: 0.85rem;
+    }
+
+    .stats-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     .section-header,
@@ -536,6 +717,10 @@ const githubSrcUrl = 'https://github.com/zolotukhin/zinc/tree/main/src';
     .module-counts {
       display: inline-block;
       margin-top: var(--space-xs);
+    }
+
+    .section-card .module-card {
+      display: block;
     }
   }
 </style>

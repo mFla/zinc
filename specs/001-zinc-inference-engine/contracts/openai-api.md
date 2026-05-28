@@ -100,7 +100,7 @@ data: [DONE]
     "clock_mhz": 2350
   },
   "model": {
-    "name": "Qwen3.5-35B-A3B-Q4_K",
+    "name": "Qwen3.6-35B-A3B-Q4_K",
     "parameters": "34.66B",
     "context_length": 32768
   },

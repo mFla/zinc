@@ -69,7 +69,7 @@
 
 **Goal**: Same GGUF model file loads correctly on Metal, all tensors parse and dequantize to same values as Vulkan path.
 
-**Independent Test**: Load `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` on Metal, verify tensor count, dimensions, and dequantized values match a reference snapshot from the Vulkan path.
+**Independent Test**: Load `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` on Metal, verify tensor count, dimensions, and dequantized values match a reference snapshot from the Vulkan path.
 
 ### Implementation
 
@@ -77,7 +77,7 @@
 - [x] T023 [US3] Update `src/model/loader.zig` Metal path — when backend is Metal, use `gpu.Backend.wrapMmap()` for tensor data instead of staging buffer upload. Preserve Vulkan path unchanged.
 - [x] T024 [US3] Add startup validation in `src/metal/device.zig` — check Apple Silicon (`mtl_init` non-null), check macOS ≥14, check available memory vs model size, print actionable error messages per spec Error Handling section
 - [x] T025 [US3] Add `--context-length` CLI flag in `src/main.zig` (default 4096, max 32768, reject values >32768 with error) for configurable KV cache allocation
-- [x] T026 [US3] End-to-end model load test — load `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` on Metal, verify all tensor count matches, print model config, confirm <2s load time (mmap, no copy)
+- [x] T026 [US3] End-to-end model load test — load `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` on Metal, verify all tensor count matches, print model config, confirm <2s load time (mmap, no copy)
 
 **Checkpoint**: GGUF loads on Metal with zero-copy. Model config prints correctly. Same file works on both backends.
 
@@ -87,11 +87,11 @@
 
 **Goal**: Generate tokens on Metal at ≥80 tok/s with output matching Vulkan backend.
 
-**Independent Test**: `./zig-out/bin/zinc -m Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf --prompt "The capital of France is" --max-tokens 256` produces coherent text at ≥80 tok/s on M4 Max 64 GB.
+**Independent Test**: `./zig-out/bin/zinc -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --prompt "The capital of France is" --max-tokens 256` produces coherent text at ≥80 tok/s on M4 Max 64 GB.
 
 ### Reference Data
 
-- [ ] T027 [US1] Generate reference token output and logits snapshot — run llama.cpp Metal (`llama-cli -m Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf -ngl 99 -p "The capital of France is" -n 256`) on this Mac, capture greedy-decoded token IDs and first-token logits (top-10 values) to `specs/005-apple-silicon-inference/reference-tokens.txt`. Also capture Vulkan ZINC output from Linux node via SSH for cross-backend comparison.
+- [ ] T027 [US1] Generate reference token output and logits snapshot — run llama.cpp Metal (`llama-cli -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf -ngl 99 -p "The capital of France is" -n 256`) on this Mac, capture greedy-decoded token IDs and first-token logits (top-10 values) to `specs/005-apple-silicon-inference/reference-tokens.txt`. Also capture Vulkan ZINC output from Linux node via SSH for cross-backend comparison.
 
 ### Implementation — Get It Working
 

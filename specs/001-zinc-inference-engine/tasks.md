@@ -251,7 +251,7 @@ After Steps 1-3, submits drop from 151 to ~41 (1 per layer + 1 final). This step
 
 ## Phase 6: User Story 4 — MoE and SSM/Mamba Support ✅ COMPLETE
 
-**Status**: Qwen3.5-35B-A3B (hybrid attention+SSM+MoE) generates correct output.
+**Status**: Qwen3.6-35B-A3B (hybrid attention+SSM+MoE) generates correct output.
 
 - [X] T056 [US4] sigmoid_mul shader — sigmoid(x) * y for attention gating
 - [X] T057 [US4] vadd, scale_accumulate, deinterleave shaders — MoE accumulation primitives

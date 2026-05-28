@@ -41,8 +41,15 @@ export function defaultScenarios(mode) {
     { name: "raw_c1_t256", kind: "raw", prompt: shortPrompt, maxTokens: 256, concurrency: 1 },
     { name: "raw_c4_t256", kind: "raw", prompt: shortPrompt, maxTokens: 256, concurrency: 4 },
   ];
+  const concurrency = [
+    { name: "short_c1_t64", kind: "chat", prompt: shortPrompt, maxTokens: 64, concurrency: 1 },
+    { name: "short_c4_t64", kind: "chat", prompt: shortPrompt, maxTokens: 64, concurrency: 4 },
+    { name: "raw_c1_t256", kind: "raw", prompt: shortPrompt, maxTokens: 256, concurrency: 1 },
+    { name: "raw_c4_t256", kind: "raw", prompt: shortPrompt, maxTokens: 256, concurrency: 4 },
+  ];
   if (mode === "chat") return chat;
   if (mode === "raw") return raw;
+  if (mode === "concurrency") return concurrency;
   return [...chat, ...raw];
 }
 
@@ -58,6 +65,9 @@ export function parseArgs(argv) {
   let mode = "both";
   let output = `/tmp/zinc_api_benchmark_${Date.now()}.json`;
   let timeoutMs = 600_000;
+  let concurrencyReport = true;
+  let minC4AggregateScale = null;
+  let maxC4P95LatencyMultiplier = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -67,8 +77,8 @@ export function parseArgs(argv) {
         break;
       case "--mode": {
         const value = argv[++i];
-        if (value === "chat" || value === "raw" || value === "both") mode = value;
-        else throw new Error(`Invalid --mode '${value}'. Expected chat, raw, or both.`);
+        if (value === "chat" || value === "raw" || value === "both" || value === "concurrency") mode = value;
+        else throw new Error(`Invalid --mode '${value}'. Expected chat, raw, both, or concurrency.`);
         break;
       }
       case "--output":
@@ -81,6 +91,23 @@ export function parseArgs(argv) {
         timeoutMs = value;
         break;
       }
+      case "--no-concurrency-report":
+        concurrencyReport = false;
+        break;
+      case "--min-c4-aggregate-scale": {
+        const raw = argv[++i] ?? "";
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) throw new Error(`Invalid --min-c4-aggregate-scale '${raw}'`);
+        minC4AggregateScale = value;
+        break;
+      }
+      case "--max-c4-p95-latency-multiplier": {
+        const raw = argv[++i] ?? "";
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) throw new Error(`Invalid --max-c4-p95-latency-multiplier '${raw}'`);
+        maxC4P95LatencyMultiplier = value;
+        break;
+      }
       case "-h":
       case "--help":
         printUsageAndExit();
@@ -90,15 +117,23 @@ export function parseArgs(argv) {
     }
   }
 
-  return { base, mode, output, timeoutMs };
+  return { base, mode, output, timeoutMs, concurrencyReport, minC4AggregateScale, maxC4P95LatencyMultiplier };
 }
 
 function printUsageAndExit() {
   console.log(`Usage: bun tools/benchmark_api.mjs [options]
   --base <url>         Base /v1 URL (default: http://127.0.0.1:9090/v1)
-  --mode <mode>        chat | raw | both (default: both)
+  --mode <mode>        chat | raw | both | concurrency (default: both)
   --output <path>      JSON artifact path (default: /tmp/zinc_api_benchmark_<ts>.json)
   --timeout-ms <ms>    Per-request timeout in milliseconds (default: 600000)
+  --no-concurrency-report
+                       Skip cN-vs-c1 scaling analysis in the artifact
+  --min-c4-aggregate-scale <x>
+                       Fail if any comparable c4 non-stream scenario has
+                       aggregate completion tok/s below x times c1
+  --max-c4-p95-latency-multiplier <x>
+                       Fail if any comparable c4 scenario has p95 latency
+                       above x times c1
   -h, --help           Show this help`);
   process.exit(0);
 }
@@ -299,6 +334,123 @@ function sum(values) {
   return values.reduce((acc, value) => acc + value, 0);
 }
 
+function scenarioFamilyKey(result) {
+  return [
+    result.kind,
+    result.stream ? "stream" : "nonstream",
+    result.prompt_chars,
+    result.max_tokens,
+  ].join(":");
+}
+
+export function buildConcurrencyReport(results) {
+  const groups = new Map();
+  for (const result of results) {
+    const key = scenarioFamilyKey(result);
+    const rows = groups.get(key) ?? [];
+    rows.push(result);
+    groups.set(key, rows);
+  }
+
+  const report = [];
+  for (const rows of groups.values()) {
+    const baseline = rows.find((row) => row.concurrency === 1);
+    if (!baseline) continue;
+
+    const comparisons = rows
+      .filter((row) => row.concurrency > 1)
+      .sort((a, b) => a.concurrency - b.concurrency)
+      .map((row) => {
+        const latencyP95Multiplier = row.latency_p95_s / Math.max(baseline.latency_p95_s, 1e-9);
+        const comparison = {
+          name: row.name,
+          concurrency: row.concurrency,
+          requests: row.requests,
+          latency_p95_s: row.latency_p95_s,
+          baseline_latency_p95_s: baseline.latency_p95_s,
+          p95_latency_multiplier: latencyP95Multiplier,
+        };
+
+        if (!row.stream && row.aggregate_completion_tps != null && baseline.aggregate_completion_tps != null) {
+          const aggregateScale = row.aggregate_completion_tps / Math.max(baseline.aggregate_completion_tps, 1e-9);
+          comparison.aggregate_completion_tps = row.aggregate_completion_tps;
+          comparison.baseline_aggregate_completion_tps = baseline.aggregate_completion_tps;
+          comparison.aggregate_completion_tps_scale = aggregateScale;
+          comparison.serialized_likely =
+            row.concurrency >= 4 &&
+            aggregateScale < 1.5 &&
+            latencyP95Multiplier > 2.5;
+        }
+
+        if (row.stream && row.ttft_p95_s != null && baseline.ttft_p95_s != null) {
+          comparison.ttft_p95_s = row.ttft_p95_s;
+          comparison.baseline_ttft_p95_s = baseline.ttft_p95_s;
+          comparison.ttft_p95_multiplier = row.ttft_p95_s / Math.max(baseline.ttft_p95_s, 1e-9);
+        }
+
+        return comparison;
+      });
+
+    if (comparisons.length === 0) continue;
+    report.push({
+      kind: baseline.kind,
+      stream: Boolean(baseline.stream),
+      prompt_chars: baseline.prompt_chars,
+      max_tokens: baseline.max_tokens,
+      baseline_name: baseline.name,
+      baseline_latency_p95_s: baseline.latency_p95_s,
+      baseline_aggregate_completion_tps: baseline.aggregate_completion_tps ?? null,
+      comparisons,
+    });
+  }
+  return report;
+}
+
+export function evaluateConcurrencyGate(report, options = {}) {
+  const failures = [];
+  for (const group of report) {
+    for (const comparison of group.comparisons) {
+      if (comparison.concurrency !== 4) continue;
+      if (
+        options.minC4AggregateScale != null &&
+        comparison.aggregate_completion_tps_scale != null &&
+        comparison.aggregate_completion_tps_scale < options.minC4AggregateScale
+      ) {
+        failures.push(
+          `${comparison.name}: aggregate scale ${comparison.aggregate_completion_tps_scale.toFixed(2)}x < ${options.minC4AggregateScale.toFixed(2)}x`,
+        );
+      }
+      if (
+        options.maxC4P95LatencyMultiplier != null &&
+        comparison.p95_latency_multiplier > options.maxC4P95LatencyMultiplier
+      ) {
+        failures.push(
+          `${comparison.name}: p95 latency multiplier ${comparison.p95_latency_multiplier.toFixed(2)}x > ${options.maxC4P95LatencyMultiplier.toFixed(2)}x`,
+        );
+      }
+    }
+  }
+  return { passed: failures.length === 0, failures };
+}
+
+export function summarizeConcurrencyComparison(group, comparison) {
+  const parts = [
+    `${comparison.name} vs ${group.baseline_name}`,
+    `c=${comparison.concurrency}`,
+    `p95=${comparison.p95_latency_multiplier.toFixed(2)}x`,
+  ];
+  if (comparison.aggregate_completion_tps_scale != null) {
+    parts.push(`agg=${comparison.aggregate_completion_tps_scale.toFixed(2)}x`);
+  }
+  if (comparison.ttft_p95_multiplier != null) {
+    parts.push(`ttft=${comparison.ttft_p95_multiplier.toFixed(2)}x`);
+  }
+  if (comparison.serialized_likely) {
+    parts.push("SERIALIZED_LIKELY");
+  }
+  return `concurrency: ${parts.join(" ")}`;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const scenarios = defaultScenarios(args.mode);
@@ -314,14 +466,35 @@ async function main() {
     console.log(summarizeResult(result));
   }
 
+  const concurrencyReport = args.concurrencyReport ? buildConcurrencyReport(results) : [];
+  if (args.concurrencyReport) {
+    for (const group of concurrencyReport) {
+      for (const comparison of group.comparisons) {
+        console.log(summarizeConcurrencyComparison(group, comparison));
+      }
+    }
+  }
+
   const artifact = {
     base: args.base,
     mode: args.mode,
     generated_at_unix: Math.floor(Date.now() / 1000),
     results,
+    concurrency_report: concurrencyReport,
   };
   await Bun.write(args.output, `${JSON.stringify(artifact, null, 2)}\n`);
   console.log(`ARTIFACT ${args.output}`);
+
+  const gate = evaluateConcurrencyGate(concurrencyReport, {
+    minC4AggregateScale: args.minC4AggregateScale,
+    maxC4P95LatencyMultiplier: args.maxC4P95LatencyMultiplier,
+  });
+  if (!gate.passed) {
+    for (const failure of gate.failures) {
+      console.error(`CONCURRENCY_GATE_FAIL ${failure}`);
+    }
+    process.exitCode = 2;
+  }
 }
 
 if (import.meta.main) {

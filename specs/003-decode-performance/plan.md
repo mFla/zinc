@@ -17,7 +17,7 @@ Optimize ZINC decode throughput from 4 tok/s to 107+ tok/s on RDNA4 by eliminati
 **Project Type**: CLI inference engine (server mode planned in Phase 4)
 **Performance Goals**: ≥27 tok/s milestone 1 (memory-bandwidth floor), ≥107 tok/s target (llama.cpp parity)
 **Constraints**: wave64 only, system glslc 2023.8 only (newer causes 5x regression on RADV), single-request decode
-**Scale/Scope**: Single model (Qwen3.5-35B-A3B Q4_K_XL, 21 GB, 40 layers, 256 experts top-8)
+**Scale/Scope**: Single model (Qwen3.6-35B-A3B Q4_K_XL, 21 GB, 40 layers, 256 experts top-8)
 
 ## Constitution Check
 

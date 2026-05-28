@@ -72,8 +72,8 @@ curl http://localhost:8080/health
 ## Validation Scenario 4: MoE/Mamba Architecture (US4)
 
 ```bash
-# Load Qwen3.5-35B-A3B (SSM+attention hybrid MoE)
-./zig-out/bin/zinc -m Qwen3.5-35B-A3B-Q4_K.gguf --prompt "Explain quantum computing"
+# Load Qwen3.6-35B-A3B (SSM+attention hybrid MoE)
+./zig-out/bin/zinc -m Qwen3.6-35B-A3B-Q4_K.gguf --prompt "Explain quantum computing"
 
 # Expected: Coherent output at 110+ tok/s on AI PRO R9700
 ```

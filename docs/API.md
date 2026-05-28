@@ -1,79 +1,181 @@
 # ZINC Serving API Reference
 
-ZINC exposes an OpenAI-compatible HTTP API. Point any OpenAI SDK client at ZINC by changing the base URL — no code changes required.
+ZINC exposes a local OpenAI-compatible HTTP API. Point OpenAI-style clients at
+the server by changing the base URL.
 
 ```bash
-# Start the server (append --debug or use ZINC_DEBUG=1 for diagnostic logs)
-./zig-out/bin/zinc -m /path/to/model.gguf -p 8080
+# Start the server. Plain server mode defaults to port 8080.
+./zig-out/bin/zinc --model-id qwen3-8b-q4k-m -p 8080
 
-# Use with any OpenAI client
 export OPENAI_BASE_URL=http://localhost:8080/v1
 ```
+
+`zinc chat` is a convenience command for the built-in chat UI and defaults to
+port 9090 unless `-p` is provided.
+
+## Compatibility Notes
+
+The API intentionally follows the OpenAI response shapes where practical, but
+ZINC is still a local single-process engine:
+
+- `/v1/chat/completions` supports streaming SSE, non-streaming responses,
+  `temperature`, `top_p`, `enable_thinking`, optional `session_id` prompt reuse,
+  and OpenAI-style tool calling for ChatML/Qwen-family templates.
+- `/v1/completions` is currently a raw, non-streaming text-completion path.
+  It accepts common compatibility fields, but sampling controls and `stream`
+  are not applied on this endpoint yet.
+- Request-provided `stop` sequences are not implemented yet. Chat generation
+  still stops on model/template end markers such as `<|im_end|>`.
+- Generation runs under one engine lock. Concurrent HTTP requests are accepted,
+  but decode is serialized.
+- The `model` request field is honored for managed models: if it names an
+  installed catalog model different from the active model, ZINC attempts to
+  activate it before generation.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/chat/completions` | Chat inference (streaming and non-streaming) |
-| POST | `/v1/completions` | Text completion |
-| GET | `/v1/models` | List managed models, fit status, install state, and the active entry |
+| POST | `/v1/chat/completions` | Chat inference, streaming and non-streaming |
+| POST | `/v1/completions` | Raw text completion, non-streaming |
+| GET | `/v1/models` | Managed catalog, install state, active model, memory status |
+| POST | `/v1/models/pull` | Download an installed-compatible managed model asynchronously |
 | POST | `/v1/models/activate` | Activate an installed managed model |
 | POST | `/v1/models/remove` | Remove a cached managed model, optionally unloading it first |
-| GET | `/health` | Server health, active requests, queued requests, and uptime |
+| GET | `/health` | Health, queue counters, uptime, GPU memory/context status |
+| GET | `/` or `/chat` | Built-in chat UI |
 
 ---
 
 ## POST /v1/chat/completions
 
-Generate a chat completion from a conversation. Supports both streaming (SSE) and non-streaming responses.
+Generate a chat completion from a message list.
 
 ### Request
 
 ```json
 {
-  "model": "qwen",
+  "model": "qwen3-8b-q4k-m",
+  "session_id": "chat-123",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "What is the capital of France?"}
   ],
   "max_tokens": 256,
   "temperature": 0.7,
-  "enable_thinking": true,
   "top_p": 0.9,
-  "stream": true,
-  "stop": ["\n\n"]
+  "enable_thinking": false,
+  "stream": true
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | required | OpenAI-compatibility field. Generation currently runs on the server's active model. |
-| `messages` | array | required | Conversation messages with `role` and `content` |
-| `max_tokens` | integer | 256 | Maximum tokens to generate |
-| `temperature` | float | 1.0 | Sampling temperature. `0` = greedy (deterministic) |
-| `enable_thinking` | boolean | false | When the active model's chat template supports it, request an open `<think>` block instead of the no-thinking generation suffix |
-| `top_p` | float | 1.0 | Nucleus sampling threshold |
-| `stream` | boolean | false | Enable Server-Sent Events streaming |
-| `stop` | string or array | null | Stop sequence(s) to halt generation |
+| `model` | string | current model | Managed model id to use. If installed and different from the active model, the server activates it before generation. |
+| `session_id` | string | empty | Optional prompt-reuse key. Reusing a session id lets ZINC reuse the matching prefix for append-only chat histories. |
+| `messages` | array | required | OpenAI-style messages. `content` may be a string, `null`, or an array of text content blocks. Non-text blocks are ignored. |
+| `max_tokens` | integer | 256 | Maximum generated tokens before context-budget clamping. |
+| `temperature` | float | 0.0 | Sampling temperature. `0` uses greedy decoding. Values are clamped to `0..2`. |
+| `top_p` | float | 1.0 | Nucleus sampling threshold, clamped to `0..1`. |
+| `enable_thinking` | boolean | model default | For templates that support it, request an open thinking block. Catalog entries with unstable thinking can force this off. |
+| `stream` | boolean | false | Enable Server-Sent Events streaming. |
+| `tools` | array | empty | OpenAI function-tool definitions. Rendered for ChatML/Qwen-style templates when tool calling is enabled. |
+| `tool_choice` | string or object | `auto` | `"none"` suppresses tool injection. `"auto"` and forced function-object choices are currently treated as automatic tool choice. |
 
-`enable_thinking` is currently model-dependent. Qwen-style templates that expose `enable_thinking` and `<think>` honor it; models without that template support ignore the flag.
-
-#### Message roles
+Supported message roles:
 
 | Role | Description |
 |------|-------------|
-| `system` | System prompt — sets behavior and context |
-| `user` | User message |
-| `assistant` | Previous assistant response (for multi-turn) |
+| `system` | System prompt. |
+| `user` | User message. |
+| `assistant` | Previous assistant response. May include historical `tool_calls`. |
+| `tool` | Tool result message with `tool_call_id`; rendered back into ChatML tool-response blocks for Qwen-style templates. |
 
-### Response (non-streaming)
+### Tool Calling
+
+Tool calling is enabled by default and can be disabled with:
+
+```bash
+ZINC_TOOL_CALLING=0 ./zig-out/bin/zinc --model-id qwen3-8b-q4k-m
+```
+
+ZINC never executes tools. It only renders tool definitions into the prompt,
+parses model-emitted `<tool_call>...</tool_call>` blocks, returns structured
+`tool_calls`, and accepts subsequent `role: "tool"` result messages from the
+client.
+
+Example request:
+
+```json
+{
+  "model": "qwen3-8b-q4k-m",
+  "messages": [{"role": "user", "content": "What time is it in UTC?"}],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Return the current time for a timezone.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "timezone": {"type": "string"}
+          },
+          "required": ["timezone"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
+
+Non-streaming tool-call response shape:
 
 ```json
 {
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
   "created": 1711500000,
-  "model": "Qwen3.5-35B-A3B-Q4_K",
+  "model": "Qwen3 8B Q4_K_M",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+              "name": "get_time",
+              "arguments": "{\"timezone\":\"UTC\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 128,
+    "completion_tokens": 12,
+    "total_tokens": 140
+  }
+}
+```
+
+### Response
+
+Non-streaming responses use the OpenAI chat-completion shape:
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1711500000,
+  "model": "Qwen3 8B Q4_K_M",
   "choices": [
     {
       "index": 0,
@@ -92,104 +194,67 @@ Generate a chat completion from a conversation. Supports both streaming (SSE) an
 }
 ```
 
-### Response (streaming)
+When `stream: true`, the server responds with `Content-Type:
+text/event-stream`. The first chunk includes the assistant role, content chunks
+follow, and the final chunk carries `finish_reason`.
 
-When `stream: true`, the server responds with `Content-Type: text/event-stream`. Each event is a JSON object:
+```text
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
-```
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":"The"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{"content":"Paris"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{"content":" capital"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3.5-35B-A3B-Q4_K","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1711500000,"model":"Qwen3 8B Q4_K_M","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
 
-### Example: curl
+Streaming tool calls are emitted atomically as `delta.tool_calls` chunks, with
+`finish_reason: "tool_calls"` in the final chunk when a tool call was produced.
+
+### curl
 
 ```bash
-# Non-streaming
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 128,
-    "enable_thinking": true
+    "model": "qwen3-8b-q4k-m",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 64
   }'
 
-# Streaming
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen",
-    "messages": [{"role": "user", "content": "Hello"}],
+    "model": "qwen3-8b-q4k-m",
+    "messages": [{"role": "user", "content": "Explain gravity briefly."}],
     "max_tokens": 128,
-    "enable_thinking": true,
     "stream": true
   }'
-```
-
-### Example: Node.js (OpenAI SDK)
-
-```typescript
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  baseURL: "http://localhost:8080/v1",
-  apiKey: "not-needed",
-});
-
-// Non-streaming
-const response = await client.chat.completions.create({
-  model: "qwen",
-  messages: [{ role: "user", content: "What is 2+2?" }],
-  max_tokens: 128,
-  enable_thinking: true,
-});
-console.log(response.choices[0].message.content);
-
-// Streaming
-const stream = await client.chat.completions.create({
-  model: "qwen",
-  messages: [{ role: "user", content: "Explain gravity" }],
-  max_tokens: 256,
-  enable_thinking: true,
-  stream: true,
-});
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || "");
-}
 ```
 
 ---
 
 ## POST /v1/completions
 
-Generate a text completion from a raw prompt string. Same parameters as chat completions, but uses `prompt` instead of `messages`.
+Generate from a raw text prompt without applying a chat template.
 
 ### Request
 
 ```json
 {
-  "model": "qwen",
+  "model": "qwen3-8b-q4k-m",
   "prompt": "The capital of France is",
-  "max_tokens": 64,
-  "temperature": 0.0,
-  "stream": false
+  "max_tokens": 64
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | required | Model identifier |
-| `prompt` | string | required | Raw text prompt |
-| `max_tokens` | integer | 256 | Maximum tokens to generate |
-| `temperature` | float | 1.0 | Sampling temperature |
-| `top_p` | float | 1.0 | Nucleus sampling threshold |
-| `stream` | boolean | false | Enable SSE streaming |
-| `stop` | string or array | null | Stop sequence(s) |
+| `model` | string | current model | Managed model id to use; may activate an installed model before generation. |
+| `prompt` | string | required | Raw text prompt. |
+| `max_tokens` | integer | 256 | Maximum generated tokens before context-budget clamping. |
+| `temperature` | float | accepted | Parsed for compatibility but not applied by this endpoint yet. |
+| `stream` | boolean | accepted | Parsed for compatibility but ignored; responses are non-streaming JSON. |
 
 ### Response
 
@@ -198,18 +263,18 @@ Generate a text completion from a raw prompt string. Same parameters as chat com
   "id": "cmpl-abc123",
   "object": "text_completion",
   "created": 1711500000,
-  "model": "Qwen3.5-35B-A3B-Q4_K",
+  "model": "Qwen3 8B Q4_K_M",
   "choices": [
     {
       "index": 0,
-      "text": " Paris, the largest city in France.",
+      "text": " Paris.",
       "finish_reason": "stop"
     }
   ],
   "usage": {
     "prompt_tokens": 6,
-    "completion_tokens": 9,
-    "total_tokens": 15
+    "completion_tokens": 2,
+    "total_tokens": 8
   }
 }
 ```
@@ -218,9 +283,9 @@ Generate a text completion from a raw prompt string. Same parameters as chat com
 
 ## GET /v1/models
 
-List managed models, fit status, install state, and the active entry. ZINC still loads one model into memory at a time, but this endpoint exposes the built-in managed catalog for the current server GPU profile.
-
-Each managed model object now includes `release_date` as a `YYYY-MM-DD` string sourced from the catalog metadata. Raw manually loaded models expose an empty string for that field.
+List the managed catalog for the server's current GPU profile, including install
+state, active model, fit decisions, download progress, and active GPU memory
+usage. ZINC loads one model into memory at a time.
 
 ### Response
 
@@ -228,24 +293,43 @@ Each managed model object now includes `release_date` as a `YYYY-MM-DD` string s
 {
   "object": "list",
   "profile": "amd-rdna4-32gb",
+  "active_memory_used_bytes": 22300000000,
+  "active_memory_budget_bytes": 34359738368,
+  "active_memory_weights_bytes": 21000000000,
+  "active_memory_runtime_bytes": 1300000000,
+  "active_context_reserved_bytes": 536870912,
+  "active_context_active_bytes": 131072,
+  "active_context_tokens": 128,
+  "active_context_capacity_tokens": 4096,
   "data": [
     {
-      "id": "qwen35-35b-a3b-q4k-xl",
+      "id": "qwen36-35b-a3b-q4k-xl",
       "object": "model",
       "created": 1711500000,
       "owned_by": "zinc",
-      "display_name": "Qwen3.5 35B-A3B UD Q4_K_XL",
-      "release_date": "2026-02-16",
-      "homepage_url": "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF",
-      "installed": false,
-      "active": false,
+      "context_length": 4096,
+      "display_name": "Qwen3.6 35B-A3B UD Q4_K_XL",
+      "release_date": "2026-04-15",
+      "homepage_url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF",
+      "family": "Qwen 3.6",
+      "quantization": "Q4_K_XL",
+      "size_bytes": 21000000000,
+      "installed": true,
+      "active": true,
       "managed": true,
       "supported_on_current_gpu": true,
       "fits_current_gpu": true,
-      "required_vram_bytes": 22987514102,
+      "required_vram_bytes": 23106019926,
+      "required_vram_with_offload_bytes": 23106019926,
+      "requires_offload_to_fit": false,
       "fit_source": "catalog",
       "status": "supported",
-      "supports_thinking_toggle": false
+      "supports_thinking_toggle": false,
+      "downloading": false,
+      "download_phase": "idle",
+      "downloaded_bytes": 0,
+      "download_total_bytes": 0,
+      "download_error": ""
     }
   ]
 }
@@ -253,9 +337,52 @@ Each managed model object now includes `release_date` as a `YYYY-MM-DD` string s
 
 ---
 
+## POST /v1/models/pull
+
+Download a supported managed model into the local cache. Downloads run in a
+background thread; poll `GET /v1/models` for progress.
+
+### Request
+
+```json
+{
+  "model": "qwen3-8b-q4k-m"
+}
+```
+
+### Responses
+
+Already installed:
+
+```json
+{
+  "object": "model.pull",
+  "id": "qwen3-8b-q4k-m",
+  "state": "installed"
+}
+```
+
+Started download:
+
+```json
+{
+  "object": "model.pull",
+  "id": "qwen3-8b-q4k-m",
+  "state": "downloading",
+  "downloaded_bytes": 0,
+  "download_total_bytes": 0
+}
+```
+
+If the same model is already downloading, the server returns `202` with the
+current `state`, `downloaded_bytes`, and `download_total_bytes`.
+
+---
+
 ## POST /v1/models/activate
 
-Activate an installed managed model in a running server. The model must already exist in the local managed cache and must fit the current GPU budget.
+Activate an installed managed model in a running server. The model must exist in
+the local managed cache and fit the current GPU budget.
 
 ### Request
 
@@ -275,22 +402,13 @@ Activate an installed managed model in a running server. The model must already 
 }
 ```
 
-### Example: curl
-
-```bash
-# Switch the running server to an installed managed model
-curl http://localhost:8080/v1/models/activate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-8b-q4k-m"
-  }'
-```
-
 ---
 
 ## POST /v1/models/remove
 
-Remove an installed managed model from the local cache. If the target model is currently loaded by the running server, the request fails by default. Set `force: true` to unload it first and then delete the cached files.
+Remove an installed managed model from the local cache. If the target model is
+currently loaded, the request fails by default. Set `force: true` to unload it
+first and then remove the cached files.
 
 ### Request
 
@@ -316,57 +434,49 @@ Remove an installed managed model from the local cache. If the target model is c
 }
 ```
 
-### Example: curl
-
-```bash
-# Remove a cached model if it is not currently loaded
-curl http://localhost:8080/v1/models/remove \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-8b-q4k-m"
-  }'
-
-# Force-unload it from the running server first
-curl http://localhost:8080/v1/models/remove \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3-8b-q4k-m",
-    "force": true
-  }'
-```
-
-Without `force`, a loaded target returns `409 Conflict` and the cached files remain untouched. After a forced remove, the server may be left with no model loaded; in that state, generation endpoints return `503` until another model is activated or the server is restarted with a model.
+Without `force`, a loaded target returns `409 Conflict` and the cached files
+remain untouched. After a forced remove, the server may have no model loaded;
+generation endpoints then return `503` until another model is activated or the
+server is restarted with a model.
 
 ---
 
 ## GET /health
 
-Server health check for monitoring and load balancers.
+Server health check for monitoring and local UI state.
 
 ### Response
 
 ```json
 {
   "status": "ok",
-  "model": "qwen3.5-35b",
+  "model": "Qwen3 8B Q4_K_M",
   "active_requests": 1,
   "queued_requests": 0,
-  "uptime_seconds": 3600
+  "uptime_seconds": 3600,
+  "gpu_memory_used_bytes": 10100000000,
+  "gpu_memory_budget_bytes": 34359738368,
+  "gpu_memory_weights_bytes": 8900000000,
+  "gpu_memory_runtime_bytes": 1200000000,
+  "gpu_context_reserved_bytes": 536870912,
+  "gpu_context_active_bytes": 131072,
+  "gpu_context_tokens": 128,
+  "gpu_context_capacity_tokens": 4096
 }
 ```
 
-`model` is `"none"` when the server is running but no model is currently loaded.
+`model` is `"none"` when the server is running without a loaded model.
 
 ---
 
-## Error responses
+## Error Responses
 
-All errors follow the OpenAI error schema:
+Errors use an OpenAI-style envelope:
 
 ```json
 {
   "error": {
-    "message": "Invalid request: missing 'messages' field",
+    "message": "Field 'messages' is required",
     "type": "invalid_request_error",
     "code": 400
   }
@@ -375,58 +485,53 @@ All errors follow the OpenAI error schema:
 
 | Status | Type | When |
 |--------|------|------|
-| 400 | `invalid_request_error` | Malformed JSON, missing required fields, invalid parameters |
-| 400 | `invalid_request_error` | Unknown managed model id, model not installed, or model does not fit when activating |
-| 409 | `invalid_request_error` | `POST /v1/models/remove` was asked to remove the model currently loaded by the server without `force: true` |
-| 503 | `service_unavailable` | Generation was requested while the server has no model loaded |
-| 500 | `internal_error` | GPU error, inference failure |
+| 400 | `invalid_request_error` | Malformed JSON, missing required fields, invalid parameters, unknown model id for management operations, unsupported or non-fitting model activation. |
+| 400 | `context_length_exceeded` | Prompt exceeds the active model context capacity. |
+| 404 | `model_not_found` | Generation requested an unknown or not-installed managed model. |
+| 404 | `not_found` | Unknown endpoint. |
+| 409 | `invalid_request_error` | GPU already reserved, another model download is in progress, or removing the loaded model without `force: true`. |
+| 501 | `unsupported_operation` | Model-management endpoint used on a build/backend without management support. |
+| 503 | `service_unavailable` | Generation requested while no model is loaded. |
+| 500 | `internal_error` | Tokenization, GPU, inference, or response-size failure. |
 
----
+## CORS And Connection Handling
 
-## CORS
+- All endpoints include `Access-Control-Allow-Origin: *`.
+- `OPTIONS` requests return `200 {}` for CORS preflight.
+- Streaming responses use HTTP/1.1 chunked transfer encoding (`Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`, `Transfer-Encoding: chunked`).
+- Client disconnection during streaming stops generation promptly.
+- Non-streaming JSON responses send `Connection: close`. The HTML routes (`/`, `/chat`) also send `Connection: close`.
 
-All endpoints include `Access-Control-Allow-Origin: *` for browser-based clients.
+## Server Configuration
 
-## Connection handling
-
-- Streaming responses use HTTP/1.1 chunked transfer encoding
-- Client disconnection during streaming immediately stops token generation and frees KV cache pages
-- Connections are closed after each response (`Connection: close`)
-
-## Concurrency
-
-ZINC accepts overlapping requests, but generation is currently serialized behind one engine lock. That means:
-
-- one request generates at a time
-- later requests queue behind the active generation
-- `/health` reports `active_requests` and `queued_requests`
-- the chat UI can switch models through `/v1/models/activate`, but the switch also takes the same generation lock
-
-## Server configuration
-
-```
+```text
 ./zig-out/bin/zinc [options]
   -m, --model <path>       Path to GGUF model file
-  --model-id <id>         Managed model id from the built-in catalog/cache
-  -p, --port <port>        Server port (default: 8080)
-  -d, --device <id>        Vulkan device index (default: 0)
+  --model-id <id>          Managed model id from the built-in catalog/cache
+  -p, --port <port>        Server port (default: 8080; `zinc chat` defaults to 9090)
+  -d, --device <id>        GPU device index (default: 0)
   -c, --context <size>     Context length (default: 4096)
-  --parallel <n>           Max concurrent requests (default: 4)
+  --parallel <n>           Max queued/concurrent HTTP requests (default: 4)
   --kv-quant <bits>        TurboQuant KV cache compression: 0/2/3/4 (default: 0=off)
-  --prompt <text>          Single prompt mode (no server, CLI only)
+  --prompt <text>          Single prompt mode (CLI only; does not start the server)
+  -n, --max-tokens <n>     CLI generation token cap
+  --chat                   Apply the model chat template in CLI prompt mode
+  --raw                    Do not auto-apply chat templates in CLI prompt mode
 ```
 
-## Supported models
+## Supported Models
 
-ZINC loads models in GGUF format with the following quantization types:
+ZINC loads GGUF models and supports the quantization families used by the
+managed catalog:
 
 | Format | Supported | Notes |
 |--------|-----------|-------|
-| Q4_K | Yes | Primary target, hand-tuned DMMV shader |
-| Q5_K | Yes | Hand-tuned DMMV shader |
-| Q6_K | Yes | Hand-tuned DMMV shader |
-| Q8_0 | Yes | Used for attention weights |
-| F16 | Yes | For KV cache and small tensors |
-| F32 | Yes | Baseline, no quantization overhead |
+| Q4_K | Yes | Primary K-quant path |
+| Q5_K | Yes | K-quant path |
+| Q6_K | Yes | K-quant path |
+| Q8_0 | Yes | Common attention and projection path |
+| F16 | Yes | Small tensors and some model data |
+| F32 | Yes | Baseline/scalar tensor path |
 
-Supported architectures: LLaMA, Mistral, Qwen2, Qwen2-MoE (including Qwen3.5 and Qwen3.6 hybrid SSM+attention), Mamba, Jamba.
+Run `./zig-out/bin/zinc model list` or `GET /v1/models` for the exact catalog
+entries that are supported and fit on the current machine.

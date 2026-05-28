@@ -20,6 +20,9 @@ pub const GpuVendor = enum {
     amd_rdna4_apu,
     amd_other,
     nvidia,
+    /// Intel Arc Xe2 (Battlemage, B-series): SIMD16 subgroup.
+    intel_arc_xe2,
+    /// Intel Arc Xe-HPG (Alchemist, A-series): SIMD32 subgroup.
     intel_arc,
     unknown,
 };
@@ -38,7 +41,7 @@ pub const GpuConfig = struct {
     bandwidth_gbps: u32,
     /// Number of compute units.
     compute_units: u32,
-    /// SIMD wave width (32 or 64).
+    /// SIMD wave width (from Vulkan subgroup size: e.g. 16, 32, or 64).
     wave_size: u32,
     /// Cooperative matrix support.
     coopmat_support: bool,
@@ -95,6 +98,15 @@ pub fn detect(instance: *const Instance) GpuConfig {
     const props = instance.device_props;
     const name_slice = std.mem.sliceTo(&props.deviceName, 0);
 
+    // Use the Vulkan default subgroup size. Subgroup size control exposes a
+    // min/max range, but the minimum is not the size used by ordinary compute
+    // pipelines. Intel Battlemage, for example, reports 16..32 while running
+    // unrequested compute shaders at subgroupSize=32.
+    const subgroup_size: u32 = chooseDefaultSubgroupSize(
+        instance.caps.default_subgroup_size,
+        instance.caps.min_subgroup_size,
+    );
+
     var config = GpuConfig{
         .vendor = .unknown,
         .device_name = undefined,
@@ -102,7 +114,7 @@ pub fn detect(instance: *const Instance) GpuConfig {
         .vram_mb = @intCast(instance.vramBytes() / (1024 * 1024)),
         .bandwidth_gbps = 0,
         .compute_units = 0,
-        .wave_size = 32,
+        .wave_size = subgroup_size,
         .coopmat_support = instance.caps.cooperative_matrix,
         .l1_cache_kb = 16,
         .l2_cache_mb = 2,
@@ -122,7 +134,6 @@ pub fn detect(instance: *const Instance) GpuConfig {
     if (props.vendorID == 0x1002) {
         // AMD — differentiate RDNA3 vs RDNA4 by device ID ranges
         config.vendor = classifyAmd(props.deviceID, name_slice);
-        config.wave_size = 64; // wave64 optimal on RDNA3/4
 
         switch (config.vendor) {
             .amd_rdna4 => {
@@ -163,16 +174,38 @@ pub fn detect(instance: *const Instance) GpuConfig {
                 config.compute_units = 32;
             },
         }
+        // AMD RDNA3/4 always uses wave64 for optimal scheduling, regardless of
+        // what min_subgroup_size reports (AMD supports both 32 and 64, but 64
+        // is the native width and what our shaders are tuned for).
+        config.wave_size = 64;
     } else if (props.vendorID == 0x10de) {
         // NVIDIA
         config.vendor = .nvidia;
-        config.wave_size = 32;
         config.bandwidth_gbps = 512;
     } else if (props.vendorID == 0x8086) {
-        // Intel
-        config.vendor = .intel_arc;
-        config.wave_size = 32;
-        config.bandwidth_gbps = 256;
+        config.vendor = classifyIntel(props.deviceID, name_slice);
+        if (config.vendor == .intel_arc_xe2) {
+            // Xe2 (Battlemage, Arc B-series). Per-SKU bandwidth ranges from
+            // 224 GB/s (B50) to 608 GB/s (B70 / B65 / B580) on the supported
+            // cards; 640 GB/s here is a high-water-mark headroom assumption,
+            // not a per-SKU lookup. See docs/INTEL_GPU_REFERENCE.md for the
+            // actual per-card table.
+            config.bandwidth_gbps = 640;
+            config.compute_units = 32;
+            // Xe2 has 256 KB L1 per Xe-core; on B70's 32 Xe-cores that totals
+            // 8 MB across the GPU. The shared GPU-wide L2 size is driver-
+            // reported and varies by SKU; 8 MB is a planner placeholder.
+            config.l1_cache_kb = 256;
+            config.l2_cache_mb = 8;
+        } else {
+            // Xe-HPG (Alchemist, Arc A-series). A770: 512 GB/s, 32 Xe-cores.
+            // L1/SLM is configurable on Alchemist; keep a conservative L1 hint.
+            config.bandwidth_gbps = 512;
+            config.compute_units = 32;
+            config.l1_cache_kb = 64;
+            config.l2_cache_mb = 8;
+        }
+        config.flash_attn_block_size = 256;
     }
 
     // Derive DMMV parameters from wave size
@@ -185,9 +218,9 @@ pub fn detect(instance: *const Instance) GpuConfig {
 
 /// Classify AMD GPU architecture from device ID and name.
 fn classifyAmd(device_id: u32, name: []const u8) GpuVendor {
-    // gfx1200/gfx1201 = RDNA4 (Navi 48/44)
+    // gfx1201 = RDNA4 Navi 48 (RX 9070 / 9070 XT / 9070 GRE / Radeon AI PRO R9700)
+    // gfx1200 = RDNA4 Navi 44 (RX 9060 / 9060 XT)
     // gfx1100-gfx1103 = RDNA3
-    // Device IDs: RDNA4 starts at 0x15xx range
     _ = device_id;
 
     // RDNA4 iGPU: Strix Halo APU (gfx1151)
@@ -201,7 +234,7 @@ fn classifyAmd(device_id: u32, name: []const u8) GpuVendor {
         return .amd_rdna4_apu;
     }
 
-    // Discrete RDNA4: Navi 48 (gfx1200 / RX 9070) and Navi 44 (gfx1201 / RX 9060 / R9700)
+    // Discrete RDNA4: Navi 48 (gfx1201 / RX 9070 / R9700) and Navi 44 (gfx1200 / RX 9060)
     if (containsIgnoreCase(name, "gfx1200") or
         containsIgnoreCase(name, "gfx1201") or
         containsIgnoreCase(name, "9070") or
@@ -227,6 +260,24 @@ fn classifyAmd(device_id: u32, name: []const u8) GpuVendor {
     return .amd_other;
 }
 
+/// Classify Intel GPU architecture from device ID and name.
+fn classifyIntel(device_id: u32, name: []const u8) GpuVendor {
+    _ = device_id;
+    // Xe2 = Battlemage (Arc B-series): Mesa ANV reports these as
+    // "Intel(R) Graphics (BMG Gxx)" where BMG is the Battlemage codename.
+    // Retail names like "Arc B580", "Arc B570", "Arc Pro B70" may also appear.
+    // Xe-HPG = Alchemist (Arc A-series): default for other Intel Arc GPUs.
+    if (containsIgnoreCase(name, "bmg") or
+        containsIgnoreCase(name, "xe2") or
+        containsIgnoreCase(name, "battlemage") or
+        containsIgnoreCase(name, " b5") or
+        containsIgnoreCase(name, " b7"))
+    {
+        return .intel_arc_xe2;
+    }
+    return .intel_arc;
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -243,6 +294,12 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn chooseDefaultSubgroupSize(default_subgroup_size: u32, min_subgroup_size: u32) u32 {
+    if (default_subgroup_size > 0) return default_subgroup_size;
+    if (min_subgroup_size > 0) return min_subgroup_size;
+    return 32;
+}
+
 test "containsIgnoreCase" {
     try std.testing.expect(containsIgnoreCase("AMD Radeon RX 9070 XT", "9070"));
     try std.testing.expect(containsIgnoreCase("RADV GFX1201", "gfx1201"));
@@ -250,8 +307,8 @@ test "containsIgnoreCase" {
 }
 
 test "classifyAmd — discrete RDNA4" {
-    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7480, "AMD Radeon RX 9070 XT (RADV GFX1200)"));
-    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7481, "Radeon RX 9060 XT (RADV GFX1201)"));
+    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7480, "AMD Radeon RX 9070 XT (RADV GFX1201)"));
+    try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7481, "Radeon RX 9060 XT (RADV GFX1200)"));
     try std.testing.expectEqual(GpuVendor.amd_rdna4, classifyAmd(0x7461, "Radeon AI PRO R9700 (RADV GFX1201)"));
 }
 
@@ -266,6 +323,59 @@ test "classifyAmd — Strix Halo RDNA4 iGPU" {
 
 test "classifyAmd — RDNA3" {
     try std.testing.expectEqual(GpuVendor.amd_rdna3, classifyAmd(0x744C, "AMD Radeon RX 7900 XTX (RADV GFX1100)"));
+}
+
+test "classifyIntel — Arc B-series (Xe2)" {
+    try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel Arc Pro B70"));
+    try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel Arc B580"));
+    // Real Mesa ANV device name on Arc B70 (BMG G31)
+    try std.testing.expectEqual(GpuVendor.intel_arc_xe2, classifyIntel(0x0000, "Intel(R) Graphics (BMG G31)"));
+}
+
+test "classifyIntel — Arc A-series (Xe-HPG)" {
+    try std.testing.expectEqual(GpuVendor.intel_arc, classifyIntel(0x0000, "Intel Arc A770"));
+    try std.testing.expectEqual(GpuVendor.intel_arc, classifyIntel(0x0000, "Intel Arc A380"));
+}
+
+test "wave_size fallback and DMMV derivation" {
+    // Verify the subgroup size fallback and wave_size → DMMV parameter mapping.
+    // wave64 (AMD): workgroup 64, 2 rows per workgroup
+    {
+        const wave: u32 = 64;
+        const wg = wave;
+        const rows: u32 = if (wave == 64) 2 else 1;
+        try std.testing.expectEqual(@as(u32, 64), wg);
+        try std.testing.expectEqual(@as(u32, 2), rows);
+    }
+    // wave32 (NVIDIA): workgroup 32, 1 row
+    {
+        const wave: u32 = 32;
+        const wg = wave;
+        const rows: u32 = if (wave == 64) 2 else 1;
+        try std.testing.expectEqual(@as(u32, 32), wg);
+        try std.testing.expectEqual(@as(u32, 1), rows);
+    }
+    // wave16 (Intel Xe2): workgroup 16, 1 row
+    {
+        const wave: u32 = 16;
+        const wg = wave;
+        const rows: u32 = if (wave == 64) 2 else 1;
+        try std.testing.expectEqual(@as(u32, 16), wg);
+        try std.testing.expectEqual(@as(u32, 1), rows);
+    }
+    // Intel Battlemage commonly reports min=16/max=32 while the default
+    // subgroup width used by ordinary pipelines is 32.
+    {
+        try std.testing.expectEqual(@as(u32, 32), chooseDefaultSubgroupSize(32, 16));
+    }
+    // Fallback when default subgroup is unavailable but min_subgroup_size is set.
+    {
+        try std.testing.expectEqual(@as(u32, 16), chooseDefaultSubgroupSize(0, 16));
+    }
+    // Final fallback when neither field is available.
+    {
+        try std.testing.expectEqual(@as(u32, 32), chooseDefaultSubgroupSize(0, 0));
+    }
 }
 
 test "GpuConfig name" {

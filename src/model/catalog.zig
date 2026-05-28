@@ -29,6 +29,12 @@ pub const CatalogEntry = struct {
     sha256: []const u8,
     size_bytes: u64,
     required_vram_bytes: u64,
+    /// Bytes of MoE expert tensors that move to host RAM when
+    /// `ZINC_OFFLOAD_MOE_EXPERTS=1`. Zero for dense models (no benefit
+    /// from offload). For MoE entries this is a catalog estimate; the
+    /// loader/inspector will overwrite with the exact tensor sum once
+    /// the model is installed.
+    offloadable_vram_bytes: u64 = 0,
     default_context_length: u32,
     recommended_for_chat: bool,
     /// Whether the model produces stable, useful output when thinking is enabled.
@@ -38,33 +44,23 @@ pub const CatalogEntry = struct {
     tested_profiles: []const []const u8,
 };
 
+/// VRAM-fit assessment for a catalog entry against a specific GPU budget.
+pub const FitState = enum {
+    /// Model fits in VRAM with no special configuration.
+    fits,
+    /// Model fits only when `ZINC_OFFLOAD_MOE_EXPERTS=1` moves MoE expert
+    /// tensors to host RAM. Requires a recent driver and willingness to
+    /// pay PCIe latency on expert reads.
+    fits_with_offload,
+    /// Model is too large for this GPU even with offload.
+    does_not_fit,
+};
+
 /// Shared GPU profile string used for all Apple Silicon (Metal) devices.
 pub const apple_silicon_profile = "apple-silicon";
 
 /// The complete list of ZINC-validated managed models available for download.
 pub const entries = [_]CatalogEntry{
-    .{
-        .id = "qwen35-35b-a3b-q4k-xl",
-        .display_name = "Qwen3.5 35B-A3B UD Q4_K_XL",
-        .release_date = "2026-02-16",
-        .family = "qwen3.5",
-        .format = "gguf",
-        .quantization = "UD-Q4_K_XL",
-        .file_name = "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        .homepage_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF",
-        .download_url = "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf?download=true",
-        .sha256 = "1b0ac637dfa092bbba2793977db9485a40c4f8b42df5fe342f0076d61b66ae83",
-        .size_bytes = 22_241_950_336,
-        .required_vram_bytes = 22_987_514_102,
-        .default_context_length = 4096,
-        .recommended_for_chat = true,
-        .thinking_stable = true,
-        .status = .supported,
-        .tested_profiles = &.{
-            "amd-rdna4-32gb",
-            apple_silicon_profile,
-        },
-    },
     .{
         .id = "qwen36-35b-a3b-q4k-xl",
         .display_name = "Qwen3.6 35B-A3B UD Q4_K_XL",
@@ -78,6 +74,8 @@ pub const entries = [_]CatalogEntry{
         .sha256 = "",
         .size_bytes = 22_360_456_160,
         .required_vram_bytes = 23_106_019_926,
+        // 35B-A3B: same architecture as Qwen3.5; ≈ 18 GiB of offloadable experts.
+        .offloadable_vram_bytes = 18 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
@@ -85,49 +83,54 @@ pub const entries = [_]CatalogEntry{
         .tested_profiles = &.{
             "amd-rdna4-32gb",
             apple_silicon_profile,
+            "intel-arc",
         },
     },
     .{
-        .id = "gpt-oss-20b-q4k-m",
-        .display_name = "OpenAI GPT-OSS 20B Q4_K_M",
-        .release_date = "2025-06-25",
-        .family = "gpt-oss",
+        .id = "qwen36-27b-q4k-m",
+        .display_name = "Qwen3.6 27B Dense Q4_K_M",
+        .release_date = "2026-04-22",
+        .family = "qwen3.6",
         .format = "gguf",
         .quantization = "Q4_K_M",
-        .file_name = "openai_gpt-oss-20b-Q4_K_M.gguf",
-        .homepage_url = "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF",
-        .download_url = "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF/resolve/main/openai_gpt-oss-20b-Q4_K_M.gguf?download=true",
-        .sha256 = "86a21df11afa5a40031ec1974e368ae0ab561ee3995f4d08ff432e8b2b7af9fc",
-        .size_bytes = 11_673_418_816,
-        .required_vram_bytes = 14 * 1024 * 1024 * 1024,
+        .file_name = "Qwen3.6-27B-Q4_K_M.gguf",
+        .homepage_url = "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF",
+        .download_url = "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+        .sha256 = "",
+        .size_bytes = 16_817_244_384,
+        .required_vram_bytes = 20 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
-        .status = .supported,
+        .status = .experimental,
         .tested_profiles = &.{
+            "amd-rdna4-32gb",
             apple_silicon_profile,
+            "intel-arc",
         },
     },
     .{
-        .id = "qwen3-8b-q4k-m",
-        .display_name = "Qwen3 8B Q4_K_M",
-        .release_date = "2025-04-29",
-        .family = "qwen3",
+        .id = "qwen35-9b-q4k-m",
+        .display_name = "Qwen 3.5 9B Q4_K_M",
+        .release_date = "2026-02-28",
+        .family = "qwen3.5",
         .format = "gguf",
         .quantization = "Q4_K_M",
-        .file_name = "Qwen3-8B-Q4_K_M.gguf",
-        .homepage_url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF",
-        .download_url = "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf?download=true",
-        .sha256 = "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
-        .size_bytes = 5_027_784_512,
-        .required_vram_bytes = 6 * 1024 * 1024 * 1024,
+        .file_name = "Qwen3.5-9B-Q4_K_M.gguf",
+        .homepage_url = "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF",
+        .download_url = "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
+        .sha256 = "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+        .size_bytes = 5_680_522_464,
+        .required_vram_bytes = 7 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
         .status = .supported,
         .tested_profiles = &.{
             "amd-rdna4-32gb",
+            "amd-rdna4-16gb",
             apple_silicon_profile,
+            "intel-arc",
         },
     },
     .{
@@ -150,11 +153,12 @@ pub const entries = [_]CatalogEntry{
         .tested_profiles = &.{
             "amd-rdna4-32gb",
             apple_silicon_profile,
+            "intel-arc",
         },
     },
     .{
-        .id = "gemma4-12b-q4k-m",
-        .display_name = "Gemma 4 12B (26B-A4B MoE) Q4_K_M",
+        .id = "gemma4-26b-a4b-q4k-m",
+        .display_name = "Gemma 4 26B-A4B MoE Q4_K_M",
         .release_date = "2026-04-02",
         .family = "gemma4",
         .format = "gguf",
@@ -165,13 +169,16 @@ pub const entries = [_]CatalogEntry{
         .sha256 = "",
         .size_bytes = 16_868_236_288,
         .required_vram_bytes = 16 * 1024 * 1024 * 1024,
+        // Gemma4 26B-A4B MoE (~4B active, ~22B inactive experts) at Q4_K_M ≈ 11 GiB.
+        .offloadable_vram_bytes = 11 * 1024 * 1024 * 1024,
         .default_context_length = 4096,
         .recommended_for_chat = true,
         .thinking_stable = true,
-        .status = .experimental,
+        .status = .supported,
         .tested_profiles = &.{
             "amd-rdna4-32gb",
             apple_silicon_profile,
+            "intel-arc",
         },
     },
 };
@@ -239,6 +246,7 @@ pub fn profileForGpu(config: gpu_detect.GpuConfig) []const u8 {
         .amd_rdna3 => if (config.vram_mb >= 14 * 1024) "amd-rdna3-16gb" else "amd-rdna3-small",
         .amd_other => "amd-other",
         .nvidia => "nvidia",
+        .intel_arc_xe2 => "intel-arc",
         .intel_arc => "intel-arc",
         .unknown => "unknown",
     };
@@ -257,9 +265,33 @@ pub fn supportsProfile(entry: CatalogEntry, profile: []const u8) bool {
     return false;
 }
 
-/// Return whether the model's VRAM requirement fits within the given budget.
+/// Return whether the model's VRAM requirement fits within the given budget
+/// without enabling MoE offload. Strict — does not consider the offload escape
+/// hatch. Use `fitState` for the offload-aware tri-state assessment.
 pub fn fitsGpu(entry: CatalogEntry, vram_budget_bytes: u64) bool {
     return entry.required_vram_bytes <= vram_budget_bytes;
+}
+
+/// VRAM required when MoE expert tensors are offloaded to host RAM. Equal to
+/// `required_vram_bytes` for dense models (no offloadable tensors).
+pub fn requiredVramWithOffload(entry: CatalogEntry) u64 {
+    if (entry.offloadable_vram_bytes >= entry.required_vram_bytes) return 0;
+    return entry.required_vram_bytes - entry.offloadable_vram_bytes;
+}
+
+/// Tri-state fit assessment that distinguishes "fits as-is" from "fits only
+/// with `ZINC_OFFLOAD_MOE_EXPERTS=1`". Use this to surface the offload escape
+/// hatch to users when a model would otherwise look unsupported.
+pub fn fitState(entry: CatalogEntry, vram_budget_bytes: u64) FitState {
+    if (entry.required_vram_bytes <= vram_budget_bytes) return .fits;
+    if (entry.offloadable_vram_bytes > 0 and requiredVramWithOffload(entry) <= vram_budget_bytes) return .fits_with_offload;
+    return .does_not_fit;
+}
+
+/// Return true when the model needs `ZINC_OFFLOAD_MOE_EXPERTS=1` to fit
+/// (does not fit by itself but does fit with offload enabled).
+pub fn requiresOffloadToFit(entry: CatalogEntry, vram_budget_bytes: u64) bool {
+    return fitState(entry, vram_budget_bytes) == .fits_with_offload;
 }
 
 /// Return whether the model is both tested on the given profile and fits in VRAM.
@@ -273,6 +305,9 @@ pub fn supportedOnCurrentGpu(entry: CatalogEntry, profile: []const u8, vram_budg
 pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
     const families = .{
         .{ "qwen3.6", "qwen35" },
+        // Qwen 3.5 is a dense SSM+attention hybrid (the GGUF declares the
+        // "qwen35" architecture), the same family ZINC drives for Qwen 3.6 —
+        // not a plain transformer.
         .{ "qwen3.5", "qwen35" },
         .{ "qwen3", "qwen3" },
         .{ "qwen2.5", "qwen2" },
@@ -283,7 +318,6 @@ pub fn ggufArchForFamily(family: []const u8) ?[]const u8 {
         .{ "gemma", "gemma" },
         .{ "mamba", "mamba" },
         .{ "jamba", "jamba" },
-        .{ "gpt-oss", "gpt-oss" },
     };
     inline for (families) |pair| {
         if (std.mem.eql(u8, family, pair[0])) return pair[1];
@@ -321,14 +355,10 @@ test "find returns null for unknown model" {
     try std.testing.expect(find("nonexistent-model-id") == null);
 }
 
-test "removed qwen35 2B managed id is absent from catalog" {
-    try std.testing.expect(find("qwen35-2b-q4k-m") == null);
-}
-
 test "find returns known entry" {
-    const entry = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("Qwen3 8B Q4_K_M", entry.display_name);
-    try std.testing.expectEqualStrings("2025-04-29", entry.release_date);
+    const entry = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Qwen 3.5 9B Q4_K_M", entry.display_name);
+    try std.testing.expectEqualStrings("2026-02-28", entry.release_date);
 }
 
 test "find returns known qwen3.6 entry" {
@@ -339,6 +369,17 @@ test "find returns known qwen3.6 entry" {
     try std.testing.expect(entry.recommended_for_chat);
     try std.testing.expect(entry.thinking_stable);
     try std.testing.expect(entry.status == .supported);
+}
+
+test "find returns qwen3.6 27b dense entry" {
+    const entry = find("qwen36-27b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("Qwen3.6 27B Dense Q4_K_M", entry.display_name);
+    try std.testing.expectEqualStrings("2026-04-22", entry.release_date);
+    try std.testing.expectEqualStrings("qwen3.6", entry.family);
+    try std.testing.expectEqualStrings("Qwen3.6-27B-Q4_K_M.gguf", entry.file_name);
+    try std.testing.expect(entry.recommended_for_chat);
+    try std.testing.expect(entry.thinking_stable);
+    try std.testing.expect(entry.status == .experimental);
 }
 
 test "qwen3.6 family reuses qwen35 gguf architecture mapping" {
@@ -361,6 +402,15 @@ test "findForLoadedModel matches raw filename and loose display name" {
         "Qwen3.6 35B A3B UD Q4 K XL",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("qwen36-35b-a3b-q4k-xl", entry.id);
+}
+
+test "findForLoadedModel matches qwen36 27b dense filename" {
+    const entry = findForLoadedModel(
+        null,
+        "/root/models/Qwen3.6-27B-Q4_K_M.gguf",
+        "Qwen3.6 27B Q4 K M",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("qwen36-27b-q4k-m", entry.id);
 }
 
 test "profileForGpu maps RDNA4 32 GB boards" {
@@ -390,26 +440,64 @@ test "profileForMetal returns apple silicon profile" {
 }
 
 test "fitsGpu compares against required vram" {
-    const entry = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(fitsGpu(entry.*, 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!fitsGpu(entry.*, 20 * 1024 * 1024 * 1024));
 }
 
+test "fitState distinguishes fits, fits_with_offload, does_not_fit" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    // 32 GiB: fits everything, no offload needed.
+    try std.testing.expectEqual(FitState.fits, fitState(moe.*, 32 * 1024 * 1024 * 1024));
+    // 16 GiB: doesn't fit straight (needs ~22 GiB) but fits with offload (~3.5 GiB).
+    try std.testing.expectEqual(FitState.fits_with_offload, fitState(moe.*, 16 * 1024 * 1024 * 1024));
+    // 2 GiB: too small even with offload.
+    try std.testing.expectEqual(FitState.does_not_fit, fitState(moe.*, 2 * 1024 * 1024 * 1024));
+}
+
+test "fitState for dense model never returns fits_with_offload" {
+    const dense = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
+    // Fits in 8 GiB.
+    try std.testing.expectEqual(FitState.fits, fitState(dense.*, 8 * 1024 * 1024 * 1024));
+    // Doesn't fit in 4 GiB and can't be helped by offload (no expert tensors).
+    try std.testing.expectEqual(FitState.does_not_fit, fitState(dense.*, 4 * 1024 * 1024 * 1024));
+}
+
+test "requiresOffloadToFit only true when straight fit fails but offload fits" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!requiresOffloadToFit(moe.*, 32 * 1024 * 1024 * 1024)); // straight fit
+    try std.testing.expect(requiresOffloadToFit(moe.*, 16 * 1024 * 1024 * 1024)); // offload-only
+    try std.testing.expect(!requiresOffloadToFit(moe.*, 2 * 1024 * 1024 * 1024)); // too small either way
+}
+
+test "requiredVramWithOffload subtracts offloadable share" {
+    const moe = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const without = moe.required_vram_bytes;
+    const with = requiredVramWithOffload(moe.*);
+    try std.testing.expect(with < without);
+    try std.testing.expectEqual(without - moe.offloadable_vram_bytes, with);
+}
+
+test "requiredVramWithOffload returns required_vram_bytes for dense models" {
+    const dense = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(dense.required_vram_bytes, requiredVramWithOffload(dense.*));
+}
+
 test "supportedOnCurrentGpu requires both tested profile and fit" {
-    const entry = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
+    const entry = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(supportedOnCurrentGpu(entry.*, "amd-rdna4-32gb", 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!supportedOnCurrentGpu(entry.*, "amd-rdna4-16gb", 24 * 1024 * 1024 * 1024));
     try std.testing.expect(!supportedOnCurrentGpu(entry.*, "amd-rdna4-32gb", 20 * 1024 * 1024 * 1024));
 }
 
 test "qwen thinking stability flags track validated chat behavior" {
-    const qwen3 = find("qwen3-8b-q4k-m") orelse return error.TestExpectedEqual;
+    const qwen3 = find("qwen35-9b-q4k-m") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen3.recommended_for_chat);
     try std.testing.expect(qwen3.thinking_stable);
 
-    const qwen35 = find("qwen35-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
-    try std.testing.expect(qwen35.thinking_stable);
-
     const qwen36 = find("qwen36-35b-a3b-q4k-xl") orelse return error.TestExpectedEqual;
     try std.testing.expect(qwen36.thinking_stable);
+
+    const qwen36_dense = find("qwen36-27b-q4k-m") orelse return error.TestExpectedEqual;
+    try std.testing.expect(qwen36_dense.thinking_stable);
 }

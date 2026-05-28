@@ -33,6 +33,23 @@ const toc = apiModule.symbols.flatMap(symbol => [
   })),
 ]);
 
+const kindOrder: ZigApiSymbol['symbolKind'][] = ['struct', 'function', 'enum', 'union', 'constant', 'variable'];
+const kindLabels: Record<ZigApiSymbol['symbolKind'], string> = {
+  struct: 'Structs',
+  function: 'Functions',
+  enum: 'Enums',
+  union: 'Unions',
+  constant: 'Constants',
+  variable: 'Variables',
+};
+const symbolKindStats = kindOrder
+  .map(kind => ({
+    kind,
+    label: kindLabels[kind],
+    count: apiModule.symbols.filter(symbol => symbol.symbolKind === kind).length,
+  }))
+  .filter(item => item.count > 0);
+
 function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   return Boolean(
     symbol.doc.summary ||
@@ -41,6 +58,40 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
       symbol.doc.returns ||
       symbol.doc.notes.length > 0
   );
+}
+
+function docSearchText(symbol: ZigApiSymbol | ZigApiMember): string {
+  return [
+    symbol.doc.summary,
+    ...symbol.doc.description,
+    ...symbol.doc.params.map(param => `${param.name} ${param.description}`),
+    symbol.doc.returns ?? '',
+    ...symbol.doc.notes,
+  ].join(' ');
+}
+
+function memberSearchText(member: ZigApiMember): string {
+  return [
+    member.name,
+    member.qualifiedName,
+    member.signature,
+    member.sourcePath,
+    docSearchText(member),
+  ].join(' ');
+}
+
+function symbolSearchText(symbol: ZigApiSymbol): string {
+  const fields = symbol.fields?.map(field => `${field.name} ${field.type}`).join(' ') ?? '';
+  return [
+    symbol.name,
+    symbol.qualifiedName,
+    symbol.symbolKind,
+    symbol.declarationKind,
+    symbol.signature,
+    symbol.sourcePath,
+    fields,
+    docSearchText(symbol),
+  ].join(' ');
 }
 ---
 
@@ -68,11 +119,48 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
             {apiModule.sourcePath}
           </a>
         </div>
+
+        <div class="module-tools" data-symbol-tools>
+          <div class="symbol-filter-shell">
+            <label class="sr-only" for="module-symbol-filter">Filter symbols in {apiModule.title}</label>
+            <input
+              id="module-symbol-filter"
+              type="search"
+              inputmode="search"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder={`Filter ${apiModule.title} exports and methods`}
+              data-symbol-filter
+            />
+            <button type="button" class="symbol-filter-clear" data-symbol-filter-clear hidden aria-label="Clear symbol filter">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+
+          <div class="kind-filters" aria-label="Filter by symbol kind">
+            <button type="button" class="kind-filter active" data-symbol-kind-filter="all" aria-pressed="true">
+              All <span>{apiModule.exportCount}</span>
+            </button>
+            {symbolKindStats.map(item => (
+              <button type="button" class="kind-filter" data-symbol-kind-filter={item.kind} aria-pressed="false">
+                {item.label} <span>{item.count}</span>
+              </button>
+            ))}
+          </div>
+
+          <p class="symbol-filter-status" data-symbol-filter-status>{apiModule.exportCount} exports shown</p>
+        </div>
       </section>
 
       <div class="symbol-stack">
         {apiModule.symbols.map(symbol => (
-          <section id={symbol.anchor} class="symbol-card">
+          <section
+            id={symbol.anchor}
+            class="symbol-card"
+            data-symbol-card
+            data-symbol-kind={symbol.symbolKind}
+            data-symbol-search={symbolSearchText(symbol)}
+          >
             <div class="symbol-heading">
               <div>
                 <p class="symbol-kind">{symbol.symbolKind}</p>
@@ -172,7 +260,12 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
 
                 <div class="member-stack">
                   {symbol.members.map(member => (
-                    <article id={member.anchor} class="member-card">
+                    <article
+                      id={member.anchor}
+                      class="member-card"
+                      data-member-card
+                      data-member-search={memberSearchText(member)}
+                    >
                       <div class="symbol-heading member-heading">
                         <div>
                           <p class="symbol-kind">method</p>
@@ -253,6 +346,89 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
 </DocLayout>
 
 <script>
+  const setupSymbolFilter = () => {
+    const input = document.querySelector<HTMLInputElement>('[data-symbol-filter]');
+    const clearButton = document.querySelector<HTMLButtonElement>('[data-symbol-filter-clear]');
+    const status = document.querySelector<HTMLElement>('[data-symbol-filter-status]');
+    const filterButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-symbol-kind-filter]'));
+    const symbolCards = Array.from(document.querySelectorAll<HTMLElement>('[data-symbol-card]'));
+    if (!input || !clearButton || !status || symbolCards.length === 0) return;
+
+    let activeKind = 'all';
+
+    const normalize = (value: string) =>
+      value
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const matchesTerms = (value: string, terms: string[]) => {
+      if (terms.length === 0) return true;
+      const normalized = normalize(value);
+      return terms.every(term => normalized.includes(term));
+    };
+
+    const setButtonState = () => {
+      for (const button of filterButtons) {
+        const selected = button.dataset.symbolKindFilter === activeKind;
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      }
+    };
+
+    const applyFilter = () => {
+      const rawQuery = input.value.trim();
+      const terms = normalize(rawQuery).split(' ').filter(Boolean);
+      clearButton.hidden = rawQuery.length === 0;
+
+      let visibleCount = 0;
+
+      for (const card of symbolCards) {
+        const kind = card.dataset.symbolKind ?? '';
+        const kindMatches = activeKind === 'all' || kind === activeKind;
+        const symbolMatches = matchesTerms(card.dataset.symbolSearch ?? card.textContent ?? '', terms);
+        const memberCards = Array.from(card.querySelectorAll<HTMLElement>('[data-member-card]'));
+        let matchingMembers = 0;
+
+        for (const member of memberCards) {
+          const memberMatches = matchesTerms(member.dataset.memberSearch ?? member.textContent ?? '', terms);
+          matchingMembers += memberMatches ? 1 : 0;
+          member.hidden = rawQuery.length > 0 && !symbolMatches && !memberMatches;
+        }
+
+        const queryMatches = rawQuery.length === 0 || symbolMatches || matchingMembers > 0;
+        const visible = kindMatches && queryMatches;
+        card.hidden = !visible;
+        if (visible) visibleCount += 1;
+      }
+
+      setButtonState();
+      status.textContent =
+        visibleCount === 0
+          ? 'No exports match the current filter.'
+          : `${visibleCount} export${visibleCount === 1 ? '' : 's'} shown`;
+    };
+
+    input.addEventListener('input', applyFilter);
+    clearButton.addEventListener('click', () => {
+      input.value = '';
+      input.focus();
+      applyFilter();
+    });
+
+    for (const button of filterButtons) {
+      button.addEventListener('click', () => {
+        activeKind = button.dataset.symbolKindFilter ?? 'all';
+        applyFilter();
+      });
+    }
+
+    applyFilter();
+  };
+
   const syncCondensedToc = () => {
     const toc = document.querySelector<HTMLElement>('[data-module-toc]');
     const hero = document.querySelector<HTMLElement>('[data-module-hero]');
@@ -280,16 +456,20 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   };
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', syncCondensedToc, { once: true });
+    document.addEventListener('DOMContentLoaded', () => {
+      setupSymbolFilter();
+      syncCondensedToc();
+    }, { once: true });
   } else {
+    setupSymbolFilter();
     syncCondensedToc();
   }
 </script>
 
 <style>
   .module-page {
-    --toc-width: 210px;
-    --toc-gap: calc(var(--space-lg) * 0.75);
+    --toc-width: 180px;
+    --toc-gap: var(--space-md);
     display: grid;
     grid-template-columns: minmax(0, 1fr) var(--toc-width);
     gap: var(--toc-gap);
@@ -297,8 +477,8 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   }
 
   .module-page[data-toc-condensed="true"] {
-    --toc-width: 148px;
-    --toc-gap: var(--space-sm);
+    --toc-width: 136px;
+    --toc-gap: 0.6rem;
   }
 
   .module-main {
@@ -307,76 +487,192 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
 
   .module-hero {
     border: 1px solid var(--color-border);
-    border-radius: 16px;
-    padding: var(--space-xl);
-    background:
-      linear-gradient(180deg, var(--color-bg-alt), var(--color-bg));
-    margin-bottom: var(--space-xl);
+    border-radius: 8px;
+    padding: var(--space-md);
+    background: var(--color-bg);
+    margin-bottom: var(--space-md);
   }
 
   .module-hero-top {
     display: flex;
     justify-content: space-between;
-    gap: var(--space-md);
+    gap: var(--space-sm);
     align-items: flex-start;
   }
 
   .module-hero h1 {
-    margin-bottom: var(--space-sm);
+    margin: 0 0 0.25rem;
+    font-size: 1.55rem;
   }
 
   .eyebrow {
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    font-size: 0.75rem;
+    font-size: 0.65rem;
     color: var(--color-text-muted);
     margin-bottom: var(--space-xs);
   }
 
   .back-link {
     white-space: nowrap;
-    font-size: 0.9rem;
+    font-size: 0.76rem;
   }
 
   .module-summary {
-    font-size: 1.05rem;
+    margin-bottom: 0.35rem;
+    font-size: 0.92rem;
+    line-height: 1.4;
   }
 
   .module-overview {
     color: var(--color-text-muted);
+    margin-bottom: 0.35rem;
+    font-size: 0.82rem;
+    line-height: 1.4;
   }
 
   .module-meta {
     display: flex;
-    gap: var(--space-sm);
+    gap: 0.35rem;
     flex-wrap: wrap;
-    margin-top: var(--space-lg);
+    margin-top: 0.65rem;
   }
 
   .module-meta span,
   .module-meta a {
     display: inline-flex;
     align-items: center;
-    min-height: 2rem;
-    padding: 0 0.7rem;
-    border-radius: 999px;
+    min-height: 1.55rem;
+    padding: 0 0.45rem;
+    border-radius: 6px;
     border: 1px solid var(--color-border);
     background: var(--color-bg);
     color: var(--color-text-muted);
-    font-size: 0.85rem;
+    font-size: 0.68rem;
+  }
+
+  .module-tools {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) auto;
+    gap: 0.45rem 0.75rem;
+    align-items: center;
+    margin-top: 0.7rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .symbol-filter-shell {
+    position: relative;
+    max-width: none;
+  }
+
+  .symbol-filter-shell input {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 0.48rem 2rem 0.48rem 0.65rem;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font: inherit;
+    font-size: 0.82rem;
+  }
+
+  .symbol-filter-shell input:focus {
+    outline: 2px solid color-mix(in srgb, var(--color-accent) 25%, transparent);
+    border-color: var(--color-accent);
+  }
+
+  .symbol-filter-shell input::-webkit-search-cancel-button {
+    display: none;
+    -webkit-appearance: none;
+  }
+
+  .symbol-filter-shell input::-moz-search-clear-button {
+    display: none;
+  }
+
+  .symbol-filter-clear {
+    position: absolute;
+    right: 0.55rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.05rem;
+    height: 1.05rem;
+    border: 0;
+    border-radius: 999px;
+    padding: 0;
+    background: color-mix(in srgb, var(--color-border) 72%, transparent);
+    color: var(--color-text-muted);
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .symbol-filter-clear:hover {
+    background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+    color: var(--color-text);
+  }
+
+  .kind-filters {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.3rem;
+  }
+
+  .kind-filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    min-height: 1.55rem;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 0 0.45rem;
+    background: var(--color-bg);
+    color: var(--color-text-muted);
+    font: inherit;
+    font-size: 0.68rem;
+    cursor: pointer;
+  }
+
+  .kind-filter span {
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .kind-filter:hover,
+  .kind-filter.active {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg));
+  }
+
+  .kind-filter.active span {
+    color: var(--color-accent);
+  }
+
+  .symbol-filter-status {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: 0.72rem;
   }
 
   .symbol-stack,
   .member-stack {
     display: grid;
-    gap: var(--space-md);
+    gap: 0.55rem;
   }
 
   .symbol-card,
   .member-card {
     border: 1px solid var(--color-border);
-    border-radius: 14px;
-    padding: var(--space-lg);
+    border-radius: 8px;
+    padding: 0.8rem;
     background: var(--color-bg);
     min-width: 0;
   }
@@ -388,9 +684,9 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   .symbol-heading {
     display: flex;
     justify-content: space-between;
-    gap: var(--space-sm);
+    gap: 0.45rem;
     align-items: flex-start;
-    margin-bottom: var(--space-sm);
+    margin-bottom: 0.45rem;
   }
 
   .symbol-heading > div {
@@ -404,22 +700,31 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
     word-break: break-word;
   }
 
+  .symbol-heading h2 {
+    font-size: 1.08rem;
+  }
+
+  .symbol-heading h4 {
+    font-size: 0.92rem;
+  }
+
   .symbol-kind {
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    font-size: 0.72rem;
+    font-size: 0.62rem;
     color: var(--color-text-muted);
-    margin-bottom: var(--space-xs);
+    margin-bottom: 0.1rem;
   }
 
   .anchor-link {
     font-family: var(--font-mono);
     color: var(--color-text-muted);
-    font-size: 0.95rem;
+    font-size: 0.8rem;
   }
 
   .doc-summary {
     font-weight: 600;
+    margin-bottom: 0.4rem;
   }
 
   .symbol-card pre,
@@ -427,6 +732,10 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
     max-width: 100%;
     overflow-x: auto;
     white-space: pre;
+    margin-bottom: 0.55rem;
+    padding: 0.55rem 0.65rem;
+    font-size: 0.74rem;
+    line-height: 1.35;
   }
 
   .symbol-card pre code,
@@ -437,8 +746,45 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   .doc-empty,
   .source-meta {
     color: var(--color-text-muted);
-    font-size: 0.9rem;
+    font-size: 0.74rem;
     margin-bottom: 0;
+  }
+
+  .doc-copy p {
+    margin-bottom: 0.45rem;
+    font-size: 0.86rem;
+    line-height: 1.45;
+  }
+
+  .doc-copy,
+  .doc-copy p,
+  .doc-copy code {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  :global(.module-page .code-shell) {
+    max-width: 100%;
+    margin-bottom: 0.55rem;
+    border-radius: 8px;
+    box-shadow: none;
+    background: var(--color-bg-alt);
+  }
+
+  :global(.module-page .code-shell__header) {
+    padding: 0.28rem 0.5rem;
+    background: var(--color-bg-alt);
+  }
+
+  :global(.module-page .code-shell__label) {
+    font-size: 0.58rem;
+  }
+
+  :global(.module-page .code-shell__copy) {
+    padding: 0.12rem 0.42rem;
+    border-radius: 6px;
+    font-size: 0.62rem;
   }
 
   .module-meta a,
@@ -449,17 +795,17 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   }
 
   .members {
-    margin-top: var(--space-lg);
-    padding-top: var(--space-md);
+    margin-top: 0.75rem;
+    padding-top: 0.65rem;
     border-top: 1px solid var(--color-border);
   }
 
   .members-header {
     display: flex;
     justify-content: space-between;
-    gap: var(--space-sm);
+    gap: 0.45rem;
     align-items: center;
-    margin-bottom: var(--space-md);
+    margin-bottom: 0.5rem;
   }
 
   .members-header h3 {
@@ -467,45 +813,49 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   }
 
   .members-header span {
-    font-size: 0.85rem;
+    font-size: 0.72rem;
     color: var(--color-text-muted);
   }
 
   .meta-block {
-    margin-top: var(--space-md);
+    margin-top: 0.65rem;
   }
 
   .meta-block h3,
   .meta-block h5 {
     margin-top: 0;
-    margin-bottom: var(--space-xs);
+    margin-bottom: 0.25rem;
+    font-size: 0.88rem;
   }
 
   .detail-list {
     display: grid;
-    gap: var(--space-sm);
+    gap: 0.35rem;
   }
 
   .detail-list div {
     border: 1px solid var(--color-border);
-    border-radius: 10px;
-    padding: var(--space-sm);
+    border-radius: 8px;
+    padding: 0.45rem 0.55rem;
     background: var(--color-bg);
   }
 
   .detail-list dt {
     font-weight: 600;
-    margin-bottom: var(--space-xs);
+    margin-bottom: 0.18rem;
+    font-size: 0.78rem;
   }
 
   .detail-list dd {
     margin: 0;
     color: var(--color-text-muted);
+    font-size: 0.78rem;
+    line-height: 1.35;
   }
 
   .table-wrapper {
     overflow-x: auto;
-    margin-top: var(--space-sm);
+    margin-top: 0.45rem;
     border: 1px solid var(--color-border);
     border-radius: 8px;
     background: var(--color-bg);
@@ -514,12 +864,12 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   .table-wrapper table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.9rem;
+    font-size: 0.76rem;
   }
 
   .table-wrapper th,
   .table-wrapper td {
-    padding: 0.5rem 0.75rem;
+    padding: 0.32rem 0.45rem;
     text-align: left;
     border-bottom: 1px solid var(--color-border);
   }
@@ -544,8 +894,8 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
     justify-self: end;
     width: 100%;
     border: 1px solid var(--color-border);
-    border-radius: 14px;
-    padding: var(--space-md);
+    border-radius: 8px;
+    padding: 0.65rem;
     background: var(--color-bg);
     max-height: calc(100vh - 2rem);
     overflow: auto;
@@ -572,7 +922,7 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
     padding: 0;
     margin: 0;
     display: grid;
-    gap: var(--space-xs);
+    gap: 0.18rem;
   }
 
   .toc[data-condensed="true"] ul {
@@ -584,7 +934,7 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
   }
 
   .toc li.depth-1 {
-    padding-left: var(--space-md);
+    padding-left: 0.65rem;
   }
 
   .toc[data-condensed="true"] li.depth-1 {
@@ -593,8 +943,8 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
 
   .toc a {
     color: var(--color-text-muted);
-    font-size: 0.82rem;
-    line-height: 1.35;
+    font-size: 0.7rem;
+    line-height: 1.25;
   }
 
   .toc[data-condensed="true"] a {
@@ -616,6 +966,14 @@ function hasDocContent(symbol: ZigApiSymbol | ZigApiMember): boolean {
     .toc {
       position: static;
       order: -1;
+    }
+
+    .module-tools {
+      grid-template-columns: 1fr;
+    }
+
+    .kind-filters {
+      justify-content: flex-start;
     }
   }
 

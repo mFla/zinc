@@ -5,7 +5,7 @@
 
 ## Summary
 
-Add a Metal compute backend to ZINC enabling inference on Apple Silicon Macs (M1+), targeting ≥80 tok/s single-request decode and ≥200 tok/s aggregate at 5 concurrent requests for Qwen3.5-35B-A3B Q4_K_XL on M4 Max. Uses an ObjC shim (C API) for Metal access from Zig, zero-copy model loading via UMA, and MSL compute kernels (initially cross-compiled from SPIR-V, then hand-optimized with simdgroup_matrix).
+Add a Metal compute backend to ZINC enabling inference on Apple Silicon Macs (M1+), targeting ≥80 tok/s single-request decode and ≥200 tok/s aggregate at 5 concurrent requests for Qwen3.6-35B-A3B Q4_K_XL on M4 Max. Uses an ObjC shim (C API) for Metal access from Zig, zero-copy model loading via UMA, and MSL compute kernels (initially cross-compiled from SPIR-V, then hand-optimized with simdgroup_matrix).
 
 ## Technical Context
 
@@ -176,7 +176,7 @@ See [quickstart.md](quickstart.md) — baseline measurement commands for llama.c
 4. Pre-compile all MSL into single .metallib at build time
 5. Profile with Metal System Trace — target ≥75% bandwidth utilization
 
-**Milestone**: ≥80 tok/s on M4 Max 64 GB with Qwen3.5-35B-A3B Q4_K_XL.
+**Milestone**: ≥80 tok/s on M4 Max 64 GB with Qwen3.6-35B-A3B Q4_K_XL.
 
 ### Phase 3: Parallel Requests & Server
 

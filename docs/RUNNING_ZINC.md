@@ -33,7 +33,7 @@ export RADV_PERFTEST=coop_matrix
 ./zig-out/bin/zinc --check -m /path/to/model.gguf
 
 # Or check one managed model from the built-in catalog
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 ```
 
 On the shared RDNA4 test node, the equivalent command is:
@@ -46,10 +46,10 @@ cd /root/zinc
 ./zig-out/bin/zinc --check
 
 # Managed model compatibility by catalog id
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 
 # Exact GGUF file check
-./zig-out/bin/zinc --check -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+./zig-out/bin/zinc --check -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ```
 
 `--check` prints its progress as numbered sections and ends with a summary and verdict. The five sections are:
@@ -64,14 +64,14 @@ The model section is the most operationally useful one. It reports:
 
 - `Tensor upload`: exact device-local weight bytes derived from the GGUF tensors
 - `VRAM fit`: estimated device-local total against the selected GPU's VRAM
-- `KV cache`: current estimate for the active runtime, which is capped to a `4096` token context in today's engine
+- `KV cache`: current estimate for the active runtime; the engine picks an auto context from the VRAM budget (85% utilization, aligned to 512 tokens) with a `4096` minimum floor — pass `-c <tokens>` to override
 - `GPU SSM state`: persistent device-local SSM state when the architecture uses it
 - `host-visible staging`: mapped/readback buffers, reported separately from device-local VRAM
 
 Important assumptions behind the fit estimate:
 
 - it reflects the current single-GPU runtime, not multi-GPU sharding
-- it reflects the current engine's `4096` KV cap even if the GGUF advertises a much larger context window
+- the auto-context heuristic floors at `4096` tokens and aligns to 512; use `-c` to request a smaller or larger context within the GGUF's architectural ceiling and the device's VRAM budget
 - it excludes Vulkan allocation alignment, descriptor pools, query pools, and driver overhead
 
 Exit behavior:
@@ -100,10 +100,10 @@ Managed 35B catalog check:
 
 ```bash
 # Command
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 
 # Key output
-Managed model: Qwen3.5 35B-A3B UD Q4_K_XL (qwen35-35b-a3b-q4k-xl) [OK]
+Managed model: Qwen3.6 35B-A3B UD Q4_K_XL (qwen36-35b-a3b-q4k-xl) [OK]
 VRAM fit (catalog): 21.41 / 31.86 GiB device-local (headroom 10.45 GiB) [OK]
 Summary       : 9 ok, 1 warn, 0 fail, 0 skip
 Verdict       : READY WITH WARNINGS [WARN]
@@ -113,10 +113,10 @@ Exact GGUF file check:
 
 ```bash
 # Command
-./zig-out/bin/zinc --check -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+./zig-out/bin/zinc --check -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 
 # Key output
-Model: /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf [OK]
+Model: /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf [OK]
 Tensor upload: 20.70 GiB device-local weights
 VRAM fit: 21.41 / 31.86 GiB device-local (headroom 10.45 GiB) [OK]
 Summary       : 9 ok, 1 warn, 0 fail, 0 skip
@@ -151,11 +151,12 @@ Example `./zig-out/bin/zinc model list` output on Apple Silicon:
 ```bash
 Detected GPU profile: apple-silicon
 
-ID                             Released     Status      Fit    Installed   Active   Notes
-gpt-oss-20b-q4k-m              2025-06-25   supported   yes    yes         no       tested + exact fit
-qwen3-8b-q4k-m                 2025-04-29   supported   yes    yes         yes      tested + exact fit
-qwen36-35b-a3b-q4k-xl          2026-04-15   supported   yes    no          no       tested + exact fit
-gemma4-31b-q4k-m               2026-04-02   supported   yes    no          no       tested + catalog fit
+ID                             Released     Status        Fit    Installed   Active   Notes
+qwen3-8b-q4k-m                 2025-04-29   supported     yes    yes         yes      tested + exact fit
+qwen36-35b-a3b-q4k-xl          2026-04-15   supported     yes    no          no       tested + exact fit
+qwen36-27b-q4k-m               2026-04-22   experimental  yes    no          no       tested + catalog fit
+gemma4-31b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
+gemma4-26b-a4b-q4k-m               2026-04-02   supported     yes    no          no       tested + catalog fit
 ```
 
 For machine-readable output (useful for AI agents and scripts):

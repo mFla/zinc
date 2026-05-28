@@ -1,8 +1,10 @@
 #version 460
 // ZINC — GPU argmax reduction for greedy token sampling
 // Two-phase: phase 0 reduces logits to per-WG partials, phase 1 finds global max.
-// RDNA4-optimized: wave64, subgroup reduction for zero-shared-memory design.
+// RDNA4-optimized wave64 fast path, with shared-memory merge for devices
+// that split the 64-thread workgroup into multiple subgroups (Intel Xe).
 
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
@@ -16,6 +18,9 @@ layout(push_constant) uniform PushConstants {
 layout(set = 0, binding = 0) readonly buffer Logits   { float logits[];       };
 layout(set = 0, binding = 1) buffer          Partials  { uint partial_data[];  }; // [val_bits, idx] pairs
 layout(set = 0, binding = 2) writeonly buffer Result   { uint token_id;        };
+
+shared float s_sg_vals[8];
+shared uint s_sg_idxs[8];
 
 void main() {
     uint gid   = gl_GlobalInvocationID.x;
@@ -47,13 +52,31 @@ void main() {
         }
     }
 
-    // Subgroup reduction: find max value across wave64
+    // Subgroup reduction: find max value within the hardware subgroup.
     float wg_max = subgroupMax(best_val);
 
     // Find lane holding the max (lowest lane wins ties)
     uvec4 ballot = subgroupBallot(best_val == wg_max);
     uint winner  = subgroupBallotFindLSB(ballot);
     uint wg_idx  = subgroupBroadcast(best_idx, winner);
+
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            s_sg_vals[gl_SubgroupID] = wg_max;
+            s_sg_idxs[gl_SubgroupID] = wg_idx;
+        }
+        barrier();
+        if (tid == 0u) {
+            for (uint sg = 1u; sg < gl_NumSubgroups; sg++) {
+                float sg_val = s_sg_vals[sg];
+                uint sg_idx = s_sg_idxs[sg];
+                if (sg_val > wg_max || (sg_val == wg_max && sg_idx < wg_idx)) {
+                    wg_max = sg_val;
+                    wg_idx = sg_idx;
+                }
+            }
+        }
+    }
 
     if (tid == 0u) {
         if (phase == 0u) {

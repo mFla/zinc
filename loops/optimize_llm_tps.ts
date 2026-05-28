@@ -7,7 +7,7 @@
  * benchmarking and keeping/reverting based on results.
  *
  * Usage:
- *   bun scripts/optimize_llm_tps.ts --agent claude "improve generation throughput"
+ *   bun scripts/optimize_llm_tps.ts "improve generation throughput"
  *   bun scripts/optimize_llm_tps.ts --agent codex --cycles 50 --target-tps 150
  *   bun scripts/optimize_llm_tps.ts --dry-run   # benchmark only
  */
@@ -65,6 +65,8 @@ const LLM_SSH_PORT = Number(process.env.LLM_SSH_PORT ?? "22");
 const LLM_PORT = Number(process.env.LLM_PORT ?? "8080");
 const LLAMA_CPP_DIR = process.env.LLAMA_CPP_DIR ?? "/root/llama.cpp";
 const BASE_URL = `http://${LLM_HOST}:${LLM_PORT}/v1/chat/completions`;
+const CODEX_MODEL = process.env.ZINC_CODEX_MODEL ?? "gpt-5.5";
+const CODEX_REASONING_EFFORT = process.env.ZINC_CODEX_REASONING_EFFORT ?? "xhigh";
 
 const BLOCKED_GIT_OPS = [
   "Bash(git checkout:*)",
@@ -627,6 +629,8 @@ function buildClaudeArgs(prompt: string, model?: string): string[] {
 function buildCodexArgs(prompt: string, model?: string): string[] {
   const args = [
     "exec",
+    "-c",
+    `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
     "--skip-git-repo-check",
     "--json",
     "--color",
@@ -636,7 +640,7 @@ function buildCodexArgs(prompt: string, model?: string): string[] {
     "--cd",
     PROJECT_ROOT,
   ];
-  if (model) args.push("--model", model);
+  args.push("--model", model ?? CODEX_MODEL);
   args.push(prompt);
   return args;
 }
@@ -1111,7 +1115,7 @@ function buildOptimizationPrompt(state: RunState): string {
     "",
     "## Current Setup",
     "- llama.cpp built: -DGGML_VULKAN=ON, -O3 -march=znver4",
-    "- Model: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (MoE 35B/3B active, 22GB)",
+    "- Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (MoE 35B/3B active, 22GB)",
     "- Server flags: -ngl 99 --device Vulkan0 --parallel 4 -c 32768 -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --mlock",
     "- Env: RADV_PERFTEST=coop_matrix",
     "- Service: /etc/systemd/system/llama-server.service",
@@ -1414,7 +1418,7 @@ async function runCycle(
 async function main() {
   const rawArgs = process.argv.slice(2);
   let maxCycles = Infinity;
-  let agent: AgentKind = "claude";
+  let agent: AgentKind = "codex";
   let model: string | undefined;
   let targetTps = 150;
   let dryRun = false;
@@ -1449,10 +1453,10 @@ async function main() {
       case "--help":
         console.log(
           [
-            "Usage: bun scripts/optimize_llm_tps.ts --agent <claude|codex> [options]",
+            "Usage: bun scripts/optimize_llm_tps.ts [options] [prompt]",
             "",
             "Options:",
-            "  --agent <claude|codex>  Agent to use (required)",
+            "  --agent <claude|codex>  Agent to use (default: codex)",
             "  --model <name>          Model override for agent",
             "  --cycles N              Max cycles (default: infinite)",
             "  --target-tps N          Generation target tok/s (default: 150)",

@@ -17,6 +17,7 @@ const {
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://zolotukhin.ai';
 const canonicalUrl = `${siteUrl}${canonicalPath}`;
 const pageUrl = `${siteUrl}${pagePath}`;
+const githubRepoUrl = 'https://github.com/zolotukhin/zinc';
 const breadcrumbItems = [
   { name: 'Home', href: '/' },
   { name: 'ZINC', href: '/zinc' },
@@ -24,31 +25,31 @@ const breadcrumbItems = [
 ];
 
 const scenarioOrder = ['core', 'context-medium', 'context-long', 'decode-extended'];
-const hiddenBenchmarkModels = new Set(['qwen35-2b-q4k-m']);
+const hiddenBenchmarkModels = new Set<string>();
 const scenarioMeta: Record<string, { label: string; short: string; eyebrow: string; description: string }> = {
   core: {
-    label: 'Quick Answer',
+    label: 'Quick Chat',
     short: 'Quick',
-    eyebrow: 'Short prompt · short decode',
-    description: 'Headline workload for a short answer with minimal prompt overhead.',
+    eyebrow: 'Chat',
+    description: 'A short assistant turn with enough decode budget to avoid one-token screenshot rates.',
   },
   'context-medium': {
-    label: 'Context Retrieval',
-    short: 'Context',
-    eyebrow: 'Short retrieval prompt',
-    description: 'A retrieval-style prompt with explicit context so prompt throughput becomes visible.',
+    label: 'Coding Review',
+    short: 'Coding',
+    eyebrow: 'Code',
+    description: 'A small TypeScript review task that asks for the bug, cause, and corrected implementation.',
   },
   'context-long': {
-    label: 'Long Context Retrieval',
-    short: 'Long ctx',
-    eyebrow: 'Prefill-heavy workload',
-    description: 'A long prompt with the answer embedded near the end to expose prefill bottlenecks.',
+    label: 'Incident Context',
+    short: 'Context',
+    eyebrow: 'Support',
+    description: 'A support-style incident packet that exposes prefill behavior and prompt+decode latency.',
   },
   'decode-extended': {
-    label: 'Long Decode',
-    short: 'Long decode',
-    eyebrow: 'Sustained generation',
-    description: 'A longer generation target that stresses steady-state decode instead of a short factual completion.',
+    label: 'Long Coding Draft',
+    short: 'Long draft',
+    eyebrow: 'Generation',
+    description: 'A longer engineering-plan generation task that stresses sustained decode.',
   },
 };
 
@@ -86,12 +87,20 @@ function formatDate(iso: string | null | undefined) {
   }).format(new Date(iso));
 }
 
+function formatShortDate(iso: string | null | undefined) {
+  if (!iso) return 'n/a';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(iso));
+}
+
 function formatCommit(value: string | null | undefined, digits = 12) {
   if (!value) return 'n/a';
   return value.length > digits ? value.slice(0, digits) : value;
 }
 
-function mean(values: Array<number | null>) {
+function mean(values: Array<number | null | undefined>) {
   const xs = values.filter((value): value is number => value != null && !Number.isNaN(value));
   if (!xs.length) return null;
   return xs.reduce((sum, value) => sum + value, 0) / xs.length;
@@ -100,6 +109,17 @@ function mean(values: Array<number | null>) {
 function meterWidth(value: number | null | undefined) {
   if (value == null || Number.isNaN(value) || value <= 0) return 0;
   return Math.max(6, Math.min(100, value));
+}
+
+function barWidth(value: number | null | undefined, maxValue: number | null | undefined) {
+  if (!hasValue(value) || !hasValue(maxValue) || (maxValue ?? 0) <= 0) return 0;
+  return Math.max(3, Math.min(100, ((value ?? 0) / (maxValue ?? 1)) * 100));
+}
+
+function maxMetric<T>(items: T[], getter: (item: T) => number | null | undefined) {
+  const values = items.map(getter).filter((value): value is number => hasValue(value));
+  if (!values.length) return null;
+  return Math.max(...values);
 }
 
 function ensureScenarios(model: any) {
@@ -122,6 +142,24 @@ function scenarioForModel(model: any, scenarioId: string) {
   return ensureScenarios(model).find((scenario: any) => scenario.id === scenarioId) ?? null;
 }
 
+function scenarioDisplayForTarget(target: any, scenarioId: string) {
+  for (const model of target.models ?? []) {
+    const scenario = scenarioForModel(model, scenarioId);
+    if (scenario) {
+      return {
+        label: scenario.label ?? scenarioMeta[scenarioId]?.label ?? scenarioId,
+        short: scenario.short_label ?? scenarioMeta[scenarioId]?.short ?? scenarioId,
+        description: scenario.notes?.[0] ?? scenarioMeta[scenarioId]?.description ?? '',
+      };
+    }
+  }
+  return {
+    label: scenarioMeta[scenarioId]?.label ?? scenarioId,
+    short: scenarioMeta[scenarioId]?.short ?? scenarioId,
+    description: scenarioMeta[scenarioId]?.description ?? '',
+  };
+}
+
 function decodeValue(scenario: any) {
   return metricValue(scenario?.zinc?.decode_tps);
 }
@@ -140,6 +178,10 @@ function baselinePromptValue(scenario: any) {
 
 function promptTokensValue(scenario: any) {
   return scenario?.zinc?.prompt_tokens ?? scenario?.baseline?.prompt_tokens ?? null;
+}
+
+function generatedTokensValue(scenario: any) {
+  return scenario?.zinc?.generated_tokens ?? scenario?.baseline?.generated_tokens ?? scenario?.max_tokens ?? null;
 }
 
 function prefillMsValue(scenario: any) {
@@ -193,6 +235,92 @@ function endToEndDeltaValue(scenario: any) {
   return scenario?.comparison?.end_to_end_delta_tps ?? null;
 }
 
+function combinedPhaseSeconds(
+  prefillTps: number | null | undefined,
+  decodeTps: number | null | undefined,
+  promptTokens: number | null | undefined,
+  generatedTokens: number | null | undefined,
+) {
+  const prompt = promptTokens ?? 0;
+  const generated = generatedTokens ?? 0;
+  if (prompt <= 0 && generated <= 0) return null;
+
+  let seconds = 0;
+  if (prompt > 0) {
+    if (!hasValue(prefillTps) || (prefillTps ?? 0) <= 0) return null;
+    seconds += prompt / (prefillTps ?? 1);
+  }
+  if (generated > 0) {
+    if (!hasValue(decodeTps) || (decodeTps ?? 0) <= 0) return null;
+    seconds += generated / (decodeTps ?? 1);
+  }
+  return seconds > 0 ? seconds : null;
+}
+
+function combinedPhaseThroughput(
+  prefillTps: number | null | undefined,
+  decodeTps: number | null | undefined,
+  promptTokens: number | null | undefined,
+  generatedTokens: number | null | undefined,
+) {
+  const seconds = combinedPhaseSeconds(prefillTps, decodeTps, promptTokens, generatedTokens);
+  if (!hasValue(seconds) || (seconds ?? 0) <= 0) return null;
+  return ((promptTokens ?? 0) + (generatedTokens ?? 0)) / (seconds ?? 1);
+}
+
+function overallValue(scenario: any) {
+  return combinedPhaseThroughput(
+    promptValue(scenario),
+    decodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  ) ?? endToEndValue(scenario);
+}
+
+function baselineOverallValue(scenario: any) {
+  return combinedPhaseThroughput(
+    baselinePromptValue(scenario),
+    baselineDecodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  ) ?? baselineEndToEndValue(scenario);
+}
+
+function overallRatioValue(scenario: any) {
+  if (hasValue(scenario?.comparison?.overall_pct_of_baseline)) {
+    return scenario.comparison.overall_pct_of_baseline;
+  }
+
+  const zincSeconds = combinedPhaseSeconds(
+    promptValue(scenario),
+    decodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  );
+  const baselineSeconds = combinedPhaseSeconds(
+    baselinePromptValue(scenario),
+    baselineDecodeValue(scenario),
+    promptTokensValue(scenario),
+    generatedTokensValue(scenario),
+  );
+  if (hasValue(zincSeconds) && hasValue(baselineSeconds) && (zincSeconds ?? 0) > 0) {
+    return ((baselineSeconds ?? 0) / (zincSeconds ?? 1)) * 100;
+  }
+
+  if (hasValue(endToEndRatioValue(scenario))) return endToEndRatioValue(scenario);
+  return mean([promptRatioValue(scenario), decodeRatioValue(scenario)]);
+}
+
+function overallDeltaValue(scenario: any) {
+  if (hasValue(scenario?.comparison?.overall_delta_tps)) {
+    return scenario.comparison.overall_delta_tps;
+  }
+  const zinc = overallValue(scenario);
+  const baseline = baselineOverallValue(scenario);
+  if (!hasValue(zinc) || !hasValue(baseline)) return null;
+  return (zinc ?? 0) - (baseline ?? 0);
+}
+
 function ratioTone(value: number | null | undefined) {
   if (value == null || Number.isNaN(value)) return 'neutral';
   if (value >= 90) return 'positive';
@@ -215,12 +343,55 @@ function compactReason(reason: string | null | undefined) {
   return reason;
 }
 
+function outputQualityStatus(scenario: any) {
+  const preview = `${scenario?.zinc?.output_preview ?? ''}`.trim();
+  const generatedTokens = scenario?.zinc?.generated_tokens ?? null;
+  if (!preview) {
+    return {
+      tone: 'neutral',
+      label: 'No Preview',
+      note: 'No output preview was captured for this workload.',
+    };
+  }
+
+  if (/^<\|(?:im_end|endoftext|end)\|>$/.test(preview) || (generatedTokens != null && generatedTokens <= 4 && preview.includes('<|im_end|>'))) {
+    return {
+      tone: 'caution',
+      label: 'Review Output',
+      note: 'ZINC completed numerically, but the preview is only a stop token.',
+    };
+  }
+
+  if (/(?:^|[\s:])(?:\d+\.){12,}/.test(preview)) {
+    return {
+      tone: 'caution',
+      label: 'Review Output',
+      note: 'ZINC completed numerically, but the preview shows a repeated numeric pattern.',
+    };
+  }
+
+  return {
+    tone: 'positive',
+    label: 'Preview OK',
+    note: 'The captured preview does not show an obvious stop-token or repetition failure.',
+  };
+}
+
 function scenarioStatus(scenario: any) {
   const zincOk = promptValue(scenario) != null || decodeValue(scenario) != null || endToEndValue(scenario) != null;
   const baselineOk = baselinePromptValue(scenario) != null || baselineDecodeValue(scenario) != null;
   const reason = compactReason(warningText(scenario));
+  const quality = outputQualityStatus(scenario);
 
   if (zincOk && baselineOk) {
+    if (quality.tone === 'caution') {
+      return {
+        tone: 'caution',
+        label: quality.label,
+        note: quality.note,
+      };
+    }
+
     return {
       tone: 'positive',
       label: 'Compared',
@@ -252,7 +423,8 @@ function normalizeTarget(target: any) {
     }));
 
   const successful = visibleModels.filter((model: any) => model?.zinc?.decode_tps);
-  const compared = visibleModels.filter((model: any) => model?.comparison?.pct_of_baseline != null);
+  const allScenarios = visibleModels.flatMap((model: any) => ensureScenarios(model));
+  const compared = visibleModels.filter((model: any) => ensureScenarios(model).some((scenario: any) => overallRatioValue(scenario) != null));
   const fastest = successful.length > 0
     ? [...successful].sort((a, b) => (b.zinc.decode_tps.median ?? b.zinc.decode_tps.avg ?? 0) - (a.zinc.decode_tps.median ?? a.zinc.decode_tps.avg ?? 0))[0]
     : null;
@@ -270,7 +442,7 @@ function normalizeTarget(target: any) {
       compared_models: compared.length,
       average_decode_tps: mean(successful.map((model: any) => model.zinc.decode_tps.median ?? model.zinc.decode_tps.avg ?? null)),
       average_prompt_tps: mean(successful.map((model: any) => model.zinc.prefill_tps?.median ?? model.zinc.prefill_tps?.avg ?? null)),
-      average_pct_of_llama: mean(compared.map((model: any) => model.comparison.pct_of_baseline)),
+      average_pct_of_llama: mean(allScenarios.map((scenario: any) => overallRatioValue(scenario))),
     },
   };
 }
@@ -283,13 +455,17 @@ function scenarioIdsForTarget(target: any) {
   return scenarioOrder.filter((id) => ids.has(id));
 }
 
-const targetOrder = ['rdna', 'metal'];
+const targetOrder = ['rdna', 'metal', 'intel'];
+function targetRank(id: string) {
+  const index = targetOrder.indexOf(id);
+  return index === -1 ? targetOrder.length : index;
+}
+
 const targets = [...benchmarkData.targets]
-  .sort((a, b) => targetOrder.indexOf(a.id) - targetOrder.indexOf(b.id))
+  .sort((a, b) => targetRank(a.id) - targetRank(b.id))
   .map(normalizeTarget);
 
-const totalBenchmarkedModels = targets.reduce((sum, target) => sum + (target.summary?.benchmarked_models ?? target.models.length ?? 0), 0);
-const totalSuccessfulModels = targets.reduce((sum, target) => sum + (target.summary?.successful_models ?? 0), 0);
+const totalUniqueModels = new Set(targets.flatMap((target) => target.models.map((model: any) => model.id))).size;
 const totalComparedModels = targets.reduce((sum, target) => sum + (target.summary?.compared_models ?? 0), 0);
 
 function benchmarkedCount(target: any) {
@@ -318,6 +494,46 @@ function formatRuns(runs: number | null | undefined, warmupRuns: number | null |
   return `${runs ?? 0} measured · ${warmupRuns ?? 0} warmup`;
 }
 
+function githubBlobUrl(ref: string | null | undefined, filePath: string, startLine?: number, endLine?: number) {
+  const revision = ref || 'main';
+  const lineAnchor = startLine == null
+    ? ''
+    : endLine == null || endLine === startLine
+      ? `#L${startLine}`
+      : `#L${startLine}-L${endLine}`;
+  return `${githubRepoUrl}/blob/${revision}/${filePath}${lineAnchor}`;
+}
+
+function displayModelLabel(modelOrLabel: any) {
+  const label = typeof modelOrLabel === 'string'
+    ? modelOrLabel
+    : (modelOrLabel?.label ?? modelOrLabel?.id ?? 'n/a');
+  return label
+    .replace(/^Gemma4\b/i, 'Gemma 4')
+    .replace(/^Qwen36\b/i, 'Qwen 3.6')
+    .replace(/^Qwen3\b/i, 'Qwen 3')
+    .replace(/\bQ4_K_XL\b/g, 'Q4K XL')
+    .replace(/\bQ4_K_M\b/g, 'Q4K M');
+}
+
+function normalizedModelName(model: any) {
+  return displayModelLabel(model)
+    .toLowerCase()
+    .replace(/\bgemma4\b/g, 'gemma 4')
+    .replace(/\bqwen36\b/g, 'qwen 3.6')
+    .replace(/\bqwen3\b/g, 'qwen 3')
+    .replace(/q4_k/g, 'q4k')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function compareModels(a: any, b: any) {
+  return normalizedModelName(a).localeCompare(normalizedModelName(b), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+}
+
 function scenarioRows(target: any, scenarioId: string) {
   return [...target.models]
     .map((model: any) => ({
@@ -325,15 +541,17 @@ function scenarioRows(target: any, scenarioId: string) {
       scenario: scenarioForModel(model, scenarioId),
     }))
     .filter((row) => row.scenario != null)
-    .sort((a, b) => (decodeValue(b.scenario) ?? 0) - (decodeValue(a.scenario) ?? 0));
+    .sort((a, b) => compareModels(a.model, b.model));
 }
 
 function scenarioSummary(target: any, scenarioId: string) {
   const rows = scenarioRows(target, scenarioId);
-  const comparedRows = rows.filter((row) => row.scenario?.comparison?.pct_of_baseline != null);
-  const fastestRow = rows[0] ?? null;
+  const comparedRows = rows.filter((row) => overallRatioValue(row.scenario) != null);
+  const fastestRow = rows.length > 0
+    ? [...rows].sort((a, b) => (decodeValue(b.scenario) ?? -1) - (decodeValue(a.scenario) ?? -1))[0]
+    : null;
   const closestRow = comparedRows.length > 0
-    ? [...comparedRows].sort((a, b) => (decodeRatioValue(b.scenario) ?? 0) - (decodeRatioValue(a.scenario) ?? 0))[0]
+    ? [...comparedRows].sort((a, b) => (overallRatioValue(b.scenario) ?? 0) - (overallRatioValue(a.scenario) ?? 0))[0]
     : null;
   return {
     count: rows.length,
@@ -346,10 +564,13 @@ function scenarioSummary(target: any, scenarioId: string) {
     avgPrefillMs: mean(rows.map((row) => prefillMsValue(row.scenario))),
     avgPromptGap: mean(rows.map((row) => promptRatioValue(row.scenario))),
     avgDecodeGap: mean(rows.map((row) => decodeRatioValue(row.scenario))),
+    avgOverall: mean(rows.map((row) => overallValue(row.scenario))),
+    avgOverallGap: mean(rows.map((row) => overallRatioValue(row.scenario))),
+    reviewCount: rows.filter((row) => outputQualityStatus(row.scenario).tone === 'caution').length,
     fastestModelLabel: fastestRow?.model?.label ?? null,
     fastestDecode: fastestRow ? decodeValue(fastestRow.scenario) : null,
     closestModelLabel: closestRow?.model?.label ?? null,
-    closestRatio: closestRow ? decodeRatioValue(closestRow.scenario) : null,
+    closestRatio: closestRow ? overallRatioValue(closestRow.scenario) : null,
   };
 }
 
@@ -359,7 +580,7 @@ const jsonLd = {
     {
       '@type': 'CollectionPage',
       name: 'ZINC Benchmarks vs llama.cpp',
-      description: 'ZINC benchmark dashboard for AMD RDNA and Apple Silicon, including prompt throughput, prefill latency, decode throughput, total latency, and same-machine comparison against llama.cpp.',
+      description: 'ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, including prompt throughput, prefill latency, decode throughput, total latency, and same-machine comparison against llama.cpp.',
       url: pageUrl,
       about: {
         '@type': 'SoftwareApplication',
@@ -368,12 +589,12 @@ const jsonLd = {
         operatingSystem: 'Linux, macOS',
         codeRepository: 'https://github.com/zolotukhin/zinc',
       },
-      keywords: 'ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark',
+      keywords: 'ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, Intel Arc benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark',
     },
     {
       '@type': 'Dataset',
       name: 'ZINC benchmark artifact',
-      description: 'Structured benchmark artifact used to render the public ZINC benchmarks dashboard across RDNA and Metal targets.',
+      description: 'Structured benchmark artifact used to render the public ZINC benchmarks dashboard across RDNA, Intel Arc, and Metal targets.',
       dateModified: benchmarkData.generated_at,
       distribution: {
         '@type': 'DataDownload',
@@ -388,8 +609,8 @@ const jsonLd = {
 
 <BaseLayout
   title="ZINC Benchmarks vs llama.cpp"
-  description="ZINC benchmark dashboard for AMD RDNA and Apple Silicon, with scenario-based prompt throughput, prefill latency, decode throughput, end-to-end throughput, and same-machine comparison against llama.cpp."
-  keywords="ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark"
+  description="ZINC benchmark dashboard for AMD RDNA, Intel Arc, and Apple Silicon, with scenario-based prompt throughput, prefill latency, decode throughput, end-to-end throughput, and same-machine comparison against llama.cpp."
+  keywords="ZINC benchmarks, llama.cpp comparison, Apple Silicon Metal benchmark, AMD RDNA benchmark, Intel Arc benchmark, local LLM benchmark, prefill throughput, decode throughput, latency benchmark"
   canonicalUrl={canonicalUrl}
   jsonLd={jsonLd}
 >
@@ -397,9 +618,9 @@ const jsonLd = {
 
   <section class="hero">
     <div class="hero-copy">
-      <p class="eyebrow">Benchmarks</p>
-      <h1>ZINC Benchmark Board</h1>
-      <p class="intro">Same-machine benchmark slices for RDNA and Metal. Prompt processing, decode, and overall throughput stay visible in one row so the page reads like a working performance board instead of a stack of oversized cards.</p>
+      <p class="eyebrow">ZINC</p>
+      <h1>Benchmarks</h1>
+      <p class="intro">ZINC vs llama.cpp on the same machines.</p>
     </div>
     <div class="hero-stats">
       <article class="stat-card">
@@ -407,17 +628,36 @@ const jsonLd = {
         <strong>{targets.length}</strong>
       </article>
       <article class="stat-card">
-        <span>Benchmarked models</span>
-        <strong>{totalBenchmarkedModels}</strong>
+        <span>Unique Models</span>
+        <strong>{totalUniqueModels}</strong>
       </article>
       <article class="stat-card">
-        <span>Successful runs</span>
-        <strong>{totalSuccessfulModels}</strong>
-      </article>
-      <article class="stat-card">
-        <span>Same-machine comparisons</span>
+        <span>Comparisons</span>
         <strong>{totalComparedModels}</strong>
       </article>
+      <article class="stat-card">
+        <span>Updated</span>
+        <strong>{formatShortDate(benchmarkData.generated_at)}</strong>
+      </article>
+    </div>
+  </section>
+
+  <section class="coverage-panel" aria-label="Benchmark coverage">
+    <div>
+      <p class="eyebrow">Coverage</p>
+      <h2>All compared model rows are grouped by hardware target.</h2>
+      <p>
+        RDNA stays first because it is the default target. The full published dataset has six unique models; Metal has the six-model local comparison set, while RDNA and Intel show the canonical models that were available and valid on those nodes for this run.
+      </p>
+    </div>
+    <div class="coverage-grid">
+      {targets.map((target) => (
+        <a href={`#${target.id}`} class="coverage-card" data-bench-coverage-target={target.id}>
+          <span>{target.label}</span>
+          <strong>{target.summary?.compared_models ?? 0}</strong>
+          <small>compared model rows · {formatShortDate(target.generated_at)}</small>
+        </a>
+      ))}
     </div>
   </section>
 
@@ -438,16 +678,16 @@ const jsonLd = {
         </div>
         <div class="target-tab-stats">
           <div>
-            <strong>{formatMetric(target.summary?.average_decode_tps, 'tok/s')}</strong>
-            <small>core avg decode</small>
+            <strong>{formatNumber(target.summary?.average_decode_tps)}</strong>
+            <small>tok/s</small>
           </div>
           <div>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>vs llama</small>
+            <small>overall</small>
           </div>
           <div>
             <strong>{benchmarkedCount(target)}</strong>
-            <small>models</small>
+            <small>rows</small>
           </div>
         </div>
       </button>
@@ -460,6 +700,11 @@ const jsonLd = {
     const provenance = target.provenance ?? {};
     const zincProvenance = provenance.zinc ?? {};
     const llamaCppProvenance = provenance.llama_cpp ?? {};
+    const sourceRef = zincProvenance.commit ?? 'main';
+    const suiteSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs');
+    const promptSourceHref = githubBlobUrl(sourceRef, 'tools/performance_suite.mjs', 1502, 1640);
+    const promptTestHref = githubBlobUrl(sourceRef, 'tools/performance_suite.test.ts', 223, 238);
+    const dataSourceHref = githubBlobUrl('main', 'site/src/data/zinc-performance.json');
 
     return (
       <section
@@ -475,87 +720,65 @@ const jsonLd = {
           <div>
             <p class="eyebrow">{target.machine.label}</p>
             <h2>{target.label}</h2>
-            <p class="panel-copy">{target.description}</p>
+            <p class="panel-copy">{target.machine.gpu} · {target.machine.memory ?? 'n/a'} · {formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</p>
           </div>
-          <dl class="machine-card">
-            <div>
-              <dt>GPU</dt>
-              <dd>{target.machine.gpu}</dd>
-            </div>
-            <div>
-              <dt>Chip</dt>
-              <dd>{target.machine.chip ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>Memory</dt>
-              <dd>{target.machine.memory ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>Artifact</dt>
-              <dd>{formatDate(target.generated_at)}</dd>
-            </div>
-            <div>
-              <dt>Runs</dt>
-              <dd>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</dd>
-            </div>
-            <div>
-              <dt>Runner</dt>
-              <dd>{target.methodology?.runner ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>ZINC version</dt>
-              <dd>{zincProvenance.version ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>ZINC commit</dt>
-              <dd title={zincProvenance.commit ?? 'n/a'}>{formatCommit(zincProvenance.commit)}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp binary</dt>
-              <dd>{llamaCppProvenance.binary ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp version</dt>
-              <dd>{llamaCppProvenance.version ?? 'n/a'}</dd>
-            </div>
-            <div>
-              <dt>llama.cpp commit</dt>
-              <dd title={llamaCppProvenance.commit ?? 'n/a'}>{formatCommit(llamaCppProvenance.commit)}</dd>
-            </div>
-          </dl>
+          <details class="machine-details">
+            <summary>Run info</summary>
+            <dl class="machine-card">
+              <div>
+                <dt>GPU</dt>
+                <dd>{target.machine.gpu}</dd>
+              </div>
+              <div>
+                <dt>Chip</dt>
+                <dd>{target.machine.chip ?? 'n/a'}</dd>
+              </div>
+              <div>
+                <dt>Memory</dt>
+                <dd>{target.machine.memory ?? 'n/a'}</dd>
+              </div>
+              <div>
+                <dt>Artifact</dt>
+                <dd>{formatDate(target.generated_at)}</dd>
+              </div>
+              <div>
+                <dt>ZINC</dt>
+                <dd title={zincProvenance.version ?? zincProvenance.commit ?? 'n/a'}>
+                  {zincProvenance.version ?? formatCommit(zincProvenance.commit)}
+                </dd>
+              </div>
+              <div>
+                <dt>llama.cpp</dt>
+                <dd title={llamaCppProvenance.version ?? llamaCppProvenance.commit ?? 'n/a'}>
+                  {llamaCppProvenance.version ?? formatCommit(llamaCppProvenance.commit)}
+                </dd>
+              </div>
+            </dl>
+          </details>
         </header>
 
         <div class="summary-grid">
           <article class="summary-card">
-            <span>Fastest decode</span>
+            <span>Fastest</span>
             <strong>{formatMetric(target.summary?.fastest_decode_tps, 'tok/s')}</strong>
-            <small>{target.summary?.fastest_model_label ?? 'n/a'}</small>
+            <small>{displayModelLabel(target.summary?.fastest_model_label)}</small>
           </article>
           <article class="summary-card">
-            <span>Average prompt</span>
-            <strong>{formatMetric(target.summary?.average_prompt_tps, 'tok/s')}</strong>
-            <small>Core workload, ZINC</small>
-          </article>
-          <article class="summary-card">
-            <span>Average decode</span>
+            <span>Decode</span>
             <strong>{formatMetric(target.summary?.average_decode_tps, 'tok/s')}</strong>
-            <small>Core workload, ZINC</small>
+            <small>average</small>
           </article>
           <article class="summary-card">
-            <span>Average vs llama.cpp</span>
+            <span>Overall</span>
             <strong>{formatPercent(target.summary?.average_pct_of_llama)}</strong>
-            <small>Core decode ratio</small>
-          </article>
-          <article class="summary-card">
-            <span>Run recipe</span>
-            <strong>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</strong>
-            <small>{target.methodology?.benchmark_style ?? 'Benchmark methodology'}</small>
+            <small>prefill + decode vs llama.cpp</small>
           </article>
         </div>
 
         <nav class="scenario-tabs" aria-label={`${target.label} scenarios`}>
           {scenarioIds.map((scenarioId, scenarioIndex) => {
             const summary = scenarioSummary(target, scenarioId);
+            const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
             return (
               <button
                 type="button"
@@ -565,21 +788,20 @@ const jsonLd = {
                 aria-pressed={scenarioIndex === 0 ? 'true' : 'false'}
               >
                 <div class="scenario-tab-head">
-                  <span>{scenarioMeta[scenarioId]?.short ?? scenarioId}</span>
-                  <small>{scenarioMeta[scenarioId]?.eyebrow ?? scenarioId}</small>
+                  <span>{scenarioDisplay.short}</span>
                 </div>
                 <div class="scenario-tab-stats">
                   <div>
-                    <strong>{formatMetric(summary.avgPromptTokens, 'tok', 0)}</strong>
-                    <small>avg prompt</small>
+                    <strong>{formatNumber(summary.avgPrompt)}</strong>
+                    <small>prefill</small>
                   </div>
                   <div>
-                    <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
-                    <small>ZINC decode</small>
+                    <strong>{formatNumber(summary.avgDecode)}</strong>
+                    <small>decode</small>
                   </div>
                   <div>
-                    <strong>{formatPercent(summary.avgDecodeGap)}</strong>
-                    <small>vs llama</small>
+                    <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                    <small>overall</small>
                   </div>
                 </div>
               </button>
@@ -590,6 +812,10 @@ const jsonLd = {
         {scenarioIds.map((scenarioId, scenarioIndex) => {
           const rows = scenarioRows(target, scenarioId);
           const summary = scenarioSummary(target, scenarioId);
+          const scenarioDisplay = scenarioDisplayForTarget(target, scenarioId);
+          const promptMax = maxMetric(rows, (row) => Math.max(promptValue(row.scenario) ?? 0, baselinePromptValue(row.scenario) ?? 0));
+          const decodeMax = maxMetric(rows, (row) => Math.max(decodeValue(row.scenario) ?? 0, baselineDecodeValue(row.scenario) ?? 0));
+          const overallMax = maxMetric(rows, (row) => Math.max(overallValue(row.scenario) ?? 0, baselineOverallValue(row.scenario) ?? 0));
 
           return (
             <section
@@ -600,86 +826,273 @@ const jsonLd = {
             >
               <article class="scenario-banner">
                 <div>
-                  <p class="eyebrow">{scenarioMeta[scenarioId]?.eyebrow ?? 'Benchmark workload'}</p>
-                  <h3>{scenarioMeta[scenarioId]?.label ?? scenarioId}</h3>
-                  <p>{scenarioMeta[scenarioId]?.description ?? 'Scenario benchmark slice.'}</p>
+                  <h3>{scenarioDisplay.label}</h3>
                 </div>
                 <div class="scenario-highlights">
                   <span class="info-chip">
                     <strong>{summary.count}</strong>
-                    models · {summary.comparedCount} compared
+                    rows
                   </span>
                   <span class="info-chip">
                     <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
-                    avg prefill
+                    prefill
                   </span>
                   <span class="info-chip">
-                    <strong>{summary.fastestModelLabel ?? 'n/a'}</strong>
-                    {summary.fastestDecode != null ? ` · ${formatMetric(summary.fastestDecode, 'tok/s')}` : ' · no decode result'}
+                    <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
+                    decode
                   </span>
-                  {summary.closestModelLabel && (
-                    <span class:list={['info-chip', ratioTone(summary.closestRatio)]}>
-                      <strong>{summary.closestModelLabel}</strong>
-                      {summary.closestRatio != null ? ` · ${formatPercent(summary.closestRatio)}` : ' · n/a'}
-                    </span>
-                  )}
+                  <span class="info-chip">
+                    <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                    overall
+                  </span>
+                  <span class:list={['info-chip', summary.reviewCount > 0 ? 'caution' : 'positive']}>
+                    <strong>{summary.reviewCount}</strong>
+                    output review
+                  </span>
                 </div>
               </article>
+
+              <div class="scenario-readout" aria-label={`${scenarioDisplay.label} summary`}>
+                <article class="readout-card">
+                  <span>Decode</span>
+                  <strong>{formatMetric(summary.avgDecode, 'tok/s')}</strong>
+                  <small>{formatPercent(summary.avgDecodeGap)} decode ratio</small>
+                </article>
+                <article class="readout-card">
+                  <span>Prefill</span>
+                  <strong>{formatMetric(summary.avgPrompt, 'tok/s')}</strong>
+                  <small>{formatPercent(summary.avgPromptGap)} prefill ratio · {formatMetric(summary.avgPromptTokens, 'prompt tok', 0)}</small>
+                </article>
+                <article class="readout-card">
+                  <span>Fastest</span>
+                  <strong>{displayModelLabel(summary.fastestModelLabel)}</strong>
+                  <small>{formatMetric(summary.fastestDecode, 'tok/s')}</small>
+                </article>
+                <article class="readout-card">
+                  <span>Overall</span>
+                  <strong>{formatPercent(summary.avgOverallGap)}</strong>
+                  <small>best row: {displayModelLabel(summary.closestModelLabel)}</small>
+                </article>
+              </div>
 
               <article class="board-card">
                 <header class="board-head">
                   <div>
-                    <h3>Head-to-Head</h3>
-                    <p>Sorted by ZINC decode. Overall includes end-to-end throughput and total latency for directional context; runner transport still differs between ZINC and llama.cpp.</p>
+                    <h3>Models</h3>
                   </div>
                   <div class="legend">
                     <span><i class="legend-swatch zinc"></i>ZINC</span>
                     <span><i class="legend-swatch baseline"></i>llama.cpp</span>
-                    <span><i class="legend-swatch neutral"></i>ZINC as % of llama.cpp</span>
                   </div>
                 </header>
 
-                <div class="table-wrap">
-                  <table class="bench-table">
-                    <thead>
-                      <tr>
-                        <th>Model</th>
-                        <th>Prefill</th>
-                        <th>Decode</th>
-                        <th>Overall</th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((row, rowIndex) => {
+                <div class="decode-rank" aria-label="Model decode comparison">
+                  {rows.map((row) => {
+                    const zincPrompt = promptValue(row.scenario);
+                    const baselinePrompt = baselinePromptValue(row.scenario);
+                    const zincDecode = decodeValue(row.scenario);
+                    const baselineDecode = baselineDecodeValue(row.scenario);
+                    const promptRatio = promptRatioValue(row.scenario);
+                    const decodeRatio = decodeRatioValue(row.scenario);
+                    const overallRatio = overallRatioValue(row.scenario);
+                    const rowStatus = scenarioStatus(row.scenario);
+
+                    return (
+                      <article class="rank-row">
+                        <div class="rank-model">
+                          <div>
+                            <strong>{displayModelLabel(row.model)}</strong>
+                            <small title={rowStatus.note}>{formatNumber(promptTokensValue(row.scenario), 0)}p · {formatNumber(row.scenario.max_tokens, 0)}out · {rowStatus.label}</small>
+                            <span class:list={['status-pill', 'rank-status', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
+                          </div>
+                        </div>
+                        <div class="rank-bars">
+                          <div class="rank-metric-group">
+                            <div class="rank-metric-title">
+                              <span>Prefill</span>
+                              <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
+                            </div>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincPrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincPrompt, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselinePrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselinePrompt, 'tok/s')}</strong>
+                            </div>
+                          </div>
+                          <div class="rank-metric-group">
+                            <div class="rank-metric-title">
+                              <span>Decode</span>
+                              <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
+                            </div>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            </div>
+                          </div>
+                        </div>
+                        <div class="rank-ratio">
+                          <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
+                          <small>overall</small>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+
+                <details class="mobile-detail-details">
+                  <summary>
+                    <strong>Details</strong>
+                  </summary>
+                  <div class="mobile-bench-list" aria-label="Detailed benchmark cards">
+                    {rows.map((row) => {
+                      const zincPrompt = promptValue(row.scenario);
+                      const baselinePrompt = baselinePromptValue(row.scenario);
+                      const zincDecode = decodeValue(row.scenario);
+                      const baselineDecode = baselineDecodeValue(row.scenario);
+                      const zincOverall = overallValue(row.scenario);
+                      const baselineOverall = baselineOverallValue(row.scenario);
+                      const zincLatency = totalLatencyValue(row.scenario);
+                      const baselineLatency = baselineTotalLatencyValue(row.scenario);
+                      const promptRatio = promptRatioValue(row.scenario);
+                      const decodeRatio = decodeRatioValue(row.scenario);
+                      const overallRatio = overallRatioValue(row.scenario);
+                      const rowStatus = scenarioStatus(row.scenario);
+
+                      return (
+                        <article class="mobile-model">
+                          <header class="mobile-model-head">
+                            <div>
+                              <strong>{displayModelLabel(row.model)}</strong>
+                              <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)}</small>
+                            </div>
+                            <span class:list={['status-pill', rowStatus.tone]} title={rowStatus.note}>{rowStatus.label}</span>
+                          </header>
+
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Prefill</span>
+                              <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
+                            </div>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincPrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincPrompt, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselinePrompt, promptMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselinePrompt, 'tok/s')}</strong>
+                            </div>
+                          </div>
+
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Decode</span>
+                              <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
+                            </div>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincDecode, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineDecode, decodeMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineDecode, 'tok/s')}</strong>
+                            </div>
+                          </div>
+
+                          <div class="mobile-metric">
+                            <div class="mobile-metric-head">
+                              <span>Overall</span>
+                              <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
+                            </div>
+                            <div class="bar-line">
+                              <span>ZINC</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill zinc" style={`width: ${barWidth(zincOverall, overallMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(zincOverall, 'tok/s')}</strong>
+                            </div>
+                            <div class="bar-line baseline">
+                              <span>llama</span>
+                              <div class="bar-track" aria-hidden="true">
+                                <i class="bar-fill baseline" style={`width: ${barWidth(baselineOverall, overallMax)}%;`}></i>
+                              </div>
+                              <strong>{formatMetric(baselineOverall, 'tok/s')}</strong>
+                            </div>
+                            <small class="latency-note">Prompt+decode. Cold latency: ZINC {formatMetric(zincLatency, 'ms', 0)} · llama.cpp {formatMetric(baselineLatency, 'ms', 0)}</small>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </details>
+
+                <details class="raw-table-details">
+                  <summary>
+                    <strong>Raw data</strong>
+                  </summary>
+                  <div class="table-wrap">
+                    <table class="bench-table">
+                      <thead>
+                        <tr>
+                          <th>Model</th>
+                          <th>Prefill</th>
+                          <th>Decode</th>
+                          <th>Overall</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                      {rows.map((row) => {
                         const zincPrompt = promptValue(row.scenario);
                         const baselinePrompt = baselinePromptValue(row.scenario);
                         const zincDecode = decodeValue(row.scenario);
                         const baselineDecode = baselineDecodeValue(row.scenario);
-                        const zincEndToEnd = endToEndValue(row.scenario);
-                        const baselineEndToEnd = baselineEndToEndValue(row.scenario);
+                        const zincOverall = overallValue(row.scenario);
+                        const baselineOverall = baselineOverallValue(row.scenario);
                         const zincLatency = totalLatencyValue(row.scenario);
                         const baselineLatency = baselineTotalLatencyValue(row.scenario);
                         const promptRatio = promptRatioValue(row.scenario);
                         const decodeRatio = decodeRatioValue(row.scenario);
-                        const endToEndRatio = endToEndRatioValue(row.scenario);
-                        const status = scenarioStatus(row.scenario);
+                        const overallRatio = overallRatioValue(row.scenario);
                         const runCount = sampleCount(row.scenario?.zinc?.decode_tps) || sampleCount(row.scenario?.baseline?.decode_tps);
+                        const rowStatus = scenarioStatus(row.scenario);
 
                         return (
                           <tr>
                             <th scope="row" class="model-cell">
                               <div class="model-row">
-                                <span class="rank-chip">{rowIndex + 1}</span>
                                 <div>
-                                  <strong>{row.model.label}</strong>
-                                  <small>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {row.scenario.prompt_mode === 'chat' ? 'chat' : 'raw'} · {runCount || 0} runs</small>
+                                  <strong>{displayModelLabel(row.model)}</strong>
+                                  <small title={rowStatus.note}>{formatMetric(promptTokensValue(row.scenario), 'tok prompt', 0)} · {formatMetric(row.scenario.max_tokens, 'tok cap', 0)} · {runCount || 0} runs · {rowStatus.label}</small>
                                 </div>
-                              </div>
-                              <div class="chip-row">
-                                <span class="chip">{row.model.family}</span>
-                                <span class="chip">{row.model.quant}</span>
-                                <span class="chip">{row.scenario.prompt_mode === 'chat' ? 'Chat' : 'Raw'}</span>
                               </div>
                             </th>
                             <td>
@@ -700,12 +1113,9 @@ const jsonLd = {
                                     </div>
                                   </div>
                                   {hasValue(promptRatio) ? (
-                                    <div class="metric-footer">
+                                    <div class="metric-footer compact">
                                       <strong class:list={['ratio-pill', ratioTone(promptRatio)]}>{formatPercent(promptRatio)}</strong>
                                       <small>{formatSignedMetric(promptDeltaValue(row.scenario), 'tok/s')}</small>
-                                      <div class="meter-track">
-                                        <div class:list={['meter-fill', ratioTone(promptRatio)]} style={`width:${meterWidth(promptRatio)}%`}></div>
-                                      </div>
                                     </div>
                                   ) : (
                                     <div class="metric-missing">
@@ -739,12 +1149,9 @@ const jsonLd = {
                                     </div>
                                   </div>
                                   {hasValue(decodeRatio) ? (
-                                    <div class="metric-footer">
+                                    <div class="metric-footer compact">
                                       <strong class:list={['ratio-pill', ratioTone(decodeRatio)]}>{formatPercent(decodeRatio)}</strong>
                                       <small>{formatSignedMetric(decodeDeltaValue(row.scenario), 'tok/s')}</small>
-                                      <div class="meter-track">
-                                        <div class:list={['meter-fill', ratioTone(decodeRatio)]} style={`width:${meterWidth(decodeRatio)}%`}></div>
-                                      </div>
                                     </div>
                                   ) : (
                                     <div class="metric-missing">
@@ -761,26 +1168,26 @@ const jsonLd = {
                               )}
                             </td>
                             <td>
-                              {hasValue(zincEndToEnd) || hasValue(baselineEndToEnd) || hasValue(zincLatency) || hasValue(baselineLatency) ? (
+                              {hasValue(zincOverall) || hasValue(baselineOverall) || hasValue(zincLatency) || hasValue(baselineLatency) ? (
                                 <div class="metric-stack">
                                   <div class="backend-line">
                                     <span class="backend-pill zinc">Z</span>
                                     <div>
-                                      <strong>{formatMetric(zincEndToEnd, 'tok/s')}</strong>
-                                      <small>{formatMetric(zincLatency, 'ms', 0)}</small>
+                                      <strong>{formatMetric(zincOverall, 'tok/s')}</strong>
+                                      <small>prompt+decode</small>
                                     </div>
                                   </div>
                                   <div class="backend-line baseline">
                                     <span class="backend-pill baseline">L</span>
                                     <div>
-                                      <strong>{formatMetric(baselineEndToEnd, 'tok/s')}</strong>
-                                      <small>{formatMetric(baselineLatency, 'ms', 0)}</small>
+                                      <strong>{formatMetric(baselineOverall, 'tok/s')}</strong>
+                                      <small>prompt+decode</small>
                                     </div>
                                   </div>
-                                  {hasValue(endToEndRatio) ? (
+                                  {hasValue(overallRatio) ? (
                                     <div class="metric-footer compact">
-                                      <strong class:list={['ratio-pill', ratioTone(endToEndRatio)]}>{formatPercent(endToEndRatio)}</strong>
-                                      <small>{formatSignedMetric(endToEndDeltaValue(row.scenario), 'tok/s')}</small>
+                                      <strong class:list={['ratio-pill', ratioTone(overallRatio)]}>{formatPercent(overallRatio)}</strong>
+                                      <small>{formatSignedMetric(overallDeltaValue(row.scenario), 'tok/s')}</small>
                                       <small>{formatLatencyDelta(latencyDeltaValue(row.scenario))}</small>
                                     </div>
                                   ) : (
@@ -797,19 +1204,13 @@ const jsonLd = {
                                 </div>
                               )}
                             </td>
-                            <td class="status-cell">
-                              <strong class:list={['status-pill', status.tone]}>{status.label}</strong>
-                              <small>{status.note}</small>
-                              {hasValue(decodeRatio) && (
-                                <small>{row.scenario?.comparison?.leader === 'zinc' ? 'ZINC ahead' : 'llama.cpp ahead'} · {formatSignedMetric(decodeDeltaValue(row.scenario), 'tok/s')}</small>
-                              )}
-                            </td>
                           </tr>
                         );
                       })}
-                    </tbody>
-                  </table>
-                </div>
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
               </article>
             </section>
           );
@@ -823,6 +1224,12 @@ const jsonLd = {
             </div>
             <span>{formatRuns(target.methodology?.runs, target.methodology?.warmup_runs)}</span>
           </summary>
+          <div class="method-links">
+            <a href={suiteSourceHref} target="_blank" rel="noreferrer">Benchmark runner</a>
+            <a href={promptSourceHref} target="_blank" rel="noreferrer">Exact prompts and token caps</a>
+            <a href={promptTestHref} target="_blank" rel="noreferrer">Prompt matrix test</a>
+            <a href={dataSourceHref} target="_blank" rel="noreferrer">Published JSON</a>
+          </div>
           <ul class="method-list">
             {target.methodology.notes.map((note) => <li>{note}</li>)}
           </ul>
@@ -834,6 +1241,7 @@ const jsonLd = {
   <script is:inline>
     function initBenchmarksDashboard() {
       const targetTabs = Array.from(document.querySelectorAll('[data-bench-target-tab]'));
+      const coverageLinks = Array.from(document.querySelectorAll('[data-bench-coverage-target]'));
       const targetPanels = Array.from(document.querySelectorAll('[data-bench-target-panel]'));
       const scenarioTabs = Array.from(document.querySelectorAll('[data-bench-scenario-target]'));
       const scenarioPanels = Array.from(document.querySelectorAll('[data-bench-scenario-panel]'));
@@ -871,7 +1279,16 @@ const jsonLd = {
 
       for (const tab of targetTabs) {
         tab.addEventListener('click', () => {
-          const targetId = tab.dataset.benchTargetTab || targetTabs[0]?.dataset.benchTargetTab || 'metal';
+          const targetId = tab.dataset.benchTargetTab || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
+          setActiveTarget(targetId);
+          history.replaceState(null, '', `#${targetId}`);
+        });
+      }
+
+      for (const link of coverageLinks) {
+        link.addEventListener('click', (event) => {
+          event.preventDefault();
+          const targetId = link.dataset.benchCoverageTarget || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
           setActiveTarget(targetId);
           history.replaceState(null, '', `#${targetId}`);
         });
@@ -879,7 +1296,7 @@ const jsonLd = {
 
       for (const tab of scenarioTabs) {
         tab.addEventListener('click', () => {
-          const targetId = tab.dataset.benchScenarioTarget || targetTabs[0]?.dataset.benchTargetTab || 'metal';
+          const targetId = tab.dataset.benchScenarioTarget || targetTabs[0]?.dataset.benchTargetTab || 'rdna';
           const scenarioId = tab.dataset.benchScenario || 'core';
           setActiveScenario(targetId, scenarioId);
         });
@@ -889,7 +1306,7 @@ const jsonLd = {
       const hashedTarget = location.hash ? location.hash.slice(1) : null;
       const initialTarget = hashedTarget && knownTargets.has(hashedTarget)
         ? hashedTarget
-        : (targetTabs[0]?.dataset.benchTargetTab || 'metal');
+        : (targetTabs[0]?.dataset.benchTargetTab || 'rdna');
       setActiveTarget(initialTarget);
     }
 
@@ -984,6 +1401,8 @@ const jsonLd = {
   }
 
   .hero-stats,
+  .coverage-panel,
+  .coverage-grid,
   .summary-grid,
   .panel-header,
   .target-panel,
@@ -993,26 +1412,32 @@ const jsonLd = {
   }
 
   .stat-card,
+  .coverage-card,
   .summary-card,
   .board-card,
   .method-card,
   .scenario-banner,
-  .machine-card {
+  .machine-card,
+  .readout-card {
     border: 1px solid color-mix(in srgb, var(--color-border) 86%, #d97706 14%);
-    border-radius: 16px;
+    border-radius: 8px;
     background: var(--bench-surface);
     box-shadow: var(--bench-shadow);
   }
 
   .stat-card,
+  .coverage-card,
   .summary-card,
   .board-card,
   .scenario-banner,
-  .machine-card {
+  .machine-card,
+  .readout-card {
     padding: 0.85rem 0.9rem;
   }
 
   .stat-card span,
+  .coverage-card span,
+  .coverage-card small,
   .summary-card span,
   .machine-card dt,
   .method-list,
@@ -1023,9 +1448,48 @@ const jsonLd = {
   }
 
   .stat-card strong,
+  .coverage-card strong,
   .summary-card strong {
     display: block;
     margin-top: 0.18rem;
+  }
+
+  .coverage-panel {
+    grid-template-columns: minmax(0, 0.95fr) minmax(420px, 1.25fr);
+    gap: 0.85rem;
+    align-items: stretch;
+    margin: 0.2rem 0 0.9rem;
+    padding: 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 82%, #d97706 18%);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+    box-shadow: var(--bench-shadow);
+  }
+
+  .coverage-panel h2 {
+    margin: 0 0 0.35rem;
+    font-size: clamp(1.2rem, 2vw, 1.55rem);
+    letter-spacing: -0.02em;
+  }
+
+  .coverage-panel p {
+    margin: 0;
+    color: var(--color-text-muted);
+  }
+
+  .coverage-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .coverage-card {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .coverage-card strong {
+    font-size: 1.8rem;
+    line-height: 1;
   }
 
   .target-tabs,
@@ -1040,20 +1504,66 @@ const jsonLd = {
   }
 
   .scenario-tabs {
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 0.35rem;
+    padding: 0.35rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+    box-shadow: var(--bench-shadow);
   }
 
   .target-tab,
   .scenario-tab {
     appearance: none;
+    position: relative;
     text-align: left;
-    border-radius: 14px;
-    border: 1px solid color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
     background: var(--bench-surface-soft);
     color: var(--color-text);
     cursor: pointer;
     padding: 0.8rem 0.85rem;
     transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+  }
+
+  .target-tab {
+    padding-right: 2.5rem;
+    border-color: color-mix(in srgb, var(--color-border) 84%, #d97706 16%);
+  }
+
+  .scenario-tab {
+    padding: 0.65rem 0.72rem 0.68rem 0.95rem;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .target-tab::before,
+  .scenario-tab::before {
+    content: '';
+    position: absolute;
+    display: block;
+    pointer-events: none;
+  }
+
+  .target-tab::before {
+    top: 0.86rem;
+    right: 0.86rem;
+    width: 0.74rem;
+    height: 0.74rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, var(--color-text-muted) 58%, transparent);
+    background: var(--bench-surface-plain);
+  }
+
+  .scenario-tab::before {
+    left: 0;
+    top: 0.62rem;
+    bottom: 0.62rem;
+    width: 3px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-border) 70%, transparent);
   }
 
   .target-tab-head,
@@ -1063,12 +1573,31 @@ const jsonLd = {
     margin-bottom: 0.55rem;
   }
 
+  .scenario-tab-head {
+    margin-bottom: 0.45rem;
+  }
+
   .target-tab.active,
   .scenario-tab.active {
     transform: translateY(-1px);
     border-color: #d97706;
     background: var(--bench-tab-active);
     box-shadow: 0 10px 18px -18px rgba(0, 0, 0, 0.45), inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+
+  .target-tab:hover,
+  .scenario-tab:hover {
+    border-color: color-mix(in srgb, #d97706 68%, var(--color-border) 32%);
+    background: color-mix(in srgb, var(--bench-tab-active) 78%, var(--bench-surface-soft) 22%);
+  }
+
+  .target-tab.active::before {
+    border-color: #d97706;
+    background: radial-gradient(circle at center, #d97706 0 42%, transparent 45%);
+  }
+
+  .scenario-tab.active::before {
+    background: #d97706;
   }
 
   .target-tab:focus-visible,
@@ -1163,6 +1692,42 @@ const jsonLd = {
     font-size: 1.35rem;
   }
 
+  .scenario-readout {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.65rem;
+  }
+
+  .readout-card {
+    min-width: 0;
+  }
+
+  .readout-card span,
+  .readout-card small {
+    color: var(--color-text-muted);
+  }
+
+  .readout-card span {
+    display: block;
+    margin-bottom: 0.18rem;
+    font-size: 0.74rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .readout-card strong {
+    display: block;
+    overflow-wrap: anywhere;
+    line-height: 1.2;
+  }
+
+  .readout-card small {
+    display: block;
+    margin-top: 0.22rem;
+    line-height: 1.35;
+  }
+
   .scenario-highlights {
     display: flex;
     flex-wrap: wrap;
@@ -1246,11 +1811,244 @@ const jsonLd = {
     background: #64748b;
   }
 
+  .decode-rank {
+    display: grid;
+    margin-bottom: 0.85rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .rank-row {
+    display: grid;
+    grid-template-columns: minmax(240px, 0.8fr) minmax(420px, 1.55fr) minmax(112px, auto);
+    gap: 0.9rem;
+    align-items: center;
+    padding: 0.72rem 0.78rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 74%, transparent);
+  }
+
+  .rank-row:last-child {
+    border-bottom: 0;
+  }
+
+  .rank-model {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    min-width: 0;
+  }
+
+  .rank-model strong {
+    display: block;
+    line-height: 1.25;
+  }
+
+  .rank-model small,
+  .rank-ratio small,
+  .latency-note {
+    display: block;
+    color: var(--color-text-muted);
+    line-height: 1.35;
+  }
+
+  .rank-status {
+    display: none;
+  }
+
+  .rank-bars {
+    display: grid;
+    gap: 0.58rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    min-width: 0;
+  }
+
+  .rank-metric-group {
+    display: grid;
+    gap: 0.28rem;
+    min-width: 0;
+  }
+
+  .rank-metric-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+
+  .rank-metric-title span {
+    color: var(--color-text-muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .rank-metric-title .ratio-pill {
+    padding: 0.16rem 0.38rem;
+    font-size: 0.68rem;
+  }
+
+  .bar-line {
+    display: grid;
+    grid-template-columns: 3.6rem minmax(64px, 1fr) 6.2rem;
+    gap: 0.55rem;
+    align-items: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .bar-line span {
+    color: var(--color-text-muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .bar-line strong {
+    justify-self: end;
+    font-size: 0.84rem;
+    white-space: nowrap;
+  }
+
+  .bar-track {
+    height: 0.48rem;
+    border-radius: 999px;
+    background: var(--bench-meter-track);
+    overflow: hidden;
+  }
+
+  .bar-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+  }
+
+  .bar-fill.zinc {
+    background: linear-gradient(90deg, #b45309, #f59e0b);
+  }
+
+  .bar-fill.baseline {
+    background: linear-gradient(90deg, #1d4ed8, #60a5fa);
+  }
+
+  .rank-ratio {
+    display: grid;
+    justify-items: end;
+    gap: 0.18rem;
+    text-align: right;
+  }
+
+  .mobile-bench-list {
+    display: none;
+  }
+
+  .mobile-model {
+    display: grid;
+    gap: 0.75rem;
+    padding: 0.78rem 0;
+    border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+  }
+
+  .mobile-model:first-child {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  .mobile-model:last-child {
+    padding-bottom: 0;
+  }
+
+  .mobile-model-head,
+  .mobile-metric-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.65rem;
+    align-items: start;
+  }
+
+  .mobile-model-head strong {
+    display: block;
+    line-height: 1.25;
+  }
+
+  .mobile-model-head small {
+    display: block;
+    margin-top: 0.18rem;
+    color: var(--color-text-muted);
+  }
+
+  .mobile-metric {
+    display: grid;
+    gap: 0.38rem;
+  }
+
+  .mobile-metric-head span {
+    font-size: 0.75rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--color-text-muted);
+  }
+
   .table-wrap {
     overflow-x: auto;
-    border-radius: 14px;
+    border-radius: 8px;
     border: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
     background: var(--bench-surface-plain);
+  }
+
+  .raw-table-details {
+    margin-top: 0.85rem;
+    border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+    padding-top: 0.65rem;
+  }
+
+  .raw-table-details summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    gap: 0.8rem;
+    align-items: center;
+    color: var(--color-text);
+  }
+
+  .raw-table-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .raw-table-details summary::after {
+    content: '+';
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.45rem;
+    height: 1.45rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    color: var(--color-text-muted);
+    font-weight: 800;
+  }
+
+  .raw-table-details[open] summary::after {
+    content: '-';
+  }
+
+  .raw-table-details summary strong,
+  .raw-table-details summary small {
+    display: block;
+  }
+
+  .raw-table-details summary small {
+    color: var(--color-text-muted);
+    margin-top: 0.08rem;
+  }
+
+  .raw-table-details .table-wrap {
+    margin-top: 0.7rem;
   }
 
   .bench-table {
@@ -1465,7 +2263,7 @@ const jsonLd = {
     gap: 0.14rem;
     min-width: 170px;
     padding: 0.55rem 0.65rem;
-    border-radius: 12px;
+    border-radius: 8px;
     border: 1px dashed color-mix(in srgb, var(--color-border) 82%, #d97706 18%);
     background: color-mix(in srgb, var(--bench-surface-soft) 86%, var(--color-bg) 14%);
   }
@@ -1582,6 +2380,32 @@ const jsonLd = {
     border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
   }
 
+  .method-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    padding: 0.75rem 0.95rem 0;
+  }
+
+  .method-links a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2rem;
+    padding: 0.28rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-border) 80%, #d97706 20%);
+    color: var(--color-text);
+    text-decoration: none;
+    font-size: 0.78rem;
+    font-weight: 700;
+    background: color-mix(in srgb, var(--bench-surface-soft) 88%, var(--color-bg) 12%);
+  }
+
+  .method-links a:hover {
+    border-color: color-mix(in srgb, #d97706 68%, var(--color-border) 32%);
+    color: #b45309;
+  }
+
   .method-list {
     margin: 0;
     padding: 0.85rem 0.95rem 0.95rem 2rem;
@@ -1591,8 +2415,25 @@ const jsonLd = {
 
   @media (max-width: 1100px) {
     .hero,
+    .coverage-panel,
     .panel-header,
     .scenario-banner {
+      grid-template-columns: 1fr;
+    }
+
+    .coverage-grid {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+
+    .scenario-readout {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .rank-row {
+      grid-template-columns: minmax(210px, 0.85fr) minmax(320px, 1.25fr) minmax(98px, auto);
+    }
+
+    .rank-bars {
       grid-template-columns: 1fr;
     }
 
@@ -1607,10 +2448,25 @@ const jsonLd = {
     }
 
     .hero-stats,
-    .machine-card,
+    .summary-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .summary-card:last-child {
+      grid-column: 1 / -1;
+    }
+
+    .machine-card {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .machine-card div:nth-child(n + 5) {
+      display: none;
+    }
+
     .target-tab-stats,
     .scenario-tab-stats {
-      grid-template-columns: 1fr;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
     .board-head {
@@ -1618,17 +2474,761 @@ const jsonLd = {
     }
 
     .target-tabs,
-    .scenario-tabs,
-    .summary-grid {
+    .scenario-tabs {
       grid-template-columns: 1fr;
     }
 
-    .bench-table {
-      min-width: 960px;
+    .scenario-readout {
+      grid-template-columns: 1fr;
+    }
+
+    .decode-rank {
+      margin-bottom: 0.9rem;
+    }
+
+    .rank-row {
+      grid-template-columns: 1fr;
+      gap: 0.58rem;
+      padding: 0.78rem 0.72rem;
+    }
+
+    .rank-ratio {
+      justify-items: start;
+      text-align: left;
+    }
+
+    .rank-bars {
+      grid-template-columns: 1fr;
+    }
+
+    .bar-line {
+      grid-template-columns: 3.1rem minmax(56px, 1fr) 5.55rem;
+      gap: 0.45rem;
+    }
+
+    .bar-line strong {
+      font-size: 0.78rem;
+    }
+
+    .table-wrap {
+      display: none;
+    }
+
+    .raw-table-details {
+      display: none;
+    }
+
+    .mobile-bench-list {
+      display: grid;
+      gap: 0;
     }
 
     .method-summary {
       flex-direction: column;
+    }
+  }
+
+  /* Visual reset: make the benchmark page read like a dense performance tool. */
+  :global(main.container) {
+    --bench-accent: #c45c13;
+    --bench-control: #334155;
+    --bench-control-soft: color-mix(in srgb, #334155 7%, var(--color-bg) 93%);
+    --bench-surface: var(--color-bg);
+    --bench-surface-plain: color-mix(in srgb, var(--color-bg) 97%, var(--color-bg-alt) 3%);
+    --bench-surface-soft: color-mix(in srgb, var(--color-bg-alt) 62%, var(--color-bg) 38%);
+    --bench-tab-active: color-mix(in srgb, var(--bench-control) 10%, var(--color-bg) 90%);
+    --bench-table-head-bg: color-mix(in srgb, var(--color-bg-alt) 88%, var(--color-bg) 12%);
+    --bench-table-head-text: color-mix(in srgb, var(--color-text) 86%, var(--bench-control) 14%);
+    --bench-row-odd: var(--color-bg);
+    --bench-row-even: color-mix(in srgb, var(--color-bg-alt) 48%, var(--color-bg) 52%);
+    --bench-meter-track: color-mix(in srgb, var(--color-border) 54%, var(--color-bg-alt) 46%);
+    --bench-shadow: none;
+  }
+
+  .hero {
+    align-items: start;
+    padding-bottom: 1.15rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .eyebrow {
+    color: var(--bench-accent);
+  }
+
+  .hero h1 {
+    max-width: 12ch;
+  }
+
+  .hero-stats {
+    align-self: stretch;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .stat-card,
+  .summary-card,
+  .scenario-banner,
+  .machine-card,
+  .readout-card {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .stat-card {
+    min-height: 5.1rem;
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .stat-card:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .stat-card:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .target-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.35rem;
+    padding: 0.35rem;
+    margin: 1rem 0 1.15rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 86%, transparent);
+    border-radius: 8px;
+    background: var(--bench-surface-plain);
+  }
+
+  .target-tab {
+    padding: 0.78rem 2.35rem 0.78rem 0.85rem;
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .target-tab::before {
+    border-color: color-mix(in srgb, var(--color-text-muted) 50%, transparent);
+  }
+
+  .target-tab.active,
+  .scenario-tab.active {
+    border-color: color-mix(in srgb, var(--bench-control) 28%, var(--color-border) 72%);
+    background: var(--bench-control-soft);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bench-control) 10%, transparent);
+  }
+
+  .target-tab:hover,
+  .scenario-tab:hover {
+    border-color: color-mix(in srgb, var(--bench-control) 30%, var(--color-border) 70%);
+    background: color-mix(in srgb, var(--bench-control-soft) 72%, var(--bench-surface-plain) 28%);
+  }
+
+  .target-tab.active::before {
+    border-color: var(--bench-accent);
+    background: radial-gradient(circle at center, var(--bench-accent) 0 42%, transparent 45%);
+  }
+
+  .panel-header {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.65rem;
+    padding-bottom: 0.9rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .panel-header h2 {
+    font-size: clamp(1.55rem, 2.2vw, 2rem);
+  }
+
+  .machine-card {
+    padding: 0;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 0.45rem 1.15rem;
+  }
+
+  .machine-card dt {
+    font-size: 0.66rem;
+  }
+
+  .machine-card dd {
+    font-size: 0.85rem;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .summary-card {
+    min-width: 0;
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .summary-card:last-child {
+    border-right: 0;
+  }
+
+  .scenario-tabs {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.25rem;
+    padding: 0.28rem;
+    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
+  }
+
+  .scenario-tab {
+    padding: 0.58rem 0.68rem 0.62rem 0.82rem;
+  }
+
+  .scenario-tab::before {
+    top: 0.58rem;
+    bottom: 0.58rem;
+    background: color-mix(in srgb, var(--color-border) 58%, transparent);
+  }
+
+  .scenario-tab.active::before {
+    background: var(--bench-accent);
+  }
+
+  .scenario-banner {
+    padding: 0.15rem 0 0.1rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+  }
+
+  .scenario-banner h3 {
+    font-size: 1.16rem;
+  }
+
+  .scenario-highlights {
+    justify-content: end;
+  }
+
+  .info-chip {
+    background: var(--bench-surface-plain);
+    border-color: color-mix(in srgb, var(--color-border) 78%, transparent);
+  }
+
+  .scenario-readout {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bench-surface-plain);
+  }
+
+  .readout-card {
+    border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+  }
+
+  .readout-card:last-child {
+    border-right: 0;
+  }
+
+  .board-card,
+  .method-card {
+    border-color: color-mix(in srgb, var(--color-border) 86%, transparent);
+    background: var(--bench-surface);
+  }
+
+  .board-card {
+    padding: 1rem;
+  }
+
+  .decode-rank,
+  .table-wrap {
+    border-radius: 8px;
+  }
+
+  .rank-chip {
+    background: color-mix(in srgb, var(--bench-accent) 10%, transparent);
+    color: var(--bench-accent);
+  }
+
+  .bar-fill.zinc {
+    background: linear-gradient(90deg, #b45309, #d97706);
+  }
+
+  .ratio-pill.caution {
+    background: color-mix(in srgb, #f59e0b 20%, transparent);
+  }
+
+  @media (max-width: 1100px) {
+    .machine-card {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .summary-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .summary-card:nth-child(3n) {
+      border-right: 0;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .scenario-banner {
+      grid-template-columns: 1fr;
+    }
+
+    .scenario-highlights {
+      justify-content: start;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .hero {
+      gap: 0.85rem;
+      padding-bottom: 0.9rem;
+    }
+
+    .hero h1 {
+      max-width: 10ch;
+    }
+
+    .hero-stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stat-card {
+      min-height: 4.75rem;
+      padding: 0.75rem;
+    }
+
+    .target-tabs {
+      grid-template-columns: 1fr;
+      margin: 0.85rem 0 1rem;
+    }
+
+    .target-tab {
+      padding-top: 0.72rem;
+      padding-bottom: 0.72rem;
+    }
+
+    .machine-card {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      padding: 0;
+    }
+
+    .summary-grid,
+    .scenario-readout {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .summary-card,
+    .readout-card {
+      border-right: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+      border-bottom: 1px solid color-mix(in srgb, var(--color-border) 76%, transparent);
+    }
+
+    .summary-card:nth-child(2n),
+    .readout-card:nth-child(2n) {
+      border-right: 0;
+    }
+
+    .summary-card:last-child {
+      grid-column: 1 / -1;
+      border-bottom: 0;
+    }
+
+    .readout-card:nth-last-child(-n + 2) {
+      border-bottom: 0;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: 1fr;
+    }
+
+    .scenario-tab {
+      padding: 0.58rem 0.62rem 0.62rem 0.82rem;
+    }
+
+    .board-card {
+      padding: 0.85rem;
+    }
+  }
+
+  /* Minimal pass: remove prose-heavy benchmark chrome. */
+  .hero {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 1.8rem;
+    align-items: center;
+  }
+
+  .hero h1 {
+    max-width: none;
+    margin-bottom: 0.25rem;
+  }
+
+  .intro {
+    font-size: 1rem;
+  }
+
+  .hero-stats {
+    display: flex;
+    align-self: center;
+    border: 0;
+    background: transparent;
+    border-radius: 0;
+    overflow: visible;
+    gap: 0;
+  }
+
+  .stat-card {
+    min-width: 6.6rem;
+    min-height: auto;
+    padding: 0 0.85rem;
+    border: 0;
+    border-left: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  }
+
+  .stat-card:first-child {
+    border-left: 0;
+  }
+
+  .stat-card span,
+  .summary-card span {
+    display: block;
+    font-size: 0.64rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .stat-card strong {
+    margin-top: 0.08rem;
+    font-size: 1rem;
+  }
+
+  .target-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 0.25rem;
+  }
+
+  .target-tab {
+    display: grid;
+    grid-template-columns: minmax(6rem, auto) minmax(0, 1fr);
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.72rem 0.85rem;
+  }
+
+  .target-tab::before {
+    display: none;
+  }
+
+  .target-tab-head {
+    margin: 0;
+  }
+
+  .target-tab-head small {
+    display: none;
+  }
+
+  .target-tab-stats {
+    justify-self: end;
+    width: min(100%, 19rem);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .target-tab-stats strong,
+  .scenario-tab-stats strong {
+    font-size: 0.86rem;
+    white-space: nowrap;
+  }
+
+  .target-tab-stats small,
+  .scenario-tab-stats small {
+    font-size: 0.64rem;
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .panel-copy {
+    margin-top: 0.25rem;
+    font-size: 0.9rem;
+  }
+
+  .machine-details {
+    justify-self: end;
+    position: relative;
+  }
+
+  .machine-details summary {
+    list-style: none;
+    cursor: pointer;
+    border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+    border-radius: 999px;
+    padding: 0.34rem 0.72rem;
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+
+  .machine-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .machine-details[open] summary {
+    color: var(--color-text);
+  }
+
+  .machine-details .machine-card {
+    margin-top: 0.65rem;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scenario-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .scenario-tab {
+    min-width: 0;
+  }
+
+  .scenario-tab-head {
+    margin-bottom: 0.28rem;
+  }
+
+  .scenario-tab-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scenario-banner {
+    align-items: center;
+    padding: 0.62rem 0 0.54rem;
+  }
+
+  .scenario-banner h3 {
+    font-size: 1.05rem;
+  }
+
+  .scenario-highlights {
+    gap: 0.32rem;
+  }
+
+  .info-chip {
+    padding: 0.24rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+  }
+
+  .scenario-readout {
+    display: none;
+  }
+
+  .board-head {
+    align-items: center;
+    margin-bottom: 0.55rem;
+  }
+
+  .board-head h3 {
+    font-size: 1rem;
+    letter-spacing: 0;
+  }
+
+  .legend {
+    font-size: 0.72rem;
+  }
+
+  .rank-row {
+    padding: 0.68rem 0.78rem;
+  }
+
+  .rank-model small,
+  .rank-ratio small {
+    font-size: 0.78rem;
+  }
+
+  .mobile-detail-details {
+    display: none;
+  }
+
+  .mobile-detail-details summary,
+  .raw-table-details summary {
+    min-height: 2.3rem;
+  }
+
+  .mobile-detail-details summary strong,
+  .raw-table-details summary strong {
+    font-size: 0.92rem;
+  }
+
+  @media (max-width: 760px) {
+    .hero {
+      grid-template-columns: 1fr;
+      gap: 0.35rem;
+    }
+
+    .hero h1 {
+      max-width: none;
+      font-size: clamp(2.25rem, 14vw, 3.2rem);
+    }
+
+    .intro,
+    .hero-stats,
+    .machine-details,
+    .summary-grid,
+    .scenario-banner {
+      display: none;
+    }
+
+    .target-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin: 0.75rem 0 0.9rem;
+    }
+
+    .target-tab {
+      grid-template-columns: 1fr;
+      gap: 0.48rem;
+      padding: 0.66rem;
+    }
+
+    .target-tab-stats {
+      justify-self: stretch;
+      width: 100%;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .target-tab-stats div:nth-child(3) {
+      display: none;
+    }
+
+    .panel-header {
+      align-items: start;
+      padding-bottom: 0.65rem;
+    }
+
+    .panel-header h2 {
+      font-size: 1.5rem;
+    }
+
+    .panel-copy {
+      font-size: 0.82rem;
+      line-height: 1.4;
+    }
+
+    .scenario-tabs {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.24rem;
+      padding: 0.24rem;
+    }
+
+    .scenario-tab {
+      padding: 0.55rem 0.58rem;
+    }
+
+    .scenario-tab::before {
+      display: none;
+    }
+
+    .scenario-tab-stats small {
+      display: none;
+    }
+
+    .board-card {
+      padding: 0.72rem;
+    }
+
+    .board-head {
+      flex-direction: row;
+      align-items: center;
+    }
+
+    .legend span:nth-child(2) {
+      display: inline-flex;
+    }
+
+    .rank-row {
+      grid-template-columns: 1fr;
+      gap: 0.48rem;
+      padding: 0.74rem 0.68rem;
+    }
+
+    .rank-model small {
+      display: none;
+    }
+
+    .rank-status {
+      display: inline-flex;
+      margin-top: 0.42rem;
+    }
+
+    .rank-ratio {
+      grid-auto-flow: column;
+      justify-content: start;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .rank-ratio small {
+      display: block;
+    }
+
+    .mobile-detail-details {
+      display: block;
+      margin-top: 0.65rem;
+      border-top: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+      padding-top: 0.5rem;
+    }
+
+    .mobile-detail-details summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--color-text);
+    }
+
+    .mobile-detail-details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .mobile-detail-details summary::after {
+      content: '+';
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.35rem;
+      height: 1.35rem;
+      border: 1px solid color-mix(in srgb, var(--color-border) 84%, transparent);
+      border-radius: 999px;
+      color: var(--color-text-muted);
+      font-weight: 800;
+    }
+
+    .mobile-detail-details[open] summary::after {
+      content: '-';
+    }
+
+    .mobile-detail-details[open] .mobile-bench-list {
+      display: grid;
+      gap: 0;
+      margin-top: 0.6rem;
+    }
+
+    .method-card {
+      display: none;
     }
   }
 </style>

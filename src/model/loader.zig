@@ -24,6 +24,10 @@ pub const ModelInspection = struct {
     config: ModelConfig,
     file_size: u64,
     tensor_bytes: u64,
+    /// Sum of MoE expert tensor bytes (the share that would be allocated in
+    /// host-visible memory under `ZINC_OFFLOAD_MOE_EXPERTS=1`). Zero for dense
+    /// models. Use this for exact, model-specific offload-fit accounting.
+    offloadable_tensor_bytes: u64 = 0,
     tensor_count: u64,
     metadata_count: usize,
 };
@@ -36,6 +40,105 @@ pub const LoadedTensor = struct {
     gpu_buffer: Buffer,
 };
 
+/// Return true if this GGUF tensor name designates a fused MoE expert weight tensor.
+/// Matches the four suffixes emitted by GGUF for sparse-MoE architectures:
+/// `ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`, and
+/// `ffn_down_exps_scale.weight` (Q4_K_M variants only).
+/// Dense tensors and non-expert MoE tensors (router gate, attention, embeddings, etc.)
+/// are not matched.
+pub fn isMoEExpertTensor(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, "ffn_gate_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_up_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_down_exps.weight") or
+        std.mem.endsWith(u8, name, "ffn_down_exps_scale.weight");
+}
+
+/// Decided offload state for the most recently loaded model:
+///   -1 = no decision yet (no model has been loaded)
+///    0 = decided off (model fits in VRAM, or env forces off)
+///    1 = decided on (model needs offload to fit, or env forces on)
+/// Set by `decideOffloadForLoad` once per `loader.load` call. Read by
+/// `shouldOffloadToHost` from per-tensor allocation paths and from
+/// `tensorBytes` budget accounting in forward.zig and model_manager.zig.
+var offload_state: std.atomic.Value(i8) = .init(-1);
+
+const OffloadOverride = enum { auto, force_on, force_off };
+
+/// Read `ZINC_OFFLOAD_MOE_EXPERTS` if set. Recognized values:
+///   "1"/"true"  → force on
+///   "0"/"false" → force off
+///   anything else (or unset) → auto-decide based on fit
+fn readOffloadOverride() OffloadOverride {
+    const val = getenv("ZINC_OFFLOAD_MOE_EXPERTS") orelse return .auto;
+    if (std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true")) return .force_on;
+    if (std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false")) return .force_off;
+    return .auto;
+}
+
+fn getenv(key: [*:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(key) orelse return null;
+    return std.mem.span(ptr);
+}
+
+/// Pure decision function — returns the offload decision without mutating
+/// state, for tests and for use by the side-effecting wrapper below.
+pub fn computeOffloadDecision(
+    override: OffloadOverride,
+    total_tensor_bytes: u64,
+    offloadable_tensor_bytes: u64,
+    vram_budget_bytes: u64,
+) bool {
+    return switch (override) {
+        .force_on => true,
+        .force_off => false,
+        .auto => blk: {
+            // Reserve ~20% of the VRAM budget for KV cache and runtime scratch.
+            // Conservative heuristic — the alternative is OOM at runtime.
+            const usable = vram_budget_bytes - vram_budget_bytes / 5;
+            if (total_tensor_bytes <= usable) break :blk false;
+            if (offloadable_tensor_bytes == 0) break :blk false;
+            if (total_tensor_bytes - offloadable_tensor_bytes <= usable) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+/// Decide whether to offload MoE expert tensors for the next model load and
+/// cache the decision. Honors `ZINC_OFFLOAD_MOE_EXPERTS` if set, otherwise
+/// auto-decides:
+///   - If the full model fits in VRAM (with headroom for KV/runtime): no offload.
+///   - If the model only fits with MoE experts in host RAM: enable offload.
+///   - If neither fits: don't enable (let allocation fail with a clear OOM
+///     instead of pretending to fit).
+pub fn decideOffloadForLoad(total_tensor_bytes: u64, offloadable_tensor_bytes: u64, vram_budget_bytes: u64) bool {
+    const override = readOffloadOverride();
+    const decision = computeOffloadDecision(override, total_tensor_bytes, offloadable_tensor_bytes, vram_budget_bytes);
+    offload_state.store(if (decision) 1 else 0, .release);
+    if (decision) {
+        const reason = if (override == .force_on) "ZINC_OFFLOAD_MOE_EXPERTS=1" else "auto: weights exceed VRAM budget";
+        log.info("MoE expert offload: ON ({s}) | weights {d} MB, offloadable {d} MB, VRAM budget {d} MB", .{
+            reason,
+            total_tensor_bytes / (1024 * 1024),
+            offloadable_tensor_bytes / (1024 * 1024),
+            vram_budget_bytes / (1024 * 1024),
+        });
+    }
+    return decision;
+}
+
+/// Return whether MoE expert tensors should be in host-visible memory for the
+/// currently-loaded model. Reads the cached decision from `decideOffloadForLoad`.
+/// Returns false until a load has happened.
+pub fn offloadEnabled() bool {
+    return offload_state.load(.acquire) == 1;
+}
+
+/// Return true if this tensor should be routed to host-visible memory.
+/// Combines the MoE-expert classifier with the cached offload decision.
+pub fn shouldOffloadToHost(name: []const u8) bool {
+    return offloadEnabled() and isMoEExpertTensor(name);
+}
+
 /// Runtime model state backed by a memory-mapped GGUF file and uploaded tensor buffers.
 pub const Model = struct {
     /// Model dimensions and metadata.
@@ -47,7 +150,7 @@ pub const Model = struct {
     /// Memory-mapped GGUF file view.
     mmap_data: ?[]align(std.heap.page_size_min) const u8,
     /// File handle for mmap.
-    mmap_file: ?std.fs.File,
+    mmap_file: ?std.Io.File,
     /// Allocator for owned resources.
     allocator: std.mem.Allocator,
 
@@ -66,8 +169,8 @@ pub const Model = struct {
             std.posix.munmap(data);
         }
         if (self.mmap_file) |f| {
-            var file = f;
-            file.close();
+            // Use raw syscall since deinit doesn't have io.
+            _ = std.os.linux.close(f.handle);
         }
 
         self.gguf_file.deinit();
@@ -342,21 +445,22 @@ fn extractConfig(gf: *const gguf.GGUFFile) ModelConfig {
 }
 
 /// Inspect a GGUF file and extract only the normalized model configuration.
+/// @param io IO interface used for file operations.
 /// @param path Path to the GGUF file on disk.
 /// @param allocator Allocator used for the parsed metadata structures.
 /// @returns A ModelConfig derived from GGUF metadata without uploading tensors to the GPU.
-pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
-    const file = try std.fs.cwd().openFile(path, .{});
+pub fn inspectConfig(io: std.Io, path: []const u8, allocator: std.mem.Allocator) !ModelConfig {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        std.posix.PROT{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -370,18 +474,18 @@ pub fn inspectConfig(path: []const u8, allocator: std.mem.Allocator) !ModelConfi
 }
 
 /// Inspect a GGUF file and return exact tensor upload bytes plus normalized config.
-pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
-    const file = try std.fs.cwd().openFile(path, .{});
+pub fn inspectModel(io: std.Io, path: []const u8, allocator: std.mem.Allocator) !ModelInspection {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer {
         var close_file = file;
-        close_file.close();
+        close_file.close(io);
     }
 
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     const mmap_data = try std.posix.mmap(
         null,
         stat.size,
-        std.posix.PROT.READ,
+        std.posix.PROT{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -392,26 +496,32 @@ pub fn inspectModel(path: []const u8, allocator: std.mem.Allocator) !ModelInspec
     defer gf.deinit();
 
     var tensor_bytes: u64 = 0;
+    var offloadable_tensor_bytes: u64 = 0;
     for (gf.tensors.items) |tensor_info| {
-        tensor_bytes += tensor_info.sizeBytes();
+        const sz = tensor_info.sizeBytes();
+        tensor_bytes += sz;
+        if (isMoEExpertTensor(tensor_info.name)) offloadable_tensor_bytes += sz;
     }
 
     return .{
         .config = extractConfigWithLogging(&gf, false),
         .file_size = stat.size,
         .tensor_bytes = tensor_bytes,
+        .offloadable_tensor_bytes = offloadable_tensor_bytes,
         .tensor_count = gf.tensor_count,
         .metadata_count = gf.metadata.count(),
     };
 }
 
 /// Load a GGUF model: memory-map the file, parse headers, and DMA tensors to GPU VRAM.
+/// @param io IO interface used for file operations.
 /// @param path Path to the GGUF file on disk.
 /// @param instance Active Vulkan instance used for buffer allocation.
 /// @param cmd_pool Command pool used for staging copy operations.
 /// @param allocator Allocator used for metadata, tensor lists, and temporary state.
 /// @returns A fully populated Model with parsed metadata and uploaded tensors.
 pub fn load(
+    io: std.Io,
     path: []const u8,
     instance: *const Instance,
     cmd_pool: *const CommandPool,
@@ -420,17 +530,17 @@ pub fn load(
     log.info("Loading model: {s}", .{path});
 
     // Open and memory-map the file
-    const file = try std.fs.cwd().openFile(path, .{});
-    errdefer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    errdefer file.close(io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(io);
     const file_size = stat.size;
     log.info("File size: {d} MB", .{file_size / (1024 * 1024)});
 
     const mmap_data = try std.posix.mmap(
         null,
         file_size,
-        std.posix.PROT.READ,
+        std.posix.PROT{ .READ = true },
         .{ .TYPE = .PRIVATE },
         file.handle,
         0,
@@ -449,7 +559,7 @@ pub fn load(
     }
 
     // Load tensors to GPU
-    var loaded_tensors: std.ArrayList(LoadedTensor) = .{};
+    var loaded_tensors: std.ArrayList(LoadedTensor) = .empty;
     errdefer {
         for (loaded_tensors.items) |*t| {
             var buf = t.gpu_buffer;
@@ -458,39 +568,70 @@ pub fn load(
         loaded_tensors.deinit(allocator);
     }
 
+    // Pass 1: sum tensor totals so the offload decision sees the model size
+    // before any allocation happens. This is cheap (just integer adds) and
+    // lets us avoid offloading when the model fits in VRAM.
+    var total_tensor_bytes: u64 = 0;
+    var offloadable_tensor_bytes: u64 = 0;
+    for (gf.tensors.items) |tensor_info| {
+        const sz = tensor_info.sizeBytes();
+        total_tensor_bytes += sz;
+        if (isMoEExpertTensor(tensor_info.name)) offloadable_tensor_bytes += sz;
+    }
+    _ = decideOffloadForLoad(total_tensor_bytes, offloadable_tensor_bytes, instance.vramBytes());
+
     var total_vram: u64 = 0;
+    var total_host_visible: u64 = 0;
     for (gf.tensors.items) |tensor_info| {
         const tensor_size = tensor_info.sizeBytes();
         const data_offset = gf.tensor_data_offset + tensor_info.offset;
+        const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
+        const offload = shouldOffloadToHost(tensor_info.name);
 
-        // Create device-local buffer
-        var gpu_buf = try Buffer.initDeviceLocal(
-            instance,
-            tensor_size,
-            vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        );
+        var gpu_buf = blk: {
+            if (offload) {
+                break :blk try Buffer.initHostVisibleStorage(instance, tensor_size);
+            } else {
+                break :blk try Buffer.initDeviceLocal(
+                    instance,
+                    tensor_size,
+                    vk.c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                );
+            }
+        };
         errdefer gpu_buf.deinit();
 
-        // Stage and copy data to GPU
-        const src_data = mmap_data[data_offset..][0..@intCast(tensor_size)];
-        var staging = try Buffer.initStaging(instance, tensor_size);
-        defer staging.deinit();
-
-        staging.upload(src_data);
-        try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
+        if (offload) {
+            // Host-visible: GPU reads directly over PCIe; memcpy from mmap, no staging.
+            gpu_buf.upload(src_data);
+            total_host_visible += tensor_size;
+        } else {
+            // Device-local: stage in host memory, then GPU-side copy into VRAM.
+            var staging = try Buffer.initStaging(instance, tensor_size);
+            defer staging.deinit();
+            staging.upload(src_data);
+            try buffer_mod.copyBuffer(instance, cmd_pool.handle, &staging, &gpu_buf, tensor_size);
+            total_vram += tensor_size;
+        }
 
         try loaded_tensors.append(allocator, .{
             .info = tensor_info,
             .gpu_buffer = gpu_buf,
         });
-
-        total_vram += tensor_size;
     }
 
-    log.info("Loaded {d} tensors | {d} MB VRAM", .{
-        loaded_tensors.items.len,
-        total_vram / (1024 * 1024),
-    });
+    if (total_host_visible > 0) {
+        log.info("Loaded {d} tensors | {d} MB device-local VRAM | {d} MB host-visible (system RAM)", .{
+            loaded_tensors.items.len,
+            total_vram / (1024 * 1024),
+            total_host_visible / (1024 * 1024),
+        });
+    } else {
+        log.info("Loaded {d} tensors | {d} MB VRAM", .{
+            loaded_tensors.items.len,
+            total_vram / (1024 * 1024),
+        });
+    }
 
     return Model{
         .config = config,
@@ -506,8 +647,136 @@ test "parseArchitecture" {
     try std.testing.expectEqual(Architecture.qwen2, parseArchitecture("qwen2"));
     try std.testing.expectEqual(Architecture.qwen2_moe, parseArchitecture("qwen2moe"));
     try std.testing.expectEqual(Architecture.qwen35, parseArchitecture("qwen35"));
+    try std.testing.expectEqual(Architecture.qwen35, parseArchitecture("qwen3_5"));
+    try std.testing.expectEqual(Architecture.qwen35, parseArchitecture("qwen3_6"));
     try std.testing.expectEqual(Architecture.mamba, parseArchitecture("mamba"));
     try std.testing.expectEqual(Architecture.unknown, parseArchitecture("gpt2"));
+}
+
+test "isMoEExpertTensor matches MoE expert tensor suffixes" {
+    // Fused per-layer MoE expert tensors.
+    try std.testing.expect(isMoEExpertTensor("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(isMoEExpertTensor("blk.47.ffn_up_exps.weight"));
+    try std.testing.expect(isMoEExpertTensor("blk.7.ffn_down_exps.weight"));
+    // Q4_K_M variants emit a separate per-row scale tensor.
+    try std.testing.expect(isMoEExpertTensor("blk.3.ffn_down_exps_scale.weight"));
+
+    // Non-expert tensors — must stay device-local.
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_q.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_k.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_v.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.attn_output.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_gate.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_up.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_down.weight"));
+    try std.testing.expect(!isMoEExpertTensor("blk.0.ffn_gate_inp.weight"));
+    try std.testing.expect(!isMoEExpertTensor("output.weight"));
+    try std.testing.expect(!isMoEExpertTensor("token_embd.weight"));
+}
+
+test "shouldOffloadToHost is false until a load decides" {
+    // The cache starts at -1 (no decision yet). offloadEnabled returns false in
+    // that state, so even MoE expert tensors stay device-local. This is the
+    // safe default before any model has been loaded.
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+    offload_state.store(-1, .release);
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+}
+
+test "computeOffloadDecision: auto fits without offload when weights are small" {
+    // 10 GB weights, 30 GB budget → fits comfortably.
+    try std.testing.expect(!computeOffloadDecision(.auto, 10 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024, 30 * 1024 * 1024 * 1024));
+}
+
+test "computeOffloadDecision: auto enables offload when weights exceed budget but offload-shape fits" {
+    // 22 GB weights, 18 GB offloadable, 16 GB budget.
+    // Without offload: 22 > 12.8 (16 * 0.8) → doesn't fit.
+    // With offload: 22 - 18 = 4 GB ≤ 12.8 → fits.
+    try std.testing.expect(computeOffloadDecision(.auto, 22 * 1024 * 1024 * 1024, 18 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024));
+}
+
+test "computeOffloadDecision: auto declines for dense model that doesn't fit" {
+    // 30 GB dense weights (no offloadable share), 16 GB budget. Offload can't help.
+    try std.testing.expect(!computeOffloadDecision(.auto, 30 * 1024 * 1024 * 1024, 0, 16 * 1024 * 1024 * 1024));
+}
+
+test "computeOffloadDecision: auto declines when neither full nor offloaded fits" {
+    // 100 GB weights, 80 GB offloadable, 16 GB budget. Even offloaded (20 GB) > 12.8 GB usable.
+    try std.testing.expect(!computeOffloadDecision(.auto, 100 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024));
+}
+
+test "computeOffloadDecision: force_on always offloads (even when it would fit normally)" {
+    try std.testing.expect(computeOffloadDecision(.force_on, 1 * 1024 * 1024 * 1024, 1 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024));
+}
+
+test "computeOffloadDecision: force_off always disables (even when it wouldn't fit otherwise)" {
+    try std.testing.expect(!computeOffloadDecision(.force_off, 100 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024));
+}
+
+test "decideOffloadForLoad caches the decision into offload_state" {
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+
+    // Force_off via the env-aware wrapper is hard to set without setenv; skip.
+    // Instead verify the auto path: 10 GB weights, 30 GB budget → fits.
+    if (readOffloadOverride() != .auto) return;
+
+    offload_state.store(-1, .release);
+    _ = decideOffloadForLoad(10 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024, 30 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(@as(i8, 0), offload_state.load(.acquire));
+    try std.testing.expect(!offloadEnabled());
+
+    // 22 GB weights with 18 GB offloadable on a 16 GB budget → offload kicks in.
+    _ = decideOffloadForLoad(22 * 1024 * 1024 * 1024, 18 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(@as(i8, 1), offload_state.load(.acquire));
+    try std.testing.expect(offloadEnabled());
+}
+
+test "shouldOffloadToHost returns true for MoE tensors when gate forced on" {
+    // Override the cache directly (same module = field access). The state is
+    // restored at end-of-test so the gate-off test above keeps working under
+    // any test order.
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+    offload_state.store(1, .release);
+
+    try std.testing.expect(shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(shouldOffloadToHost("blk.5.ffn_down_exps.weight"));
+    // Dense tensors stay device-local even with gate on — the classifier
+    // is independent of the gate.
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
+    try std.testing.expect(!shouldOffloadToHost("output.weight"));
+}
+
+test "shouldOffloadToHost returns false for MoE tensors when gate forced off" {
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+    offload_state.store(0, .release);
+
+    try std.testing.expect(!shouldOffloadToHost("blk.0.ffn_gate_exps.weight"));
+    try std.testing.expect(!shouldOffloadToHost("blk.0.attn_q.weight"));
+}
+
+test "offloadEnabled reflects cached state and never mutates it" {
+    const prev = offload_state.load(.acquire);
+    defer offload_state.store(prev, .release);
+
+    // Forced-on cache → returns true, cache unchanged.
+    offload_state.store(1, .release);
+    try std.testing.expect(offloadEnabled());
+    try std.testing.expectEqual(@as(i8, 1), offload_state.load(.acquire));
+
+    // Forced-off cache → returns false, cache unchanged.
+    offload_state.store(0, .release);
+    try std.testing.expect(!offloadEnabled());
+    try std.testing.expectEqual(@as(i8, 0), offload_state.load(.acquire));
+
+    // Uncached state (-1) is the safe default before any load: returns false
+    // and stays -1 until decideOffloadForLoad sets it.
+    offload_state.store(-1, .release);
+    try std.testing.expect(!offloadEnabled());
+    try std.testing.expectEqual(@as(i8, -1), offload_state.load(.acquire));
 }
 
 test "extractConfig defaults gemma4 attention scale to 1.0" {
@@ -517,7 +786,7 @@ test "extractConfig defaults gemma4 attention scale to 1.0" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -542,7 +811,7 @@ test "extractConfig uses max gemma4 head_count_kv array entry" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };
@@ -574,7 +843,7 @@ test "extractConfig reads rope attention factor for gpt-oss YaRN models" {
         .version = .v3,
         .tensor_count = 0,
         .metadata = .{},
-        .tensors = .{},
+        .tensors = .empty,
         .tensor_data_offset = 0,
         .allocator = allocator,
     };

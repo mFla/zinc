@@ -32,7 +32,17 @@ struct MetalPipe {
 struct MetalCmd {
     id<MTLCommandBuffer> cmd_buf;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> current_pipeline;
+    void* current_buffers[64];
     uint8_t is_concurrent;
+};
+
+// Residency set wrapper. The `id` is held as `void *` so this header compiles
+// on SDKs where MTLResidencySet is unavailable; the @available check at runtime
+// gates actual API usage. Adapted from llama.cpp ggml-metal-device.m.
+struct MetalRSet {
+    id<MTLDevice> device;
+    void *rset; // id<MTLResidencySet> on macOS 15+, nil otherwise
 };
 
 // --- Device lifecycle ---
@@ -209,7 +219,7 @@ void mtl_free_buffer(MetalBuf* buf) {
 
 // --- Pipeline management ---
 
-MetalPipe* mtl_create_pipeline(MetalCtx* ctx, const char* msl_source, const char* fn_name) {
+static MetalPipe* mtl_create_pipeline_impl(MetalCtx* ctx, const char* msl_source, const char* fn_name, int report_errors) {
     if (!ctx || !msl_source || !fn_name) return NULL;
 
     NSError* error = nil;
@@ -219,23 +229,29 @@ MetalPipe* mtl_create_pipeline(MetalCtx* ctx, const char* msl_source, const char
 
     id<MTLLibrary> library = [ctx->device newLibraryWithSource:source options:options error:&error];
     if (!library) {
-        fprintf(stderr, "Error: MSL compilation failed for '%s': %s\n",
-                fn_name, [[error localizedDescription] UTF8String]);
+        if (report_errors) {
+            fprintf(stderr, "Error: MSL compilation failed for '%s': %s\n",
+                    fn_name, [[error localizedDescription] UTF8String]);
+        }
         return NULL;
     }
 
     NSString* name = [NSString stringWithUTF8String:fn_name];
     id<MTLFunction> function = [library newFunctionWithName:name];
     if (!function) {
-        fprintf(stderr, "Error: Kernel function '%s' not found in compiled MSL.\n", fn_name);
+        if (report_errors) {
+            fprintf(stderr, "Error: Kernel function '%s' not found in compiled MSL.\n", fn_name);
+        }
         return NULL;
     }
 
     id<MTLComputePipelineState> state = [ctx->device newComputePipelineStateWithFunction:function
                                                                                    error:&error];
     if (!state) {
-        fprintf(stderr, "Error: Failed to create compute pipeline for '%s': %s\n",
-                fn_name, [[error localizedDescription] UTF8String]);
+        if (report_errors) {
+            fprintf(stderr, "Error: Failed to create compute pipeline for '%s': %s\n",
+                    fn_name, [[error localizedDescription] UTF8String]);
+        }
         return NULL;
     }
 
@@ -243,6 +259,14 @@ MetalPipe* mtl_create_pipeline(MetalCtx* ctx, const char* msl_source, const char
     if (!pipe) return NULL;
     pipe->state = state;
     return pipe;
+}
+
+MetalPipe* mtl_create_pipeline(MetalCtx* ctx, const char* msl_source, const char* fn_name) {
+    return mtl_create_pipeline_impl(ctx, msl_source, fn_name, 1);
+}
+
+MetalPipe* mtl_create_pipeline_quiet(MetalCtx* ctx, const char* msl_source, const char* fn_name) {
+    return mtl_create_pipeline_impl(ctx, msl_source, fn_name, 0);
 }
 
 MetalPipe* mtl_create_pipeline_from_lib(MetalCtx* ctx, const void* lib_data, size_t lib_size, const char* fn_name) {
@@ -318,19 +342,55 @@ MetalCmd* mtl_begin_command_mode(MetalCtx* ctx, uint8_t serial) {
         return NULL;
     }
 
-    MTLDispatchType dispatch_type = serial ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent;
-    id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoderWithDispatchType:dispatch_type];
+    id<MTLComputeCommandEncoder> encoder = serial
+        ? [cmd_buf computeCommandEncoder]
+        : [cmd_buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     if (!encoder) {
         fprintf(stderr, "Error: Failed to create compute command encoder.\n");
         return NULL;
     }
 
+    // Match llama.cpp's ggml_metal_graph_compute submission pattern: enqueue
+    // command buffers before the caller records the graph work, then commit
+    // after encoding. On Apple GPUs this lets the command queue establish order
+    // early for the dense decode chunks that are committed asynchronously.
+    [cmd_buf enqueue];
+
     MetalCmd* cmd = (MetalCmd*)calloc(1, sizeof(MetalCmd));
     if (!cmd) return NULL;
     cmd->cmd_buf = cmd_buf;
     cmd->encoder = encoder;
+    cmd->current_pipeline = nil;
     cmd->is_concurrent = serial ? 0 : 1;
     return cmd;
+}
+
+static inline void mtl_set_pipeline_if_needed(MetalCmd* cmd, MetalPipe* pipe) {
+    id<MTLComputePipelineState> state = pipe->state;
+    if (cmd->current_pipeline != state) {
+        [cmd->encoder setComputePipelineState:state];
+        cmd->current_pipeline = state;
+    }
+}
+
+static inline void mtl_set_buffer_if_needed(MetalCmd* cmd, MetalBuf* buf, uint32_t idx) {
+    if (!buf || !buf->buffer) return;
+
+    void* current = (__bridge void*)buf->buffer;
+    if (idx < 64 && cmd->current_buffers[idx] == current) {
+        return;
+    }
+
+    [cmd->encoder setBuffer:buf->buffer offset:0 atIndex:idx];
+    if (idx < 64) {
+        cmd->current_buffers[idx] = current;
+    }
+}
+
+static inline void mtl_mark_bytes_binding(MetalCmd* cmd, uint32_t idx) {
+    if (idx < 64) {
+        cmd->current_buffers[idx] = NULL;
+    }
 }
 
 void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
@@ -339,18 +399,19 @@ void mtl_dispatch(MetalCmd* cmd, MetalPipe* pipe,
                   const void* push_data, size_t push_size) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     // Bind data buffers at indices 0..n_bufs-1
     for (uint32_t i = 0; i < n_bufs; i++) {
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:i];
+            mtl_set_buffer_if_needed(cmd, bufs[i], i);
         }
     }
 
     // Bind push constants as a buffer at index n_bufs (equivalent to Vulkan push constants)
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:n_bufs];
+        mtl_mark_bytes_binding(cmd, n_bufs);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -365,19 +426,20 @@ void mtl_dispatch_v2(MetalCmd* cmd, MetalPipe* pipe,
                      uint32_t push_idx) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     // Bind data buffers, shifting indices to skip push_idx
     for (uint32_t i = 0; i < n_bufs; i++) {
         uint32_t slot = (i < push_idx) ? i : (i + 1);
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:slot];
+            mtl_set_buffer_if_needed(cmd, bufs[i], slot);
         }
     }
 
     // Bind push constants at push_idx via setBytes (inlined into command buffer)
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
+        mtl_mark_bytes_binding(cmd, push_idx);
     }
 
     MTLSize threadgroups = MTLSizeMake(grid[0], grid[1], grid[2]);
@@ -392,17 +454,18 @@ void mtl_dispatch_v2_tgmem(MetalCmd* cmd, MetalPipe* pipe,
                      uint32_t push_idx, uint32_t tg_mem_size) {
     if (!cmd || !pipe) return;
 
-    [cmd->encoder setComputePipelineState:pipe->state];
+    mtl_set_pipeline_if_needed(cmd, pipe);
 
     for (uint32_t i = 0; i < n_bufs; i++) {
         uint32_t slot = (i < push_idx) ? i : (i + 1);
         if (bufs[i]) {
-            [cmd->encoder setBuffer:bufs[i]->buffer offset:0 atIndex:slot];
+            mtl_set_buffer_if_needed(cmd, bufs[i], slot);
         }
     }
 
     if (push_data && push_size > 0) {
         [cmd->encoder setBytes:push_data length:push_size atIndex:push_idx];
+        mtl_mark_bytes_binding(cmd, push_idx);
     }
 
     if (tg_mem_size > 0) {
@@ -423,6 +486,27 @@ void mtl_barrier(MetalCmd* cmd) {
     [cmd->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+void mtl_barrier_buffer(MetalCmd* cmd, MetalBuf* buf) {
+    if (!cmd || !buf || !buf->buffer) return;
+
+    id<MTLResource> resource = buf->buffer;
+    [cmd->encoder memoryBarrierWithResources:&resource count:1];
+}
+
+void mtl_barrier_buffers(MetalCmd* cmd, MetalBuf** bufs, uint32_t n_bufs) {
+    if (!cmd || !bufs || n_bufs == 0) return;
+
+    id<MTLResource> resources[32];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < n_bufs && count < 32; ++i) {
+        if (!bufs[i] || !bufs[i]->buffer) continue;
+        resources[count++] = bufs[i]->buffer;
+    }
+    if (count == 0) return;
+
+    [cmd->encoder memoryBarrierWithResources:resources count:count];
+}
+
 void mtl_commit_and_wait(MetalCmd* cmd) {
     if (!cmd) return;
     [cmd->encoder endEncoding];
@@ -435,6 +519,7 @@ void mtl_commit_and_wait(MetalCmd* cmd) {
     }
 
     cmd->encoder = nil;
+    cmd->current_pipeline = nil;
     cmd->cmd_buf = nil;
     free(cmd);
 }
@@ -443,6 +528,7 @@ void mtl_commit_async(MetalCmd* cmd) {
     if (!cmd) return;
     [cmd->encoder endEncoding];
     cmd->encoder = nil;
+    cmd->current_pipeline = nil;
     [cmd->cmd_buf commit];
 }
 
@@ -457,4 +543,100 @@ void mtl_wait(MetalCmd* cmd) {
 
     cmd->cmd_buf = nil;
     free(cmd);
+}
+
+// --- Residency sets (macOS 15+) ---
+//
+// Mirrors llama.cpp `ggml_metal_buffer_rset_init` / `_rset_free`: build a
+// residency set covering all model weight buffers, commit + request residency
+// once, and rely on Metal to keep them wired down. Without this, on real
+// inference workloads the OS may evict the 17 GB of weights between layer
+// dispatches, masking the kernel's real bandwidth (kernels that microbench
+// at 491 GB/s have been observed at ~4 GB/s effective in real runs).
+
+uint8_t mtl_rset_supported(void) {
+#if defined(__MAC_15_0) || defined(__IPHONE_18_0)
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+MetalRSet* mtl_rset_create(MetalCtx* ctx, uint32_t initial_capacity) {
+    if (!ctx) return NULL;
+#if defined(__MAC_15_0) || defined(__IPHONE_18_0)
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        MTLResidencySetDescriptor* desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"zinc_model_weights";
+        desc.initialCapacity = (NSUInteger)initial_capacity;
+
+        NSError* error = nil;
+        id<MTLResidencySet> rset = [ctx->device newResidencySetWithDescriptor:desc error:&error];
+        if (!rset || error) {
+            if (error) {
+                fprintf(stderr, "Error: failed to create MTLResidencySet: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+            return NULL;
+        }
+
+        MetalRSet* out = (MetalRSet*)calloc(1, sizeof(MetalRSet));
+        if (!out) {
+            return NULL;
+        }
+        out->device = ctx->device;
+        // Transfer +1 retain into the C pointer; balanced in mtl_rset_free.
+        out->rset = (__bridge_retained void*)rset;
+        // The device's command queue gets the residency set so command buffers
+        // automatically see all member allocations as resident.
+        [ctx->queue addResidencySet:rset];
+        return out;
+    }
+#endif
+    (void)initial_capacity;
+    return NULL;
+}
+
+void mtl_rset_add_buffer(MetalRSet* rset, MetalBuf* buf) {
+    if (!rset || !buf || !buf->buffer) return;
+#if defined(__MAC_15_0) || defined(__IPHONE_18_0)
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        if (rset->rset) {
+            id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)rset->rset;
+            [rs addAllocation:buf->buffer];
+        }
+    }
+#endif
+}
+
+void mtl_rset_commit_and_request(MetalRSet* rset) {
+    if (!rset) return;
+#if defined(__MAC_15_0) || defined(__IPHONE_18_0)
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        if (rset->rset) {
+            id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)rset->rset;
+            [rs commit];
+            [rs requestResidency];
+        }
+    }
+#endif
+}
+
+void mtl_rset_free(MetalRSet* rset) {
+    if (!rset) return;
+#if defined(__MAC_15_0) || defined(__IPHONE_18_0)
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        if (rset->rset) {
+            // __bridge_transfer hands the +1 reference back to ARC for release.
+            id<MTLResidencySet> rs = (__bridge_transfer id<MTLResidencySet>)rset->rset;
+            [rs endResidency];
+            [rs removeAllAllocations];
+            rs = nil;
+            rset->rset = NULL;
+        }
+    }
+#endif
+    rset->device = nil;
+    free(rset);
 }

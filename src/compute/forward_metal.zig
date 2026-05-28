@@ -3,6 +3,12 @@
 //! This is the Metal equivalent of forward.zig (Vulkan).
 //! Uses MSL compute shaders dispatched via the Metal shim.
 const std = @import("std");
+
+fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 const config_mod = @import("../model/config.zig");
 const ModelConfig = config_mod.ModelConfig;
 const gguf = @import("../model/gguf.zig");
@@ -27,6 +33,23 @@ const log = std.log.scoped(.forward);
 /// from the device budget (see `memory_plan.autoContextTokensForDeviceBudget`)
 /// see this as a soft safety net rather than the primary limit.
 pub const runtime_context_cap: u32 = 262144;
+const queued_prefill_embed_tokens: usize = 256;
+const qwen_ssm_projection_prefill_max_tokens: u32 = 256;
+const qwen_ssm_projection_prefill_min_tokens: usize = 32;
+const qwen_ssm_projection_validate_tokens: u32 = 4;
+// llama.cpp's Metal `ggml_metal_op_mul_mat_id` switches from the small
+// matrix-vector path to the expert-grouped matrix path at 32 prompt rows, but
+// that is only the minimum batch shape. Validate Qwen route packing closer to
+// the Effort 16 prompt so vLLM-style expert block packing and the SSM prefix
+// validator exercise about 1K route slots by default.
+const qwen_moe_route_pack_validate_tokens: u32 = 128;
+// Let the Qwen3.6 llama.cpp-style graph batching / vLLM route-packed MoE
+// prefix run until the model ends or a per-layer support guard fails. This
+// keeps the layer-major prompt path from falling back to token-major decode at
+// an arbitrary layer cap.
+const qwen_route_packed_prefix_layer_limit: usize = std.math.maxInt(usize);
+const moe_route_block_cols: u32 = 8;
+const moe_cols_dense_dispatch_cols: u32 = 4;
 
 /// Runtime state for the decode loop.
 pub const DecodeState = struct {
@@ -101,17 +124,17 @@ pub const InitOptions = struct {
 };
 
 fn tensorBytes(model: *const metal_loader.Model) u64 {
-    var total: u64 = 0;
-    for (model.gguf_file.tensors.items) |tensor_info| {
-        total += tensor_info.sizeBytes();
-    }
-    return total;
+    return metal_loader.residentWeightBytes(model);
 }
 
 fn memoryBudget(device: *const metal_device.MetalDevice) u64 {
     const working_set = device.recommendedMaxWorkingSetSize();
     if (working_set > 0) return working_set;
     return device.totalMemory();
+}
+
+fn memoryPlanningBudget(device: *const metal_device.MetalDevice) u64 {
+    return @divTrunc(memoryBudget(device) * 85, 100);
 }
 
 fn tokenSeen(history: []const u32, token: u32) bool {
@@ -206,8 +229,12 @@ fn sampleFromLogits(logits: []const f32, history: []const u32, params: SamplingP
     return candidate_ids[keep_count - 1];
 }
 
+fn getenv(name: [*:0]const u8) ?[:0]const u8 {
+    return if (std.c.getenv(name)) |p| std.mem.span(p) else null;
+}
+
 fn readThreadgroupOverride(env_name: [:0]const u8, simd_width: u32, max_threads: u32) ?u32 {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = getenv(env_name.ptr) orelse return null;
     if (simd_width == 0 or max_threads == 0) return null;
 
     const value = std.fmt.parseUnsigned(u32, raw, 10) catch return null;
@@ -240,6 +267,109 @@ fn preferApple9Q8K2048Path(tensor: *const metal_loader.LoadedTensor, M: u32, K: 
     return false;
 }
 
+fn preferApple9QwenSharedDownQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 2048 and
+        K == 512 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_down_shexp.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SHARED_DOWN_Q8_QUAD") orelse true;
+}
+
+fn preferApple9QwenSsmQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        K == 2048 and
+        M >= 4096 and
+        (std.mem.endsWith(u8, tensor.info.name, "attn_qkv.weight") or
+            std.mem.endsWith(u8, tensor.info.name, "attn_gate.weight"));
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_QUAD") orelse true;
+}
+
+fn preferApple9QwenSsmOutQ8K4096Path(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        K == 4096 and
+        M >= 2048 and
+        std.mem.endsWith(u8, tensor.info.name, "ssm_out.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_OUT_Q8_K4096") orelse true;
+}
+
+fn preferApple9QwenSsmRepackedQ8QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_qwen36 = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8;
+    const is_ssm_shape = is_qwen36 and
+        (K == 2048 or K == 4096) and
+        M >= 2048 and
+        (std.mem.endsWith(u8, tensor.info.name, "attn_qkv.weight") or
+            std.mem.endsWith(u8, tensor.info.name, "attn_gate.weight") or
+            std.mem.endsWith(u8, tensor.info.name, "ssm_out.weight"));
+    const is_full_attn_shape = is_qwen36 and
+        ((K == 2048 and M >= 4096 and std.mem.endsWith(u8, tensor.info.name, "attn_q.weight")) or
+            (K == 4096 and M == 2048 and std.mem.endsWith(u8, tensor.info.name, "attn_output.weight")));
+    if (!is_ssm_shape and !is_full_attn_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_QUAD") orelse true;
+}
+
+fn preferApple9QwenSsmPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    if (!preferApple9QwenSsmRepackedQ8QuadPath(cfg, tensor, M, K)) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_SSM_REPACKED_Q8_PRIVATE") orelse true;
+}
+
+fn preferApple9QwenRouterPrivateRepackedQ8(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 256 and
+        K == 2048 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_gate_inp.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ROUTER_REPACKED_Q8_PRIVATE") orelse true;
+}
+
+fn preferApple9QwenFullAttnQ8K2048QuadPath(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        K == 2048 and
+        M >= 4096 and
+        std.mem.endsWith(u8, tensor.info.name, "attn_q.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ATTN_Q8_K2048_QUAD") orelse true;
+}
+
+fn preferApple9QwenFullAttnOutQ8K4096Path(cfg: ModelConfig, tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const is_shape = cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 2048 and
+        K == 4096 and
+        std.mem.endsWith(u8, tensor.info.name, "attn_output.weight");
+    if (!is_shape) return false;
+    return readBoolEnv("ZINC_METAL_QWEN_ATTN_OUT_Q8_K4096") orelse true;
+}
+
 fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
     const name = tensor.info.name;
     if (K <= 2048 and M >= 4096 and
@@ -254,21 +384,44 @@ fn preferApple9Q8WidePath(tensor: *const metal_loader.LoadedTensor, M: u32, K: u
     return false;
 }
 
+fn preferLlamaQ8SmallThreadgroupForQwenSsm(tensor: *const metal_loader.LoadedTensor, M: u32, K: u32) bool {
+    const name = tensor.info.name;
+
+    // Adapt llama.cpp `ggml-metal.metal::kernel_mul_mv_q8_0_f32_impl` and
+    // `ggml-metal-impl.h`'s Q8_0 geometry (N_R0=2, N_SG=4): Qwen3.6 SSM
+    // prompt prefill is dominated by these Q8 projections, and the 128-thread
+    // shape keeps the per-row reduction close to the production Metal backend
+    // instead of the wider Apple9 override.
+    if ((readBoolEnv("ZINC_METAL_QWEN_SSM_Q8_TG128") orelse true) == false) return false;
+
+    if (K == 2048 and M >= 4096 and
+        (std.mem.endsWith(u8, name, "attn_qkv.weight") or
+            std.mem.endsWith(u8, name, "attn_gate.weight")))
+    {
+        return true;
+    }
+    if (K == 4096 and M >= 2048 and std.mem.endsWith(u8, name, "ssm_out.weight")) {
+        return true;
+    }
+    return false;
+}
+
 fn shouldUseGlobalQ8Override(arch: config_mod.Architecture, tensor_name: []const u8) bool {
     if (arch != .gemma) return true;
 
     return !(std.mem.endsWith(u8, tensor_name, "ffn_gate.weight") or
         std.mem.endsWith(u8, tensor_name, "ffn_up.weight") or
         std.mem.endsWith(u8, tensor_name, "ffn_down.weight") or
+        std.mem.endsWith(u8, tensor_name, "attn_output.weight") or
         std.mem.endsWith(u8, tensor_name, "ffn_gate_shexp.weight") or
         std.mem.endsWith(u8, tensor_name, "ffn_up_shexp.weight") or
         std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight"));
 }
 
 fn shouldCpuQ8Fallback(arch: config_mod.Architecture, tensor_name: []const u8) bool {
-    return arch == .gemma and
-        (std.mem.endsWith(u8, tensor_name, "ffn_down.weight") or
-            std.mem.endsWith(u8, tensor_name, "ffn_down_shexp.weight"));
+    _ = arch;
+    _ = tensor_name;
+    return false;
 }
 
 fn shouldDebugAttentionValidation(cfg: ModelConfig, position: u32, layer_idx: usize) bool {
@@ -277,10 +430,189 @@ fn shouldDebugAttentionValidation(cfg: ModelConfig, position: u32, layer_idx: us
 }
 
 fn readBoolEnv(env_name: [:0]const u8) ?bool {
-    const raw = std.posix.getenv(env_name) orelse return null;
+    const raw = getenv(env_name.ptr) orelse return null;
     if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
     if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
     return null;
+}
+
+fn readU32Env(env_name: [:0]const u8) ?u32 {
+    const raw = getenv(env_name.ptr) orelse return null;
+    return std.fmt.parseUnsigned(u32, raw, 10) catch null;
+}
+
+fn qwenMoeRoutePackRequestedValidateTokens() ?u32 {
+    return readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_TOKENS") orelse
+        readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_TOKENS");
+}
+
+fn clampQwenMoeRoutePackValidateTokens(requested: u32) u32 {
+    return @min(@max(requested, 1), qwen_ssm_projection_prefill_max_tokens);
+}
+
+fn qwenMoeRoutePackValidateTokensForPrompt(prompt_len: usize) u32 {
+    const requested = qwenMoeRoutePackRequestedValidateTokens() orelse
+        @as(u32, @intCast(@min(prompt_len, @as(usize, qwen_ssm_projection_prefill_max_tokens))));
+    return clampQwenMoeRoutePackValidateTokens(requested);
+}
+
+fn qwenMoeRoutePackValidateTokens(engine: *const InferenceEngine) u32 {
+    const requested = qwenMoeRoutePackRequestedValidateTokens() orelse
+        if (engine.qwen_moe_route_validate_target_tokens > 0)
+            engine.qwen_moe_route_validate_target_tokens
+        else
+            qwen_moe_route_pack_validate_tokens;
+    return clampQwenMoeRoutePackValidateTokens(requested);
+}
+
+fn qwenMoeRoutePackValidateLayer(engine: *const InferenceEngine) usize {
+    const requested =
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_LAYER") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_VALIDATE_LAYER") orelse
+        engine.qwen_ssm_proj_validate_layer;
+    return @intCast(requested);
+}
+
+fn qwenRoutePackedPrefixLayerLimit() usize {
+    const requested =
+        readU32Env("ZINC_QWEN36_35B_ROUTE_PACK_PREFIX_LAYERS") orelse
+        readU32Env("ZINC_QWEN36_ROUTE_PACK_PREFIX_LAYERS") orelse
+        return qwen_route_packed_prefix_layer_limit;
+    return @intCast(@max(requested, 1));
+}
+
+fn qwenRoutePackedFullValidationEnabled() bool {
+    return (readBoolEnv("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL") orelse false) or
+        (readBoolEnv("ZINC_QWEN36_ROUTE_PACK_VALIDATE_FULL") orelse false);
+}
+
+fn defaultQwen36SsmPrefillProjectionEnabled(cfg: ModelConfig) bool {
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.n_layers == 40 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.ssm_d_state == 128 and
+        cfg.ssm_dt_rank == 32 and
+        cfg.ssm_n_group == 16;
+}
+
+fn defaultFusedSsmNormEnabled(cfg: ModelConfig) bool {
+    // llama.cpp keeps norm as a separate graph op before the Metal matmul
+    // kernels. For the Qwen3.6 35B SSM shape, fusing RMSNorm into per-row Q8
+    // DMMV repeats the 2048-wide norm reduction across thousands of rows.
+    if (defaultQwen36SsmPrefillProjectionEnabled(cfg)) return false;
+    return true;
+}
+
+fn fusedSsmDeltaGatedNormEnabled(engine: *const InferenceEngine, head_v_dim: u32, d_state: u32) bool {
+    if (!engine.fused_ssm_delta_gated_norm_enabled) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.ssm_delta_net_gated_norm_pipe.handle == null and engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
+    if (head_v_dim == 0 or head_v_dim > 128 or d_state == 0 or d_state > 128) return false;
+    return true;
+}
+
+fn canUseQwenSsmDeltaGatedNormExact(
+    engine: *const InferenceEngine,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: bool,
+    has_ssm_a: bool,
+) bool {
+    if (!engine.qwen_ssm_delta_gated_norm_exact_enabled) return false;
+    if (!defaultQwen36SsmPrefillProjectionEnabled(engine.config)) return false;
+    if (!has_dt_bias or !has_ssm_a) return false;
+    if (dt_rank != 32 or head_v_dim != 128 or d_state != 128 or n_group != 16) return false;
+    if (engine.ssm_delta_net_gated_norm_qwen_pipe.handle == null) return false;
+    return engine.ssm_delta_net_gated_norm_qwen_pipe.thread_execution_width == 32 and
+        engine.ssm_delta_net_gated_norm_qwen_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn ssmDeltaGatedNormThreadgroupSize(
+    pipe: *const MetalPipeline,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+) u32 {
+    if (dt_rank == 32 and
+        head_v_dim == 128 and
+        d_state == 128 and
+        n_group == 16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
+}
+
+fn ssmDeltaNetPrefillThreadgroupSize(
+    pipe: *const MetalPipeline,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+) u32 {
+    if (dt_rank == 32 and
+        head_v_dim == 128 and
+        d_state == 128 and
+        n_group == 16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
+}
+
+fn canUseQwenSsmConvD4FastPath(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) bool {
+    return defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+        conv_channels == 8192 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        engine.ssm_conv1d_qwen_d4_pipe.handle != null;
+}
+
+fn qwenSsmConvD4PrefillPipe(
+    engine: *const InferenceEngine,
+    conv_channels: u32,
+    d_conv: u32,
+) *const MetalPipeline {
+    if (defaultQwen36SsmPrefillProjectionEnabled(engine.config) and
+        conv_channels == 8192 and
+        d_conv == 4 and
+        engine.ssm_conv1d_prefill_qwen_d4_pipe.handle != null)
+    {
+        return &engine.ssm_conv1d_prefill_qwen_d4_pipe;
+    }
+    return &engine.ssm_conv1d_prefill_pipe;
+}
+
+fn ssmConv1dThreadgroupSize(
+    pipe: *const MetalPipeline,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+) u32 {
+    if (conv_channels == 8192 and
+        d_conv == 4 and
+        !kernel_is_f16 and
+        pipe.thread_execution_width == 32 and
+        pipe.max_threads_per_threadgroup >= 128)
+    {
+        return 128;
+    }
+    return 64;
 }
 
 const DmmvPathClass = enum(u8) {
@@ -300,6 +632,13 @@ const Q8ShapeStat = struct {
     cols: u32 = 0,
     bytes: u64 = 0,
     calls: u32 = 0,
+};
+
+const Q8RepackedKernel = enum(u8) {
+    tg128,
+    exact_qwen,
+    quad,
+    generic,
 };
 
 const BarrierClass = enum(u8) {
@@ -348,6 +687,7 @@ pub const RuntimeProfile = struct {
     debug_validation_ns: u64 = 0,
     dmmv_total_bytes: u64 = 0,
     dmmv_q4k_bytes: u64 = 0,
+    dmmv_q5_1_bytes: u64 = 0,
     dmmv_q5k_bytes: u64 = 0,
     dmmv_q6k_bytes: u64 = 0,
     dmmv_q8_0_bytes: u64 = 0,
@@ -355,12 +695,41 @@ pub const RuntimeProfile = struct {
     dmmv_f32_bytes: u64 = 0,
     lm_head_bytes: u64 = 0,
     ssm_bytes: u64 = 0,
+    ssm_projection_bytes: u64 = 0,
+    ssm_qkv_projection_bytes: u64 = 0,
+    ssm_gate_projection_bytes: u64 = 0,
+    ssm_tail_projection_bytes: u64 = 0,
+    ssm_out_bytes: u64 = 0,
     full_attn_bytes: u64 = 0,
+    full_attn_projection_bytes: u64 = 0,
+    full_attn_output_bytes: u64 = 0,
     router_bytes: u64 = 0,
+    router_topk_calls: u32 = 0,
+    route_pack_layers: u32 = 0,
+    route_pack_slots: u64 = 0,
+    route_pack_active_block_upper_bound: u64 = 0,
+    route_pack_dense_dispatch_blocks: u64 = 0,
     shared_expert_bytes: u64 = 0,
+    shared_expert_gate_up_bytes: u64 = 0,
+    shared_expert_down_bytes: u64 = 0,
     dense_ffn_bytes: u64 = 0,
     moe_expert_bytes: u64 = 0,
+    moe_expert_gate_up_bytes: u64 = 0,
+    moe_expert_down_bytes: u64 = 0,
+    full_attn_flash_calls: u32 = 0,
+    full_attn_kv_write_calls: u32 = 0,
+    ssm_conv_calls: u32 = 0,
+    ssm_delta_calls: u32 = 0,
+    ssm_gated_norm_calls: u32 = 0,
     q8_shape_stats: [16]Q8ShapeStat = [_]Q8ShapeStat{.{}} ** 16,
+    q8_repacked_tg128_bytes: u64 = 0,
+    q8_repacked_exact_qwen_bytes: u64 = 0,
+    q8_repacked_quad_bytes: u64 = 0,
+    q8_repacked_generic_bytes: u64 = 0,
+    q8_repacked_tg128_calls: u32 = 0,
+    q8_repacked_exact_qwen_calls: u32 = 0,
+    q8_repacked_quad_calls: u32 = 0,
+    q8_repacked_generic_calls: u32 = 0,
 
     fn reset(self: *RuntimeProfile) void {
         self.* = .{};
@@ -368,20 +737,20 @@ pub const RuntimeProfile = struct {
 };
 
 fn profileStart(enabled: bool) i128 {
-    return if (enabled) std.time.nanoTimestamp() else -1;
+    return if (enabled) nanoTimestamp() else -1;
 }
 
 fn profileElapsedNs(start_ns: i128) u64 {
     if (start_ns < 0) return 0;
-    const end_ns = std.time.nanoTimestamp();
+    const end_ns = nanoTimestamp();
     if (end_ns <= start_ns) return 0;
     return @intCast(end_ns - start_ns);
 }
 
 fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierClass) void {
-    const encoded = cmd.barrier_enabled;
+    const before_count = cmd.barrier_count;
     cmd.barrier();
-    if (!encoded) return;
+    if (cmd.barrier_count == before_count) return;
     if (profile) |p| switch (class) {
         .embed => p.embed_barrier_calls += 1,
         .full_attn => p.full_attn_barrier_calls += 1,
@@ -392,6 +761,52 @@ fn profileBarrier(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierC
         .dense_ffn => p.dense_ffn_barrier_calls += 1,
         .final => p.final_barrier_calls += 1,
     };
+}
+
+fn profileBarrierBuffers(cmd: *MetalCommand, profile: ?*RuntimeProfile, class: BarrierClass, bufs: []const *const MetalBuffer) void {
+    const before_count = cmd.barrier_count;
+    cmd.barrierBuffers(bufs);
+    if (cmd.barrier_count == before_count) return;
+    if (profile) |p| switch (class) {
+        .embed => p.embed_barrier_calls += 1,
+        .full_attn => p.full_attn_barrier_calls += 1,
+        .ssm => p.ssm_barrier_calls += 1,
+        .router => p.router_barrier_calls += 1,
+        .gpu_routed_moe => p.gpu_routed_moe_barrier_calls += 1,
+        .fallback_moe => p.fallback_moe_barrier_calls += 1,
+        .dense_ffn => p.dense_ffn_barrier_calls += 1,
+        .final => p.final_barrier_calls += 1,
+    };
+}
+
+fn profileFullAttnQkvBarrier(
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    include_q: bool,
+    include_k: bool,
+    include_v: bool,
+    include_gate: bool,
+    engine: *const InferenceEngine,
+) void {
+    var bufs: [4]*const MetalBuffer = undefined;
+    var count: usize = 0;
+    if (include_q) {
+        bufs[count] = &engine.q_buf;
+        count += 1;
+    }
+    if (include_k) {
+        bufs[count] = &engine.k_buf;
+        count += 1;
+    }
+    if (include_v) {
+        bufs[count] = &engine.v_buf;
+        count += 1;
+    }
+    if (include_gate) {
+        bufs[count] = &engine.gate_buf;
+        count += 1;
+    }
+    profileBarrierBuffers(cmd, profile, .full_attn, bufs[0..count]);
 }
 
 fn fullAttentionInterval(cfg: ModelConfig) u32 {
@@ -455,6 +870,44 @@ fn bytesToGiB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0;
 }
 
+fn logDetailedProfileBuckets(label: []const u8, profile: RuntimeProfile) void {
+    if (profile.decode_steps == 0 and profile.dmmv_total_bytes == 0) return;
+
+    log.info("  {s} buckets: embed {d:.2} ms | attn proj {d:.2} GiB out {d:.2} GiB flash {d} kv-write {d} | final {d:.2} ms lm-head {d:.2} GiB", .{
+        label,
+        nsToMs(profile.embedding_ns),
+        bytesToGiB(profile.full_attn_projection_bytes),
+        bytesToGiB(profile.full_attn_output_bytes),
+        profile.full_attn_flash_calls,
+        profile.full_attn_kv_write_calls,
+        nsToMs(profile.final_record_ns),
+        bytesToGiB(profile.lm_head_bytes),
+    });
+    log.info("  {s} buckets: ssm proj {d:.2} GiB (qkv {d:.2} gate {d:.2} tail {d:.2}) recurrent conv/delta/gated {d}/{d}/{d} out {d:.2} GiB | router {d:.2} GiB topk {d} cpu {d:.2} ms", .{
+        label,
+        bytesToGiB(profile.ssm_projection_bytes),
+        bytesToGiB(profile.ssm_qkv_projection_bytes),
+        bytesToGiB(profile.ssm_gate_projection_bytes),
+        bytesToGiB(profile.ssm_tail_projection_bytes),
+        profile.ssm_conv_calls,
+        profile.ssm_delta_calls,
+        profile.ssm_gated_norm_calls,
+        bytesToGiB(profile.ssm_out_bytes),
+        bytesToGiB(profile.router_bytes),
+        profile.router_topk_calls,
+        nsToMs(profile.router_cpu_ns),
+    });
+    log.info("  {s} buckets: moe gate/up {d:.2} GiB down {d:.2} GiB | shared gate/up {d:.2} GiB down {d:.2} GiB | waits {d} commits {d:.2} ms", .{
+        label,
+        bytesToGiB(profile.moe_expert_gate_up_bytes),
+        bytesToGiB(profile.moe_expert_down_bytes),
+        bytesToGiB(profile.shared_expert_gate_up_bytes),
+        bytesToGiB(profile.shared_expert_down_bytes),
+        profile.commit_waits,
+        nsToMs(profile.gpu_completion_wait_ns),
+    });
+}
+
 fn dmmvPathLabel(path: DmmvPathClass) []const u8 {
     return switch (path) {
         .other => "other",
@@ -477,6 +930,20 @@ const DmmvPush = extern struct {
     y_offset: u32,
 };
 
+/// Push for `dmmv_q4k_lmhead_norm.metal` — Q4_K matvec with fused
+/// per-simdgroup RMS reduction over the unnormalized hidden vector
+/// and an inline `norm_weight * rms_inv` scaling on each X load.
+/// Used by the dense Gemma 31B final LM head to drop the standalone
+/// `rms_norm_mul` dispatch + barrier in the final phase.
+const DmmvNormPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    x_offset: u32,
+    y_offset: u32,
+    eps: f32,
+};
+
 const DualQ8DmmvPush = extern struct {
     M0: u32,
     M1: u32,
@@ -488,6 +955,19 @@ const DualQ8DmmvPush = extern struct {
     y1_offset: u32,
 };
 
+/// Push for `dmmv_q4k_qk_dual.metal` — dense Gemma single-token Q+K dual
+/// matvec. Matches `QKDualPush` in the kernel.
+const QKDualPush = extern struct {
+    M_q: u32,
+    M_k: u32,
+    K: u32,
+    a_q_offset: u32,
+    a_k_offset: u32,
+    x_offset: u32,
+    y_q_offset: u32,
+    y_k_offset: u32,
+};
+
 const CopyU32Push = extern struct {
     n_words: u32,
     src_offset_words: u32,
@@ -496,6 +976,8 @@ const CopyU32Push = extern struct {
 
 const CopyF32Push = extern struct {
     n: u32,
+    src_offset: u32,
+    dst_offset: u32,
 };
 
 const ZeroF32Push = extern struct {
@@ -555,6 +1037,14 @@ const GemmPush = extern struct {
     src0_off: u32,
 };
 
+/// Push constants for `gemm_f32_small.metal`.
+const GemmF32SmallPush = extern struct {
+    M: u32,
+    K: u32,
+    N: u32,
+    src0_off: u32,
+};
+
 /// Push constants for rope_batched.
 const RopeBatchedPush = extern struct {
     stride: u32,
@@ -574,6 +1064,8 @@ const BatchedFlashAttnPush = extern struct {
     kv_len: u32,
     n_queries: u32,
     kv_pos_offset: u32,
+    sliding_window_size: u32,
+    attn_scale_bits: u32,
 };
 
 /// Push constants for flash_attn_batched_q8 — adds byte strides for the Q8
@@ -585,6 +1077,8 @@ const BatchedFlashAttnQ8Push = extern struct {
     kv_len: u32,
     n_queries: u32,
     kv_pos_offset: u32,
+    sliding_window_size: u32,
+    attn_scale_bits: u32,
     kv_head_stride_bytes: u32,
     kv_token_stride_bytes: u32,
 };
@@ -599,6 +1093,48 @@ const MoeDmmvPush = extern struct {
     x_expert_stride: u32,
     x_offset: u32,
     y_offset: u32,
+};
+
+/// Push constants for fused Gemma Q4_K MoE gate/up DMMV.
+const MoeGateUpDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    gate_y_offset: u32,
+    up_y_offset: u32,
+};
+
+/// Push constants for fused Q4_K MoE gate/up DMMV when gate/up are separate tensors.
+const MoeGateUpDualDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    gate_a_offset: u32,
+    up_a_offset: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+    gate_y_offset: u32,
+    up_y_offset: u32,
+};
+
+/// Push constants for grouped MoE DMMV columns. `ids_stride` is the number of
+/// packed route ids reserved per expert in `moe_route_pack`.
+const MoeColsDmmvPush = extern struct {
+    M: u32,
+    K: u32,
+    a_offset: u32,
+    expert_stride: u32,
+    x_offset: u32,
+    y_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    use_active_blocks: u32,
 };
 
 fn createMetalBufferForMode(ctx: ?*shim.MetalCtx, size: usize, use_private: bool) !MetalBuffer {
@@ -647,10 +1183,180 @@ const MoeAccBatchedPush = extern struct {
     w_sh: f32,
 };
 
+/// Push constants for GPT-OSS batched expert accumulate with per-expert down bias.
+const MoeAccBatchedBiasPush = extern struct {
+    n: u32,
+    expert_stride: u32,
+    expert_count: u32,
+    bias_offset: u32,
+    w0: f32,
+    w1: f32,
+    w2: f32,
+    w3: f32,
+    w4: f32,
+    w5: f32,
+    w6: f32,
+    w7: f32,
+    w_sh: f32,
+};
+
+/// Push constants for GPT-OSS routed batched accumulate with per-expert down bias.
+const MoeAccBatchedBiasRoutedPush = extern struct {
+    n: u32,
+    n_used: u32,
+    expert_stride: u32,
+    bias_offset: u32,
+};
+
+/// Push constants for GPT-OSS OAI SwiGLU across a contiguous [expert][dim] batch.
+const OaiSwiGLUBatchedBiasPush = extern struct {
+    n: u32,
+    gate_bias_offset: u32,
+    up_bias_offset: u32,
+};
+
 /// Push constants for GPU softmax + top-k routing.
 const SoftmaxTopkPush = extern struct {
     n_experts: u32,
     k: u32,
+};
+
+const SoftmaxTopkScaledPush = extern struct {
+    n_experts: u32,
+    k: u32,
+    logit_scale_bits: u32,
+};
+
+const SoftmaxTopkWeightBiasPush = extern struct {
+    n_experts: u32,
+    k: u32,
+    bias_offset: u32,
+};
+
+const RouterF32TopkBiasPush = extern struct {
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    x_offset: u32,
+    bias_offset: u32,
+};
+
+const RouterF32TopkBatchedPush = extern struct {
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    input_offset: u32,
+    input_stride: u32,
+    output_stride: u32,
+};
+
+const RouterQ8TopkPush = extern struct {
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+    x_offset: u32,
+};
+
+const AddBiasPush = extern struct {
+    n: u32,
+    bias_offset: u32,
+};
+
+/// Push constants for batched GPU softmax + top-k routing.
+/// Outputs one packed routing row per token: [k expert ids][k f32 weights as u32].
+const SoftmaxTopkBatchedPush = extern struct {
+    n_experts: u32,
+    k: u32,
+    logits_stride: u32,
+    output_stride: u32,
+};
+
+/// Push constants for packing batched MoE routes by expert.
+/// `ids` stores token_idx * k + topk_slot for each routed token.
+const MoeRoutePackPush = extern struct {
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
+};
+
+/// Push constants for scattering grouped MoE route outputs back to token order.
+/// Source is route-slot indexed: `[token * k + slot][hidden_dim]`.
+const MoeRouteScatterPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
+    debug: u32,
+};
+
+/// Push constants for fused route scatter + shared expert + residual add.
+/// Source is route-slot indexed; hidden is token-major `[token][hidden_dim]`.
+const MoeRouteScatterSharedResidualPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    has_gate: u32,
+};
+
+/// Push constants for fused route scatter + f32 shared gate dot + residual add.
+const MoeRouteScatterSharedResidualGateF32Push = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    gate_weight_offset: u32,
+};
+
+/// Push constants for scattering grouped MoE route outputs with Gemma's
+/// per-expert down projection scale folded into the route weight.
+const MoeRouteScatterScaledPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    ids_stride: u32,
+    debug: u32,
+    scale_offset: u32,
+};
+
+/// Push constants for gathering token-ordered expert inputs into route slots.
+/// Destination is route-slot indexed: `[token * k + slot][hidden_dim]`.
+const MoeRouteGatherPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    debug: u32,
+};
+
+/// Push constants for flattening batched top-k IDs into route-slot order.
+const MoeRouteIdsPush = extern struct {
+    n_tokens: u32,
+    k: u32,
+    routing_stride: u32,
+};
+
+/// Push constants for direct route-slot scatter with Gemma expert-down scales.
+const MoeRouteScatterDirectScaledPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    routing_stride: u32,
+    scale_offset: u32,
+    debug: u32,
 };
 
 /// Push constants for GPU-weighted batched MoE accumulation.
@@ -660,10 +1366,23 @@ const MoeWeightedAccPush = extern struct {
     src_stride: u32,
 };
 
+const MoeWeightedAccScaledPush = extern struct {
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    scale_offset: u32,
+};
+
 /// Push constants for RMS norm dispatch (matches rms_norm_mul.metal: buffer(0)).
 const RmsNormPush = extern struct {
     n: u32, // elements per group
     eps: f32, // epsilon
+};
+
+const RmsNormOffsetPush = extern struct {
+    n: u32,
+    eps: f32,
+    weight_offset: u32,
 };
 
 /// Push constants for fused residual-add + RMS norm (matches residual_rms_norm.metal: buffer(0)).
@@ -672,6 +1391,52 @@ const ResidualRmsNormPush = extern struct {
     n: u32,
     eps: f32,
     scale: f32,
+    residual_offset: u32,
+};
+
+/// Push constants for residual_rms_norm + Q8 router top-k fusion.
+const ResidualRmsNormRouterQ8TopkPush = extern struct {
+    n: u32,
+    eps: f32,
+    scale: f32,
+    residual_offset: u32,
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+};
+
+/// Push constants for residual_rms_norm + F32 router top-k fusion.
+const ResidualRmsNormRouterF32TopkPush = extern struct {
+    n: u32,
+    eps: f32,
+    scale: f32,
+    residual_offset: u32,
+    n_experts: u32,
+    K: u32,
+    k: u32,
+    a_offset: u32,
+};
+
+/// Push constants for triple-fused residual_norm + residual_add + output_norm
+/// (matches post_norm_residual_rms_norm.metal: buffer(0)). Replaces the
+/// separate post_*_norm + barrier + residual_rms_norm pair. `hidden_scale`
+/// folds the per-layer `layer_output_scale` (previously a standalone
+/// scale_in_place dispatch + barrier) into the same kernel — pass 1.0 to
+/// disable.
+const PostNormResidualRmsNormPush = extern struct {
+    n: u32,
+    eps: f32,
+    hidden_scale: f32,
+};
+
+const GemmaMoePostNormResidualPush = extern struct {
+    n: u32,
+    eps: f32,
+    expert_weight_offset: u32,
+    shared_weight_offset: u32,
+    has_gate: u32,
+    has_final_norm: u32,
 };
 
 /// Push constants for fused MoE weighted acc + shared expert (matches moe_weighted_acc_shared.metal: buffer(3)).
@@ -683,9 +1448,35 @@ const MoeWeightedAccSharedPush = extern struct {
     has_gate: u32,
 };
 
+/// Push constants for fused MoE weighted acc + shared expert with F32 gate dot.
+const MoeWeightedAccSharedGateF32Push = extern struct {
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    gate_weight_offset: u32,
+    norm_offset: u32,
+    hidden_scale: f32,
+};
+
+/// Push constants for Qwen MoE weighted acc + F32 shared gate + next RMSNorm.
+const MoeWeightedAccSharedGateF32NormPush = extern struct {
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    gate_weight_offset: u32,
+    norm_offset: u32,
+    eps: f32,
+    hidden_scale: f32,
+};
+
 /// Push constants for sigmoid multiply dispatch (matches sigmoid_mul.metal: buffer(0)).
 const SigmoidMulPush = extern struct {
     n: u32,
+};
+
+const SigmoidScaleAccBatchedPush = extern struct {
+    n_tokens: u32,
+    hidden_dim: u32,
 };
 
 /// Push constants for RoPE dispatch (matches rope_fused.metal: buffer(0)).
@@ -702,6 +1493,23 @@ const RopeNativePush = extern struct {
     rope_dim: u32,
     n_heads: u32,
     position: u32,
+};
+
+/// Push constants for fused single-token RoPE-Q + RoPE-K + KV cache write
+/// (matches rope_kv_cache_write.metal: buffer(0)). Grid = n_q_heads + n_kv_heads;
+/// the first `n_q_heads` slots rotate Q in place, the remaining slots rotate K
+/// and write both K and V into the cache slot. Folding Q-rope into this
+/// kernel saves one dispatch per dense full-attn layer (≈60/token on
+/// Gemma 31B).
+const RopeKvCacheWritePush = extern struct {
+    stride: u32,
+    rope_dim: u32,
+    n_q_heads: u32,
+    position: u32,
+    dst_offset: u32,
+    apply_v_norm: u32,
+    apply_qk_norm: u32,
+    eps: f32,
 };
 
 /// Push constants for flash attention dispatch (matches flash_attn.metal: buffer(0)).
@@ -729,6 +1537,17 @@ const SsmConv1dPush = extern struct {
     conv_channels: u32,
     d_conv: u32,
     kernel_is_f16: u32,
+    input_offset: u32,
+};
+
+/// Push constants for layer-major prompt SSM conv1d.
+const SsmConv1dPrefillPush = extern struct {
+    conv_channels: u32,
+    d_conv: u32,
+    n_tokens: u32,
+    input_stride: u32,
+    input_offset: u32,
+    output_offset: u32,
 };
 
 /// Push constants for SSM delta-net state update dispatch (SPIRV-Cross: buffer(0)).
@@ -742,6 +1561,44 @@ const SsmDeltaNetPush = extern struct {
     dt_bias_is_f16: u32,
     has_dt_bias: u32,
     has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    output_offset: u32,
+};
+
+/// Push constants for SSM delta-net with an explicit conv-output row offset.
+const SsmDeltaNetOffsetPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    output_offset: u32,
+    conv_offset: u32,
+};
+
+/// Push constants for prompt-prefill SSM delta-net over a token chunk.
+const SsmDeltaNetPrefillPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    n_tokens: u32,
+    alpha_stride: u32,
+    beta_stride: u32,
+    conv_stride: u32,
+    output_stride: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    conv_offset: u32,
+    output_offset: u32,
 };
 
 /// Push constants for SSM gated norm dispatch (SPIRV-Cross: buffer(0)).
@@ -750,6 +1607,27 @@ const SsmGatedNormPush = extern struct {
     dt_rank: u32,
     head_v_dim: u32,
     d_state: u32,
+    norm_per_head: u32,
+    z_offset: u32,
+    output_offset: u32,
+    delta_offset: u32,
+};
+
+/// Push constants for fused token-major SSM delta-net + gated norm.
+const SsmDeltaNetGatedNormPush = extern struct {
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    ssm_a_is_f16: u32,
+    dt_bias_is_f16: u32,
+    has_dt_bias: u32,
+    has_ssm_a: u32,
+    alpha_offset: u32,
+    beta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
     norm_per_head: u32,
 };
 
@@ -970,23 +1848,249 @@ fn resolveMoeGateUpLayout(lt: LayerTensors, inter_dim: u32, hidden_dim: u32) !Mo
 const BatchedPrefillMode = enum { off, on, validate };
 
 fn batchedPrefillMode() BatchedPrefillMode {
-    const raw = std.posix.getenv("ZINC_BATCHED_PREFILL") orelse return .off;
+    const raw = getenv("ZINC_BATCHED_PREFILL") orelse return .off;
     if (std.mem.eql(u8, raw, "1")) return .on;
     if (std.mem.eql(u8, raw, "validate")) return .validate;
     return .off;
 }
 
-/// Returns true when the model + engine state match the narrow slice that
-/// `prefillBatched` currently knows how to run: LLaMA-style dense attention
-/// + dense FFN, Q4_K/Q6_K weights, no Q/K norms, no biases, no attention
-/// gate, no post-attn/post-ffn norms, no sliding window, no per-layer output
-/// scale, no attention sinks, f32 KV cache, shared-mode decode buffers.
+fn batchedPrefillEnvPresent() bool {
+    return getenv("ZINC_BATCHED_PREFILL") != null;
+}
+
+fn gemmaBatchedPrefillEnabled() bool {
+    const raw = getenv("ZINC_GEMMA_BATCHED_PREFILL") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "validate");
+}
+
+fn supportsBatchedGemmQuant(t: GGMLType) bool {
+    return t == .q4_k or t == .q6_k;
+}
+
+fn supportsGroupedGemmaMoeCols(engine: *const InferenceEngine, t: GGMLType) bool {
+    return switch (t) {
+        .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
+        .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
+        .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
+        else => false,
+    };
+}
+
+fn maxPackedMoeRouteBlocks(route_slots: u32, n_experts: u32) u32 {
+    if (route_slots == 0 or n_experts == 0) return 0;
+
+    // vLLM's `moe_align_block_size` and llama.cpp's Metal `mul_mm_id` both
+    // operate on expert-contiguous route blocks. Once every expert has one
+    // partially-filled block, each additional block needs `moe_route_block_cols`
+    // more routes assigned to that expert. This is a correctness-safe upper
+    // bound for the active-block grid and avoids launching raw-route-count
+    // early-exit threadgroups.
+    const first_blocks = @min(route_slots, n_experts);
+    const remaining_routes = route_slots - first_blocks;
+    return first_blocks + remaining_routes / moe_route_block_cols;
+}
+
+fn denseMoeColsDispatchBlocks(n_tokens: u32, n_experts: u32) u32 {
+    if (n_tokens == 0 or n_experts == 0) return 0;
+    const blocks_per_expert = (n_tokens + moe_cols_dense_dispatch_cols - 1) / moe_cols_dense_dispatch_cols;
+    return n_experts * blocks_per_expert;
+}
+
+fn recordRoutePackProfile(
+    profile: ?*RuntimeProfile,
+    n_tokens: u32,
+    n_experts: u32,
+    n_experts_used: u32,
+    active_block_upper_bound: u32,
+) void {
+    const p = profile orelse return;
+    const route_slots = n_tokens * n_experts_used;
+    p.route_pack_layers += 1;
+    p.route_pack_slots += route_slots;
+    p.route_pack_active_block_upper_bound += active_block_upper_bound;
+    p.route_pack_dense_dispatch_blocks += denseMoeColsDispatchBlocks(n_tokens, n_experts);
+}
+
+fn logRoutePackCandidateBlocks(n_tokens: u32, n_experts: u32, n_experts_used: u32) void {
+    const route_slots = n_tokens * n_experts_used;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, n_experts);
+    const dense_blocks = denseMoeColsDispatchBlocks(n_tokens, n_experts);
+    log.info("Metal profile: Qwen route-pack candidate blocks prompt_tokens={d} route_slots={d} active_block_upper={d} dense_dispatch_blocks={d} upper/dense={d:.1}%", .{
+        n_tokens,
+        route_slots,
+        active_block_upper_bound,
+        dense_blocks,
+        pctOf(dense_blocks, active_block_upper_bound),
+    });
+}
+
+fn canUseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else cfg.hidden_dim * 4;
+    if (!gemmaBatchedPrefillEnabled()) return false;
+    if (cfg.architecture != .gemma or cfg.n_experts == 0) return false;
+    if (cfg.ssm_d_inner > 0) return false;
+    if (engine.private_decode_buffers) return false;
+    if (fullAttentionInterval(cfg) != 1) return false;
+    if (engine.attn_sink_values != null) return false;
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine.lm_head.info.type_)) return false;
+
+    for (0..cfg.n_layers) |i| {
+        if (engine.layer_output_scales[i] != 1.0) return false;
+
+        const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) return false;
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch return false;
+        const q = lt.attn_q orelse return false;
+        const k = lt.attn_k orelse return false;
+        const o = lt.attn_output orelse return false;
+        if (!supportsBatchedGemmQuant(q.info.type_) or !supportsBatchedGemmQuant(k.info.type_) or
+            !supportsBatchedGemmQuant(o.info.type_)) return false;
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse return false;
+            if (!supportsBatchedGemmQuant(v.info.type_)) return false;
+        }
+
+        const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
+        if (q_rows >= attn.q_dim * 2) return false;
+
+        if (!hasExplicitGemmaMoeTensors(cfg, lt)) return false;
+        const gate_inp = lt.ffn_gate_inp orelse return false;
+        if (!supportsBatchedGemmQuant(gate_inp.info.type_)) return false;
+        if (lt.ffn_gate_inp_bias != null or lt.ffn_gate_exps_bias != null or
+            lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
+
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, cfg.hidden_dim) catch return false;
+        if (gate_up_layout.gate_tensor.info.type_ != .q4_k or gate_up_layout.up_tensor.info.type_ != .q4_k) return false;
+        const down_exps = lt.ffn_down_exps orelse return false;
+        if (!supportsGroupedGemmaMoeCols(engine, down_exps.info.type_)) return false;
+
+        const gate_shexp = lt.ffn_gate_shexp orelse return false;
+        const up_shexp = lt.ffn_up_shexp orelse return false;
+        const down_shexp = lt.ffn_down_shexp orelse return false;
+        if (!supportsBatchedGemmQuant(gate_shexp.info.type_) or
+            !supportsBatchedGemmQuant(up_shexp.info.type_) or
+            !supportsBatchedGemmQuant(down_shexp.info.type_)) return false;
+        if (lt.ffn_gate_inp_shexp) |gate| {
+            if (!supportsBatchedGemmQuant(gate.info.type_)) return false;
+        }
+
+        if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
+            !isF32Tensor(lt.post_ffw_norm_1) or !isF32Tensor(lt.post_ffw_norm_2) or
+            !isF32Tensor(lt.ffn_down_exps_scale))
+        {
+            return false;
+        }
+    }
+
+    return engine.softmax_topk_batched_pipe.handle != null and
+        engine.moe_route_pack_pipe.handle != null and
+        engine.moe_route_ids_pipe.handle != null and
+        engine.moe_route_gather_pipe.handle != null and
+        engine.moe_route_scatter_scaled_pipe.handle != null and
+        engine.moe_route_scatter_direct_scaled_pipe.handle != null and
+        engine.geglu_batched_pipe.handle != null and
+        engine.sigmoid_scale_acc_batched_pipe.handle != null and
+        engine.zero_f32_pipe.handle != null and
+        engine.scale_acc_pipe.handle != null;
+}
+
+fn shouldDefaultDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    // Auto-enable for dense Gemma (original case) and dense Qwen3 (Effort 14
+    // post-loop-cycle-29 finding). Per-token prefill on Qwen3-8B Q4_K_M ran
+    // at ~48 tok/s; batched ran at ~354 tok/s — 7.4x improvement, lifting
+    // ZINC from 12% to 85% of llama.cpp's 416 tok/s prefill on this M1 Max.
+    // The structural checks in canUseBatchedPrefill (non-Gemma branch at
+    // line 1336+) already accept Qwen3 dense via the generic structural
+    // path; this function only controls whether the path fires WITHOUT
+    // ZINC_BATCHED_PREFILL=1 being set explicitly. Qwen3 8B has
+    // hidden_dim=4096 < 5000, so it would NOT match the original Gemma
+    // dim guard — we drop the dim guard for .qwen2 dense and keep it for
+    // Gemma where the kernel was originally tuned for hidden_dim=5376.
+    if (cfg.architecture == .qwen2 and cfg.n_experts == 0) return true;
+    return cfg.architecture == .gemma and cfg.n_experts == 0 and cfg.hidden_dim >= 5000;
+}
+
+fn canUseDenseGemmaBatchedPrefill(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .gemma or cfg.n_experts != 0) return false;
+    if (cfg.ssm_d_inner > 0) return false;
+    if (engine.private_decode_buffers) return false;
+    if (fullAttentionInterval(cfg) != 1) return false;
+    if (engine.attn_sink_values != null) return false;
+    if (!shouldCpuLmHeadFallback(engine) and !supportsBatchedGemmQuant(engine.lm_head.info.type_)) return false;
+    if (engine.geglu_batched_pipe.handle == null or
+        engine.gemm_q4k_pipe.handle == null or
+        engine.gemm_q6k_pipe.handle == null)
+    {
+        return false;
+    }
+
+    for (0..cfg.n_layers) |i| {
+        const lt = engine.layer_tensors[i];
+        if (lt.attn_gate != null) return false;
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch return false;
+        const q = lt.attn_q orelse return false;
+        const k = lt.attn_k orelse return false;
+        const o = lt.attn_output orelse return false;
+        const gate = lt.ffn_gate orelse return false;
+        const up = lt.ffn_up orelse return false;
+        const down = lt.ffn_down orelse return false;
+        for ([_]*const metal_loader.LoadedTensor{ q, k, o, gate, up, down }) |t| {
+            if (!supportsBatchedGemmQuant(t.info.type_)) return false;
+        }
+        if (!attn.use_k_as_v) {
+            const v = lt.attn_v orelse return false;
+            if (!supportsBatchedGemmQuant(v.info.type_)) return false;
+        }
+
+        const q_rows: u32 = @intCast(q.info.numElements() / cfg.hidden_dim);
+        if (q_rows >= attn.q_dim * 2) return false;
+    }
+
+    return true;
+}
+
+fn defaultCommandEncoderMode(cfg: ModelConfig) CommandEncoderMode {
+    _ = cfg;
+    // Apple9 power-management traps: with `MTLDispatchTypeSerial`, the GPU
+    // appears to drain the in-flight warps and let the cores idle between
+    // every dispatch, even when the next dispatch is data-independent. The
+    // K=5376 dense kernels measure 491–629 GB/s in `bench-metal-shapes`
+    // (which uses `beginCommand`, i.e. the concurrent encoder) yet the
+    // real Gemma 31B decode achieves ~5 GB/s effective when running through
+    // the serial encoder. Switching back to `MTLDispatchTypeConcurrent`
+    // (which is exactly the encoder llama.cpp's `ggml-metal.m` uses for its
+    // graph compute) lets independent Q/K/V and gate/up projections overlap
+    // and — more importantly — keeps the GPU busy enough that power-management
+    // does not down-clock between the per-layer chain. Every existing
+    // `profileBarrier()` was placed at a real data-dependency boundary while
+    // this code originally ran on a concurrent encoder, so promoting them
+    // back to live `MTLBarrierScopeBuffers` barriers preserves ordering.
+    return .concurrent;
+}
+
+/// Returns true when the model + engine state match a supported batched
+/// prefill slice. Dense Gemma allows the Gemma 4 norms, GEGLU, sliding-window
+/// attention, and per-layer output scale that the per-token path applies.
 /// Every unsupported case falls back to the per-token path.
 fn canUseBatchedPrefill(engine: *const InferenceEngine) bool {
     const cfg = engine.config;
+    if (cfg.architecture == .gemma) {
+        if (cfg.n_experts > 0) return canUseGemmaBatchedPrefill(engine);
+        return canUseDenseGemmaBatchedPrefill(engine);
+    }
     if (cfg.n_experts > 0) return false;
     if (cfg.ssm_d_inner > 0) return false;
-    if (cfg.architecture == .gemma or cfg.architecture == .gpt_oss) return false;
+    if (cfg.architecture == .gpt_oss) return false;
     if (engine.private_decode_buffers) return false;
     // Both f32 and Q8 KV caches are supported — we dispatch the matching
     // flash_attn_batched / kv_cache_write variant below.
@@ -1033,6 +2137,27 @@ fn canUseBatchedPrefill(engine: *const InferenceEngine) bool {
     return true;
 }
 
+const BatchedPrefillAttentionDims = struct {
+    max_q_dim: u32,
+    max_kv_dim: u32,
+};
+
+fn batchedPrefillAttentionDims(engine: *const InferenceEngine) !BatchedPrefillAttentionDims {
+    const cfg = engine.config;
+    const hidden_dim = cfg.hidden_dim;
+    var max_q_dim: u32 = 0;
+    var max_kv_dim: u32 = 0;
+
+    for (engine.layer_tensors) |lt| {
+        const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+        max_q_dim = @max(max_q_dim, attn.q_dim);
+        max_kv_dim = @max(max_kv_dim, attn.kv_dim);
+    }
+
+    if (max_q_dim == 0 or max_kv_dim == 0) return error.InvalidTensorShape;
+    return .{ .max_q_dim = max_q_dim, .max_kv_dim = max_kv_dim };
+}
+
 /// Scratch GPU buffers needed by `prefillBatched` for a batch of `n_tokens`.
 /// All buffers are shared-mode so CPU code can dequantize embeddings directly
 /// into `hidden` and read the last-token slice back out at the end.
@@ -1048,12 +2173,31 @@ const BatchedPrefillScratch = struct {
     up: MetalBuffer,
     swiglu: MetalBuffer,
     down: MetalBuffer,
+    moe_routing: MetalBuffer,
+    moe_expert_counts: MetalBuffer,
+    moe_packed_ids: MetalBuffer,
+    moe_active_blocks: MetalBuffer,
+    moe_active_block_count: MetalBuffer,
+    moe_route_input: MetalBuffer,
+    moe_expert_gate: MetalBuffer,
+    moe_expert_up: MetalBuffer,
+    moe_expert_swiglu: MetalBuffer,
+    moe_expert_down: MetalBuffer,
+    moe_route_slots: u32,
 
     fn init(engine: *InferenceEngine, n_tokens: u32, q_dim: u32, kv_dim: u32, inter_dim: u32) !BatchedPrefillScratch {
         const ctx = engine.device.ctx;
         const hidden_dim = engine.config.hidden_dim;
         const f32_sz: usize = @sizeOf(f32);
+        const u32_sz: usize = @sizeOf(u32);
         const n: usize = n_tokens;
+        const hidden_n: usize = hidden_dim;
+        const inter_n: usize = inter_dim;
+        const attn_scratch_n: usize = @max(@as(usize, q_dim), @as(usize, kv_dim));
+        const ffn_scratch_n: usize = @max(@max(inter_n, @as(usize, engine.config.shared_expert_intermediate_dim)), attn_scratch_n);
+        const n_experts: usize = engine.config.n_experts;
+        const k_used: usize = engine.config.n_experts_used;
+        const route_slots = n * k_used;
         const h = try metal_buffer.createBuffer(ctx, n * hidden_dim * f32_sz);
         errdefer {
             var mut = h;
@@ -1084,22 +2228,72 @@ const BatchedPrefillScratch = struct {
             var mut = ao;
             metal_buffer.freeBuffer(&mut);
         }
-        const gb = try metal_buffer.createBuffer(ctx, n * inter_dim * f32_sz);
+        const gb = try metal_buffer.createBuffer(ctx, n * ffn_scratch_n * f32_sz);
         errdefer {
             var mut = gb;
             metal_buffer.freeBuffer(&mut);
         }
-        const ub = try metal_buffer.createBuffer(ctx, n * inter_dim * f32_sz);
+        const ub = try metal_buffer.createBuffer(ctx, n * ffn_scratch_n * f32_sz);
         errdefer {
             var mut = ub;
             metal_buffer.freeBuffer(&mut);
         }
-        const sw = try metal_buffer.createBuffer(ctx, n * inter_dim * f32_sz);
+        const sw = try metal_buffer.createBuffer(ctx, n * ffn_scratch_n * f32_sz);
         errdefer {
             var mut = sw;
             metal_buffer.freeBuffer(&mut);
         }
         const db = try metal_buffer.createBuffer(ctx, n * hidden_dim * f32_sz);
+        errdefer {
+            var mut = db;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const routing = try metal_buffer.createBuffer(ctx, @max(n * k_used * 2 * u32_sz, 4));
+        errdefer {
+            var mut = routing;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const counts = try metal_buffer.createBuffer(ctx, @max(n_experts * u32_sz, 4));
+        errdefer {
+            var mut = counts;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const packed_ids = try metal_buffer.createBuffer(ctx, @max(n_experts * n * u32_sz, 4));
+        errdefer {
+            var mut = packed_ids;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const active_blocks = try metal_buffer.createBuffer(ctx, @max(route_slots * u32_sz, 4));
+        errdefer {
+            var mut = active_blocks;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const active_block_count = try metal_buffer.createBuffer(ctx, u32_sz);
+        errdefer {
+            var mut = active_block_count;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const moe_input = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
+        errdefer {
+            var mut = moe_input;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const moe_gate = try metal_buffer.createBuffer(ctx, @max(route_slots * inter_n * f32_sz, 4));
+        errdefer {
+            var mut = moe_gate;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const moe_up = try metal_buffer.createBuffer(ctx, @max(route_slots * inter_n * f32_sz, 4));
+        errdefer {
+            var mut = moe_up;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const moe_swiglu = try metal_buffer.createBuffer(ctx, @max(route_slots * inter_n * f32_sz, 4));
+        errdefer {
+            var mut = moe_swiglu;
+            metal_buffer.freeBuffer(&mut);
+        }
+        const moe_down = try metal_buffer.createBuffer(ctx, @max(route_slots * hidden_n * f32_sz, 4));
         return .{
             .n_tokens = n_tokens,
             .hidden = h,
@@ -1112,6 +2306,17 @@ const BatchedPrefillScratch = struct {
             .up = ub,
             .swiglu = sw,
             .down = db,
+            .moe_routing = routing,
+            .moe_expert_counts = counts,
+            .moe_packed_ids = packed_ids,
+            .moe_active_blocks = active_blocks,
+            .moe_active_block_count = active_block_count,
+            .moe_route_input = moe_input,
+            .moe_expert_gate = moe_gate,
+            .moe_expert_up = moe_up,
+            .moe_expert_swiglu = moe_swiglu,
+            .moe_expert_down = moe_down,
+            .moe_route_slots = @intCast(route_slots),
         };
     }
 
@@ -1126,6 +2331,16 @@ const BatchedPrefillScratch = struct {
         metal_buffer.freeBuffer(&self.up);
         metal_buffer.freeBuffer(&self.swiglu);
         metal_buffer.freeBuffer(&self.down);
+        metal_buffer.freeBuffer(&self.moe_routing);
+        metal_buffer.freeBuffer(&self.moe_expert_counts);
+        metal_buffer.freeBuffer(&self.moe_packed_ids);
+        metal_buffer.freeBuffer(&self.moe_active_blocks);
+        metal_buffer.freeBuffer(&self.moe_active_block_count);
+        metal_buffer.freeBuffer(&self.moe_route_input);
+        metal_buffer.freeBuffer(&self.moe_expert_gate);
+        metal_buffer.freeBuffer(&self.moe_expert_up);
+        metal_buffer.freeBuffer(&self.moe_expert_swiglu);
+        metal_buffer.freeBuffer(&self.moe_expert_down);
     }
 };
 
@@ -1146,6 +2361,206 @@ fn dispatchGemmBatchedOnCmd(
         .q4_k => dispatchGemmQ4KOnCmd(engine, cmd, weight, input, output, M, K, N),
         .q6_k => dispatchGemmQ6KOnCmd(engine, cmd, weight, input, output, M, K, N),
         else => unreachable,
+    }
+}
+
+fn canUseQwenSharedBatchedGemm(engine: *const InferenceEngine, quant_type: GGMLType) bool {
+    return switch (quant_type) {
+        .q8_0 => engine.gemm_q8_0_pipe.handle != null,
+        .q4_k => engine.gemm_q4k_pipe.handle != null,
+        .q5_k => engine.gemm_q5k_pipe.handle != null,
+        .q6_k => engine.gemm_q6k_pipe.handle != null,
+        else => false,
+    };
+}
+
+fn canUseQwenSharedGateInputF32(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, hidden_dim: u32) bool {
+    return tensor.info.type_ == .f32 and
+        tensor.info.numElements() == hidden_dim and
+        engine.moe_route_scatter_shared_residual_gate_f32_pipe.handle != null;
+}
+
+fn canUseQwenSharedGateInputBatched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, hidden_dim: u32) bool {
+    return canUseQwenSharedBatchedGemm(engine, tensor.info.type_) or
+        canUseQwenSharedGateInputF32(engine, tensor, hidden_dim);
+}
+
+fn canUseQwenTokenSharedGateF32Acc(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, hidden_dim: u32) bool {
+    return engine.config.architecture == .qwen2_moe and
+        tensor.info.type_ == .f32 and
+        tensor.info.numElements() == hidden_dim and
+        engine.moe_weighted_acc_shared_gate_f32_pipe.handle != null;
+}
+
+fn canFoldQwenGpuMoeLayerOutputScale(engine: *const InferenceEngine, lt: LayerTensors, hidden_dim: u32) bool {
+    const gate_inp_shexp = lt.ffn_gate_inp_shexp orelse return false;
+    return engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        lt.ffn_gate_shexp != null and
+        lt.ffn_up_shexp != null and
+        lt.ffn_down_shexp != null and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        canUseQwenTokenSharedGateF32Acc(engine, gate_inp_shexp, hidden_dim);
+}
+
+fn canUseQwenSsmProjectionTailF32Batched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, rows: u32, cols: u32) bool {
+    return tensor.info.type_ == .f32 and
+        rows > 0 and
+        rows <= 64 and
+        tensor.info.numElements() == @as(u64, rows) * @as(u64, cols) and
+        engine.gemm_f32_small_pipe.handle != null and
+        engine.gemm_f32_small_pipe.max_threads_per_threadgroup >= 32;
+}
+
+fn dispatchQwenSharedBatchedGemmOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) !void {
+    switch (weight.info.type_) {
+        .q8_0 => dispatchGemmQ8_0OnCmd(engine, cmd, weight, input, output, M, K, N),
+        .q5_k => dispatchGemmQ5KOnCmd(engine, cmd, weight, input, output, M, K, N),
+        .q4_k, .q6_k => dispatchGemmBatchedOnCmd(engine, cmd, weight, input, output, M, K, N),
+        else => return error.UnsupportedQwenSharedBatchedGemm,
+    }
+}
+
+fn dispatchGemmF32SmallOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    recordDmmvProfile(engine, weight, M, K);
+    const push = GemmF32SmallPush{
+        .M = M,
+        .K = K,
+        .N = N,
+        .src0_off = tensorPageOffset(engine.model, weight),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
+    cmd.dispatchV2(&engine.gemm_f32_small_pipe, .{ M, N, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(GemmF32SmallPush), 0);
+}
+
+fn dispatchQwenSsmProjectionTailBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) !void {
+    if (canUseQwenSsmProjectionTailF32Batched(engine, weight, M, K)) {
+        dispatchGemmF32SmallOnCmd(engine, cmd, weight, input, output, M, K, N);
+        return;
+    }
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, weight, input, output, M, K, N);
+}
+
+fn canUseQwenSsmF32AlphaBetaDual(
+    engine: *const InferenceEngine,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+) bool {
+    const cfg = engine.config;
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        rows == cfg.ssm_dt_rank and
+        rows == 32 and
+        cols == 2048 and
+        alpha_t.info.type_ == .f32 and
+        beta_t.info.type_ == .f32 and
+        alpha_t.info.numElements() == @as(u64, rows) * @as(u64, cols) and
+        beta_t.info.numElements() == @as(u64, rows) * @as(u64, cols) and
+        !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.dmmv_f32_dual_small_pipe.handle != null and
+        engine.dmmv_f32_dual_small_pipe.thread_execution_width == 32 and
+        engine.dmmv_f32_dual_small_pipe.max_threads_per_threadgroup >= 1024;
+}
+
+fn dispatchQwenSsmF32AlphaBetaDualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    alpha_output_buf: *const MetalBuffer,
+    beta_output_buf: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, alpha_t, rows, cols);
+    recordDmmvProfile(engine, beta_t, rows, cols);
+
+    const push = DualQ8DmmvPush{
+        .M0 = rows,
+        .M1 = rows,
+        .K = cols,
+        .a0_offset = tensorPageOffset(engine.model, alpha_t),
+        .a1_offset = tensorPageOffset(engine.model, beta_t),
+        .x_offset = x_byte_offset,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &alpha_t.gpu_buffer, &beta_t.gpu_buffer, input_buf, alpha_output_buf, beta_output_buf };
+    const simd_width = if (engine.dmmv_f32_dual_small_pipe.thread_execution_width > 0)
+        engine.dmmv_f32_dual_small_pipe.thread_execution_width
+    else
+        @as(u32, 32);
+    const block_size: u32 = 1024;
+    const rows_per_wg: u32 = block_size / simd_width;
+    cmd.dispatchV2(
+        &engine.dmmv_f32_dual_small_pipe,
+        .{ (rows + rows_per_wg - 1) / rows_per_wg, 2, n_tokens },
+        .{ block_size, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        0,
+    );
+}
+
+fn dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    alpha_output: *const MetalBuffer,
+    beta_output: *const MetalBuffer,
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+) !void {
+    if (canUseQwenSsmF32AlphaBetaDual(engine, alpha_t, beta_t, rows, cols)) {
+        dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, input, alpha_output, beta_output, rows, cols, n_tokens, 0);
+        return;
+    }
+    if (canBatchQwenSsmProjectionTail(engine, alpha_t, rows, cols)) {
+        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, alpha_t, input, alpha_output, rows, cols, n_tokens);
+    }
+    if (canBatchQwenSsmProjectionTail(engine, beta_t, rows, cols)) {
+        try dispatchQwenSsmProjectionTailBatchedOnCmd(engine, cmd, beta_t, input, beta_output, rows, cols, n_tokens);
     }
 }
 
@@ -1175,6 +2590,7 @@ pub const InferenceEngine = struct {
     logits_readback_buf: MetalBuffer,
     argmax_buf: MetalBuffer,
     embed_staging: MetalBuffer,
+    prefill_embed_buf: MetalBuffer,
     lm_head_private_buf: MetalBuffer,
     expert_ids_buf: MetalBuffer,
 
@@ -1200,29 +2616,67 @@ pub const InferenceEngine = struct {
     // DMMV compute pipelines (one per quant type)
     dmmv_q4k_pipe: MetalPipeline,
     dmmv_q4k_k2048_pipe: MetalPipeline,
+    dmmv_q4k_dual_pipe: MetalPipeline,
+    dmmv_q4k_dual_llama_pipe: MetalPipeline,
+    dmmv_q4k_qk_dual_pipe: MetalPipeline,
     dmmv_q4k_lmhead_pipe: MetalPipeline,
     dmmv_q4k_lmhead_1024_pipe: MetalPipeline,
+    dmmv_q4k_lmhead_norm_pipe: MetalPipeline,
     dmmv_q5k_pipe: MetalPipeline,
     dmmv_q5k_native_pipe: MetalPipeline,
     dmmv_q6k_pipe: MetalPipeline,
+    dmmv_q6k_llama_pipe: MetalPipeline,
     dmmv_q8_0_pipe: MetalPipeline,
     dmmv_q5_0_pipe: MetalPipeline,
     dmmv_q5_1_pipe: MetalPipeline,
     dmmv_mxfp4_pipe: MetalPipeline,
+    dmmv_mxfp4_moe_pipe: MetalPipeline,
+    dmmv_mxfp4_moe_sg_pipe: MetalPipeline,
+    dmmv_q8_0_lmhead_pipe: MetalPipeline,
     dmmv_q8_0_k2048_pipe: MetalPipeline,
+    dmmv_q8_0_k4096_pipe: MetalPipeline,
+    dmmv_q8_0_k4096_quad_pipe: MetalPipeline,
+    dmmv_q8_0_k2048_quad_pipe: MetalPipeline,
+    dmmv_q8_0_k512_quad_pipe: MetalPipeline,
+    dmmv_q8_0_quad_pipe: MetalPipeline,
     dmmv_q8_0_dual_pipe: MetalPipeline,
+    dmmv_q8_0_pair_pipe: MetalPipeline,
+    dmmv_q8_0_pair_swiglu_pipe: MetalPipeline,
     dmmv_q8_0_k2048_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_dual_fused_norm_pipe: MetalPipeline,
     dmmv_q8_0_repacked_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_nr2_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_nr2_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_quad_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_quad_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_quad_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k2048_qwen_pipe: MetalPipeline,
+    dmmv_q8_0_repacked_k4096_qwen_pipe: MetalPipeline,
     dmmv_f16_pipe: MetalPipeline,
     dmmv_f32_pipe: MetalPipeline,
+    dmmv_f32_dual_small_pipe: MetalPipeline,
     dmmv_q4k_moe_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_pipe: MetalPipeline,
+    dmmv_q4k_dense_gate_up_geglu_pipe: MetalPipeline,
+    dmmv_q4k_dense_gate_up_swiglu_pipe: MetalPipeline,
+    dmmv_q4k_moe_cols_pipe: MetalPipeline,
     dmmv_q5_1_moe_pipe: MetalPipeline,
+    dmmv_q5_1_moe_cols_pipe: MetalPipeline,
     dmmv_q5k_moe_pipe: MetalPipeline,
+    dmmv_q5k_moe_cols_pipe: MetalPipeline,
+    dmmv_q5k_moe_k512_pipe: MetalPipeline,
+    dmmv_q5k_moe_k512_tri_pipe: MetalPipeline,
+    dmmv_q5k_moe_k512_quad_pipe: MetalPipeline,
     dmmv_q5k_moe_k2048_pipe: MetalPipeline,
     dmmv_q6k_moe_pipe: MetalPipeline,
+    dmmv_q6k_moe_cols_pipe: MetalPipeline,
     dmmv_q4k_moe_k2048_pipe: MetalPipeline,
     dmmv_q4k_moe_k2048_1024_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_dual_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_dual_k2048_pipe: MetalPipeline,
+    dmmv_q4k_moe_gate_up_swiglu_k2048_pipe: MetalPipeline,
 
     // Elementwise compute pipelines (for batched GPU dispatch)
     deinterleave_pipe: MetalPipeline,
@@ -1232,30 +2686,67 @@ pub const InferenceEngine = struct {
     kv_cache_write_q8_pipe: MetalPipeline,
     rope_pipe: MetalPipeline,
     rope_native_pipe: MetalPipeline,
+    rope_kv_cache_write_pipe: MetalPipeline,
     sigmoid_mul_pipe: MetalPipeline,
     geglu_pipe: MetalPipeline,
     geglu_batched_pipe: MetalPipeline,
     swiglu_pipe: MetalPipeline,
     swiglu_batched_pipe: MetalPipeline,
+    swiglu_oai_batched_bias_pipe: MetalPipeline,
     scale_acc_pipe: MetalPipeline,
+    scale_in_place_pipe: MetalPipeline,
+    add_bias_pipe: MetalPipeline,
     rms_norm_pipe: MetalPipeline,
+    rms_norm_offset_pipe: MetalPipeline,
+    gemma_moe_post_norm_residual_pipe: MetalPipeline,
     moe_acc_pipe: MetalPipeline,
     moe_acc_batched_pipe: MetalPipeline,
+    moe_acc_batched_bias_pipe: MetalPipeline,
+    moe_acc_batched_bias_routed_pipe: MetalPipeline,
     softmax_topk_pipe: MetalPipeline,
+    softmax_topk_scaled_pipe: MetalPipeline,
+    softmax_topk_weight_bias_pipe: MetalPipeline,
+    router_f32_topk_bias_pipe: MetalPipeline,
+    router_f32_topk_batched_pipe: MetalPipeline,
+    router_q8_0_topk_pipe: MetalPipeline,
+    router_q8_0_topk_k2048_pipe: MetalPipeline,
+    router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
+    softmax_topk_batched_pipe: MetalPipeline,
+    moe_route_pack_pipe: MetalPipeline,
+    moe_route_pack_blocks_pipe: MetalPipeline,
+    moe_route_ids_pipe: MetalPipeline,
+    moe_route_gather_pipe: MetalPipeline,
+    moe_route_scatter_pipe: MetalPipeline,
+    moe_route_scatter_set_pipe: MetalPipeline,
+    moe_route_scatter_shared_residual_pipe: MetalPipeline,
+    moe_route_scatter_shared_residual_gate_f32_pipe: MetalPipeline,
+    moe_route_scatter_scaled_pipe: MetalPipeline,
+    moe_route_scatter_direct_scaled_pipe: MetalPipeline,
     sigmoid_scale_acc_pipe: MetalPipeline,
+    sigmoid_scale_acc_batched_pipe: MetalPipeline,
     moe_weighted_acc_pipe: MetalPipeline,
+    moe_weighted_acc_scaled_pipe: MetalPipeline,
     residual_rms_norm_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_k2048_pipe: MetalPipeline,
+    residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe: MetalPipeline,
+    residual_rms_norm_router_f32_topk_pipe: MetalPipeline,
+    post_norm_residual_rms_norm_pipe: MetalPipeline,
     moe_weighted_acc_shared_pipe: MetalPipeline,
+    moe_weighted_acc_shared_gate_f32_pipe: MetalPipeline,
+    moe_weighted_acc_shared_gate_f32_qwen2048_pipe: MetalPipeline,
+    moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe: MetalPipeline,
     copy_u32_pipe: MetalPipeline,
     copy_f32_pipe: MetalPipeline,
     zero_f32_pipe: MetalPipeline,
     argmax_pipe: MetalPipeline,
 
     // Batched GEMM pipelines for prefill (process N tokens per dispatch).
-    // Only loaded when the model has Q4_K / Q6_K weights; other quants stay
-    // on the DMMV path until GEMM kernels are ported.
     gemm_q4k_pipe: MetalPipeline,
+    gemm_q5k_pipe: MetalPipeline,
     gemm_q6k_pipe: MetalPipeline,
+    gemm_q8_0_pipe: MetalPipeline,
+    gemm_f32_small_pipe: MetalPipeline,
     // Batched flash attention for prefill — handles N queries with causal masking.
     // `_q8` variant reads K/V from a Q8_0-quantized cache; default reads f32.
     flash_attn_batched_pipe: MetalPipeline,
@@ -1286,7 +2777,14 @@ pub const InferenceEngine = struct {
 
     // SSM GPU pipelines (cross-compiled from GLSL via SPIRV-Cross)
     ssm_conv1d_pipe: MetalPipeline,
+    ssm_conv1d_qwen_d4_pipe: MetalPipeline,
+    ssm_conv1d_prefill_pipe: MetalPipeline,
+    ssm_conv1d_prefill_qwen_d4_pipe: MetalPipeline,
     ssm_delta_net_pipe: MetalPipeline,
+    ssm_delta_net_offset_pipe: MetalPipeline,
+    ssm_delta_net_prefill_pipe: MetalPipeline,
+    ssm_delta_net_gated_norm_pipe: MetalPipeline,
+    ssm_delta_net_gated_norm_qwen_pipe: MetalPipeline,
     ssm_gated_norm_pipe: MetalPipeline,
 
     // SSM state (Metal buffers — GPU-resident, persistent across tokens)
@@ -1305,6 +2803,7 @@ pub const InferenceEngine = struct {
 
     // Cached per-layer tensor pointers (init-time, eliminates per-token O(733) scans)
     layer_tensors: []LayerTensors,
+    private_router_bufs: ?[]MetalBuffer,
     private_ssm_qkv_bufs: ?[]MetalBuffer,
     private_ssm_gate_bufs: ?[]MetalBuffer,
     private_ssm_out_bufs: ?[]MetalBuffer,
@@ -1316,6 +2815,12 @@ pub const InferenceEngine = struct {
     max_context_tokens: u32,
     profile_enabled: bool,
     debug_validation_enabled: bool,
+    gemma_moe_validation_enabled: bool,
+    qwen_prefill_validation_enabled: bool,
+    qwen_ssm_prefill_proj_enabled: bool,
+    fused_ssm_norm_enabled: bool,
+    fused_ssm_delta_gated_norm_enabled: bool,
+    qwen_ssm_delta_gated_norm_exact_enabled: bool,
     private_decode_buffers: bool,
     command_encoder_mode: CommandEncoderMode,
     kv_cache_q8: bool,
@@ -1324,6 +2829,73 @@ pub const InferenceEngine = struct {
     q8_tg_override: ?u32,
     q8_dual_tg_override: ?u32,
     request_profile: RuntimeProfile,
+    prefill_profile: RuntimeProfile,
+    qwen_ssm_proj_validate_captured_tokens: u32,
+    qwen_ssm_proj_validate_layer: u32,
+    qwen_ssm_prefill_proj_active_tokens: u32,
+    qwen_ssm_prefill_branch_active_tokens: u32,
+    qwen_ssm_prefill_branch_norm_active_tokens: u32,
+    qwen_ssm_proj_validate_norm_buf: MetalBuffer,
+    qwen_ssm_proj_validate_qkv_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_z_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_alpha_ref_buf: MetalBuffer,
+    qwen_ssm_proj_validate_beta_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_captured_tokens: u32,
+    qwen_moe_route_validate_target_tokens: u32,
+    qwen_moe_route_validate_failure_hint_emitted: bool,
+    qwen_moe_route_validate_layer_input_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_norm_buf: MetalBuffer,
+    qwen_moe_route_validate_routing_buf: MetalBuffer,
+    qwen_moe_route_validate_gate_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_up_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_down_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_hidden_before_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_post_hidden_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_shared_gate_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_shared_up_ref_buf: MetalBuffer,
+    qwen_moe_route_validate_shared_down_ref_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_norm_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_qkv_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_z_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_alpha_buf: MetalBuffer,
+    qwen_ssm_prefill_proj_beta_buf: MetalBuffer,
+    qwen_ssm_prefill_branch_buf: MetalBuffer,
+    /// Residency set covering all engine-owned scratch + KV-cache + per-layer
+    /// norm buffers, mirroring the model loader's weight residency set.
+    /// `commandBufferWithUnretainedReferences` skips Metal's auto-residency
+    /// tracking, so any buffer touched by a recorded dispatch must be
+    /// explicitly wired down. Without this the scratch path competes with
+    /// the 17.5 GB weight working set and the OS pages it out between
+    /// dispatches. Null on macOS < 15 or if creation failed (engine still
+    /// runs, just unprotected).
+    scratch_rset: ?*shim.MetalRSet = null,
+
+    /// Repack a Q8_0 tensor through a CPU-visible staging buffer, then upload
+    /// the coalesced layout into GPU-private storage for hot SSM reads.
+    fn createPrivateRepackedQ8Buffer(
+        self: *InferenceEngine,
+        tensor: *const metal_loader.LoadedTensor,
+        size_bytes: usize,
+        rows: u32,
+        cols: u32,
+    ) !MetalBuffer {
+        if (size_bytes % @sizeOf(u32) != 0) return error.InvalidQ8RepackSize;
+
+        var staging = try metal_buffer.createBuffer(self.device.ctx, size_bytes);
+        defer metal_buffer.freeBuffer(&staging);
+
+        const src_ptr = tensor.gpu_buffer.cpu_ptr orelse return error.MetalBufferNotMapped;
+        repackQ8_0Blocks(src_ptr + tensorPageOffset(self.model, tensor), staging.cpu_ptr.?, rows, cols);
+
+        var dst = try metal_buffer.createPrivateBuffer(self.device.ctx, size_bytes);
+        errdefer metal_buffer.freeBuffer(&dst);
+        dst.is_repacked_q8 = true;
+
+        var cmd = try metal_command.beginCommand(self.device.ctx);
+        dispatchCopyU32OnCmd(self, &cmd, &staging, &dst, @intCast(size_bytes / @sizeOf(u32)), 0, 0);
+        cmd.commitAndWait();
+        return dst;
+    }
 
     /// Initialize the Metal inference engine, allocating GPU buffers and compiling pipelines.
     pub fn init(
@@ -1339,11 +2911,12 @@ pub const InferenceEngine = struct {
         const requested_ctx = memory_plan.requestedContextTokens(cfg, null, runtime_context_cap);
         const max_ctx = runtime_profile.maxContextTokensForUnifiedBudget(
             weights_bytes,
-            memoryBudget(device),
+            memoryPlanningBudget(device),
             requested_ctx,
         );
         if (max_ctx == 0) {
-            log.err("No decode context fits within {d:.2} GiB Metal working-set budget", .{
+            log.err("No decode context fits within {d:.2} GiB Metal planning budget ({d:.2} GiB reported working set)", .{
+                @as(f64, @floatFromInt(memoryPlanningBudget(device))) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(memoryBudget(device))) / (1024.0 * 1024.0 * 1024.0),
             });
             return error.ContextLengthDoesNotFit;
@@ -1404,19 +2977,74 @@ pub const InferenceEngine = struct {
         self.max_context_tokens = max_ctx;
         self.profile_enabled = options.profile_enabled;
         self.debug_validation_enabled = options.debug_validation_enabled;
-        self.private_decode_buffers = if (options.debug_validation_enabled)
+        self.gemma_moe_validation_enabled = readBoolEnv("ZINC_GEMMA_MOE_VALIDATE") orelse false;
+        self.qwen_prefill_validation_enabled =
+            (readBoolEnv("ZINC_QWEN36_35B_PREFILL_VALIDATE") orelse false) or
+            (readBoolEnv("ZINC_QWEN36_PREFILL_VALIDATE") orelse false);
+        self.qwen_ssm_prefill_proj_enabled =
+            readBoolEnv("ZINC_QWEN36_35B_SSM_PREFILL_PROJ") orelse
+            readBoolEnv("ZINC_QWEN36_SSM_PREFILL_PROJ") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+        self.qwen_ssm_proj_validate_layer =
+            readU32Env("ZINC_QWEN36_35B_SSM_PROJ_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_SSM_PROJ_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_35B_PREFILL_VALIDATE_LAYER") orelse
+            readU32Env("ZINC_QWEN36_PREFILL_VALIDATE_LAYER") orelse
+            0;
+        self.fused_ssm_norm_enabled = readBoolEnv("ZINC_METAL_FUSED_SSM_NORM") orelse defaultFusedSsmNormEnabled(cfg);
+        self.fused_ssm_delta_gated_norm_enabled =
+            readBoolEnv("ZINC_METAL_FUSED_SSM_DELTA_GATED_NORM") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+        self.qwen_ssm_delta_gated_norm_exact_enabled =
+            readBoolEnv("ZINC_METAL_QWEN_SSM_DELTA_GATED_NORM_EXACT") orelse
+            defaultQwen36SsmPrefillProjectionEnabled(cfg);
+        self.private_decode_buffers = if (options.debug_validation_enabled or
+            self.gemma_moe_validation_enabled or
+            self.qwen_prefill_validation_enabled)
             false
         else
             options.private_decode_buffers_override orelse
                 readBoolEnv("ZINC_METAL_PRIVATE_DECODE") orelse
                 modelSupportsPrivateDecodeBuffers(model, cfg);
-        self.command_encoder_mode = options.command_encoder_mode orelse .concurrent;
+        self.command_encoder_mode = options.command_encoder_mode orelse defaultCommandEncoderMode(cfg);
         self.kv_cache_q8 = kv_cache_q8;
         self.kv_cache_head_stride_bytes = kv_cache_head_stride_bytes;
         self.kv_cache_bytes_per_token = @intCast(kv_cache_bytes_per_token);
         self.q8_tg_override = null;
         self.q8_dual_tg_override = null;
         self.request_profile = .{};
+        self.prefill_profile = .{};
+        self.qwen_ssm_proj_validate_captured_tokens = 0;
+        self.qwen_ssm_prefill_proj_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_norm_active_tokens = 0;
+        self.qwen_ssm_proj_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_qkv_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_z_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_alpha_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_proj_validate_beta_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_captured_tokens = 0;
+        self.qwen_moe_route_validate_target_tokens = 0;
+        self.qwen_moe_route_validate_failure_hint_emitted = false;
+        self.qwen_moe_route_validate_layer_input_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_routing_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_up_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_down_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_hidden_before_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_post_hidden_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_shared_gate_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_shared_up_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_moe_route_validate_shared_down_ref_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_norm_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_qkv_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_z_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_alpha_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_proj_beta_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.qwen_ssm_prefill_branch_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+        self.scratch_rset = null;
+        self.private_router_bufs = null;
         self.private_ssm_qkv_bufs = null;
         self.private_ssm_gate_bufs = null;
         self.private_ssm_out_bufs = null;
@@ -1442,8 +3070,19 @@ pub const InferenceEngine = struct {
             .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.argmax_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
         self.embed_staging = try metal_buffer.createBuffer(ctx, hidden_size);
+        self.prefill_embed_buf = try metal_buffer.createBuffer(ctx, hidden_size * queued_prefill_embed_tokens);
+        self.qwen_ssm_prefill_proj_norm_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * hidden_size, 4));
+        self.qwen_ssm_prefill_proj_qkv_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, conv_channels) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_z_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, d_inner) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_alpha_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_proj_beta_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, cfg.ssm_dt_rank) * @sizeOf(f32), 4));
+        self.qwen_ssm_prefill_branch_buf = try metal_buffer.createBuffer(ctx, @max(@as(usize, qwen_ssm_projection_prefill_max_tokens) * @as(usize, d_inner) * @sizeOf(f32), 4));
         self.lm_head_private_buf = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
         self.expert_ids_buf = try metal_buffer.createBuffer(ctx, expert_ids_size);
+        {
+            const ids_ptr: [*]u32 = @ptrCast(@alignCast(self.expert_ids_buf.cpu_ptr.?));
+            ids_ptr[0] = 0;
+        }
         self.expert_gate_batch_buf = try createMetalBufferForMode(ctx, expert_inter_batch_size, self.private_decode_buffers);
         self.expert_up_batch_buf = try createMetalBufferForMode(ctx, expert_inter_batch_size, self.private_decode_buffers);
         self.expert_swiglu_batch_buf = try createMetalBufferForMode(ctx, expert_inter_batch_size, self.private_decode_buffers);
@@ -1524,29 +3163,67 @@ pub const InferenceEngine = struct {
         // Load DMMV compute pipelines for all quant types
         self.dmmv_q4k_pipe = try loadShaderPipeline(ctx, "dmmv_q4k");
         self.dmmv_q4k_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
+        self.dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
+        self.dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
+        self.dmmv_q4k_qk_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_qk_dual");
         self.dmmv_q4k_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead");
         self.dmmv_q4k_lmhead_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_1024");
+        self.dmmv_q4k_lmhead_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_lmhead_norm");
         self.dmmv_q5k_pipe = try loadShaderPipeline(ctx, "dmmv_q5k");
         self.dmmv_q5k_native_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_native");
         self.dmmv_q6k_pipe = try loadShaderPipeline(ctx, "dmmv_q6k");
+        self.dmmv_q6k_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_llama");
         self.dmmv_q8_0_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0");
         self.dmmv_q5_0_pipe = try loadShaderPipeline(ctx, "dmmv_q5_0");
         self.dmmv_q5_1_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1");
         self.dmmv_mxfp4_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4");
+        self.dmmv_mxfp4_moe_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe");
+        self.dmmv_mxfp4_moe_sg_pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
+        self.dmmv_q8_0_lmhead_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
         self.dmmv_q8_0_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048");
+        self.dmmv_q8_0_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096");
+        self.dmmv_q8_0_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096_quad");
+        self.dmmv_q8_0_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_quad");
+        self.dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+        self.dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
         self.dmmv_q8_0_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual");
+        self.dmmv_q8_0_pair_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
+        self.dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
         self.dmmv_q8_0_k2048_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_fused_norm");
         self.dmmv_q8_0_dual_fused_norm_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_dual_fused_norm");
         self.dmmv_q8_0_repacked_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked");
+        self.dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
+        self.dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
+        self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
+        self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
+        self.dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
+        self.dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
+        self.dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
+        self.dmmv_q8_0_repacked_k2048_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_qwen");
+        self.dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
         self.dmmv_f16_pipe = try loadShaderPipeline(ctx, "dmmv_f16");
         self.dmmv_f32_pipe = try loadShaderPipeline(ctx, "dmmv_f32");
+        self.dmmv_f32_dual_small_pipe = try loadShaderPipeline(ctx, "dmmv_f32_dual_small");
         self.dmmv_q4k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe");
+        self.dmmv_q4k_moe_gate_up_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
+        self.dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
+        self.dmmv_q4k_dense_gate_up_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_swiglu");
+        self.dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
         self.dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
+        self.dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
         self.dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
+        self.dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
+        self.dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
+        self.dmmv_q5k_moe_k512_tri_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_tri");
+        self.dmmv_q5k_moe_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_quad");
         self.dmmv_q5k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048");
         self.dmmv_q6k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe");
+        self.dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
         self.dmmv_q4k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048");
         self.dmmv_q4k_moe_k2048_1024_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048_1024");
+        self.dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+        self.dmmv_q4k_moe_gate_up_dual_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
+        self.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_swiglu_k2048");
 
         // Elementwise pipelines for batched GPU dispatch
         self.deinterleave_pipe = try loadShaderPipeline(ctx, "deinterleave");
@@ -1556,26 +3233,65 @@ pub const InferenceEngine = struct {
         self.kv_cache_write_q8_pipe = try loadShaderPipeline(ctx, "kv_cache_write_q8");
         self.rope_pipe = try loadShaderPipeline(ctx, "rope_fused");
         self.rope_native_pipe = try loadShaderPipeline(ctx, "rope_native");
+        self.rope_kv_cache_write_pipe = try loadShaderPipeline(ctx, "rope_kv_cache_write");
         self.sigmoid_mul_pipe = try loadShaderPipeline(ctx, "sigmoid_mul");
         self.geglu_pipe = try loadShaderPipeline(ctx, "geglu");
         self.geglu_batched_pipe = try loadShaderPipeline(ctx, "geglu_batched");
         self.swiglu_pipe = try loadShaderPipeline(ctx, "swiglu");
         self.swiglu_batched_pipe = try loadShaderPipeline(ctx, "swiglu_batched");
+        self.swiglu_oai_batched_bias_pipe = try loadShaderPipeline(ctx, "swiglu_oai_batched_bias");
         self.scale_acc_pipe = try loadShaderPipeline(ctx, "scale_accumulate");
+        self.scale_in_place_pipe = try loadShaderPipeline(ctx, "scale_in_place");
+        self.add_bias_pipe = try loadShaderPipeline(ctx, "add_bias");
         self.rms_norm_pipe = try loadShaderPipeline(ctx, "rms_norm_mul");
+        self.rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
+        self.gemma_moe_post_norm_residual_pipe = try loadShaderPipeline(ctx, "gemma_moe_post_norm_residual");
         self.moe_acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate");
         self.moe_acc_batched_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
+        self.moe_acc_batched_bias_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias");
+        self.moe_acc_batched_bias_routed_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched_bias_routed");
         self.softmax_topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
+        self.softmax_topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
+        self.softmax_topk_weight_bias_pipe = try loadShaderPipeline(ctx, "softmax_topk_weight_bias");
+        self.router_f32_topk_bias_pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
+        self.router_f32_topk_batched_pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
+        self.router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
+        self.router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_k2048");
+        self.router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_repacked_k2048");
+        self.softmax_topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
+        self.moe_route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
+        self.moe_route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+        self.moe_route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
+        self.moe_route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
+        self.moe_route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
+        self.moe_route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
+        self.moe_route_scatter_shared_residual_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
+        self.moe_route_scatter_shared_residual_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual_gate_f32");
+        self.moe_route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
+        self.moe_route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
         self.sigmoid_scale_acc_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc");
+        self.sigmoid_scale_acc_batched_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc_batched");
         self.moe_weighted_acc_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc");
+        self.moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
         self.residual_rms_norm_pipe = try loadShaderPipeline(ctx, "residual_rms_norm");
+        self.residual_rms_norm_router_q8_0_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk");
+        self.residual_rms_norm_router_q8_0_topk_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_k2048");
+        self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
+        self.residual_rms_norm_router_f32_topk_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
+        self.post_norm_residual_rms_norm_pipe = try loadShaderPipeline(ctx, "post_norm_residual_rms_norm");
         self.moe_weighted_acc_shared_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared");
+        self.moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+        self.moe_weighted_acc_shared_gate_f32_qwen2048_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
+        self.moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048_norm");
         self.copy_u32_pipe = try loadShaderPipeline(ctx, "copy_u32");
         self.copy_f32_pipe = try loadShaderPipeline(ctx, "copy_f32");
         self.zero_f32_pipe = try loadShaderPipeline(ctx, "zero_f32");
         self.argmax_pipe = try loadShaderPipeline(ctx, "argmax");
         self.gemm_q4k_pipe = try loadShaderPipeline(ctx, "gemm_q4k");
+        self.gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
         self.gemm_q6k_pipe = try loadShaderPipeline(ctx, "gemm_q6k");
+        self.gemm_q8_0_pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
+        self.gemm_f32_small_pipe = try loadShaderPipeline(ctx, "gemm_f32_small");
         self.flash_attn_batched_pipe = try loadShaderPipeline(ctx, "flash_attn_batched");
         self.flash_attn_batched_q8_pipe = try loadShaderPipeline(ctx, "flash_attn_batched_q8");
         self.rope_batched_pipe = try loadShaderPipeline(ctx, "rope_batched");
@@ -1712,7 +3428,14 @@ pub const InferenceEngine = struct {
 
         // SSM GPU pipelines
         self.ssm_conv1d_pipe = try loadShaderPipeline(ctx, "ssm_conv1d");
+        self.ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
+        self.ssm_conv1d_prefill_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
+        self.ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
         self.ssm_delta_net_pipe = try loadShaderPipeline(ctx, "ssm_delta_net");
+        self.ssm_delta_net_offset_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
+        self.ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+        self.ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+        self.ssm_delta_net_gated_norm_qwen_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm_qwen");
         self.ssm_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_gated_norm");
 
         // SSM state + constants as Metal buffers (GPU-resident via UMA)
@@ -1905,10 +3628,12 @@ pub const InferenceEngine = struct {
             }
         }
         if (self.private_decode_buffers) {
+            self.private_router_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_qkv_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_gate_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             self.private_ssm_out_bufs = try allocator.alloc(MetalBuffer, cfg.n_layers);
             for (0..cfg.n_layers) |i| {
+                self.private_router_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_qkv_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_gate_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
                 self.private_ssm_out_bufs.?[i] = .{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
@@ -1917,33 +3642,85 @@ pub const InferenceEngine = struct {
             const has_repacked = self.dmmv_q8_0_repacked_pipe.handle != null;
             var need_gpu_copy = false;
             var cmd: MetalCommand = undefined;
+            var private_repacked_count: u32 = 0;
+            var private_repacked_bytes: usize = 0;
+            var private_router_repacked_count: u32 = 0;
+            var private_router_repacked_bytes: usize = 0;
             for (0..cfg.n_layers) |i| {
+                if (self.layer_tensors[i].ffn_gate_inp) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenRouterPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_router_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_router_repacked_count += 1;
+                            private_router_repacked_bytes += size_bytes;
+                        }
+                    } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
+                        if (!need_gpu_copy) {
+                            cmd = try metal_command.beginCommand(ctx);
+                            need_gpu_copy = true;
+                        }
+                        self.private_router_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
+                        dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_router_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
+                    }
+                }
                 if (self.layer_tensors[i].attn_qkv) |tensor| {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_qkv_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_qkv_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_qkv_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
-                        if (!need_gpu_copy) { cmd = try metal_command.beginCommand(ctx); need_gpu_copy = true; }
+                        if (!need_gpu_copy) {
+                            cmd = try metal_command.beginCommand(ctx);
+                            need_gpu_copy = true;
+                        }
                         self.private_ssm_qkv_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
                         dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_ssm_qkv_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
+                    }
+                } else if (self.layer_tensors[i].attn_q) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_qkv_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        }
                     }
                 }
                 if (self.layer_tensors[i].attn_gate) |tensor| {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_gate_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_gate_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_gate_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
-                        if (!need_gpu_copy) { cmd = try metal_command.beginCommand(ctx); need_gpu_copy = true; }
+                        if (!need_gpu_copy) {
+                            cmd = try metal_command.beginCommand(ctx);
+                            need_gpu_copy = true;
+                        }
                         self.private_ssm_gate_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
                         dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_ssm_gate_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
                     }
@@ -1952,25 +3729,60 @@ pub const InferenceEngine = struct {
                     const size_bytes: usize = @intCast(tensor.info.sizeBytes());
                     const t_K: u32 = @intCast(tensor.info.dims[0]);
                     if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
-                        var buf = try metal_buffer.createBuffer(ctx, size_bytes);
-                        buf.is_repacked_q8 = true;
                         const t_M: u32 = @intCast(tensor.info.dims[1]);
-                        repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
-                        self.private_ssm_out_bufs.?[i] = buf;
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_out_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        } else {
+                            var buf = try metal_buffer.createBuffer(ctx, size_bytes);
+                            buf.is_repacked_q8 = true;
+                            repackQ8_0Blocks(tensor.gpu_buffer.cpu_ptr.? + tensorPageOffset(model, tensor), buf.cpu_ptr.?, t_M, t_K);
+                            self.private_ssm_out_bufs.?[i] = buf;
+                        }
                     } else if (tensor.info.type_ == .q8_0 and size_bytes % @sizeOf(u32) == 0) {
-                        if (!need_gpu_copy) { cmd = try metal_command.beginCommand(ctx); need_gpu_copy = true; }
+                        if (!need_gpu_copy) {
+                            cmd = try metal_command.beginCommand(ctx);
+                            need_gpu_copy = true;
+                        }
                         self.private_ssm_out_bufs.?[i] = try metal_buffer.createPrivateBuffer(ctx, size_bytes);
                         dispatchCopyU32OnCmd(&self, &cmd, &tensor.gpu_buffer, &self.private_ssm_out_bufs.?[i], @intCast(size_bytes / @sizeOf(u32)), @intCast(tensorPageOffset(model, tensor) / @sizeOf(u32)), 0);
+                    }
+                } else if (self.layer_tensors[i].attn_output) |tensor| {
+                    const size_bytes: usize = @intCast(tensor.info.sizeBytes());
+                    const t_K: u32 = @intCast(tensor.info.dims[0]);
+                    if (tensor.info.type_ == .q8_0 and has_repacked and canRepackQ8(t_K)) {
+                        const t_M: u32 = @intCast(tensor.info.dims[1]);
+                        if (preferApple9QwenSsmPrivateRepackedQ8(cfg, tensor, t_M, t_K)) {
+                            self.private_ssm_out_bufs.?[i] = try self.createPrivateRepackedQ8Buffer(tensor, size_bytes, t_M, t_K);
+                            private_repacked_count += 1;
+                            private_repacked_bytes += size_bytes;
+                        }
                     }
                 }
             }
             if (need_gpu_copy) cmd.commitAndWait();
+            if (private_router_repacked_count > 0) {
+                log.info("Metal: private-repacked {d} Qwen router Q8_0 tensors ({d:.2} MiB) for coalesced top-k", .{
+                    private_router_repacked_count,
+                    @as(f64, @floatFromInt(private_router_repacked_bytes)) / (1024.0 * 1024.0),
+                });
+            }
+            if (private_repacked_count > 0) {
+                log.info("Metal: private-repacked {d} Qwen SSM/full-attn Q8_0 tensors ({d:.2} GiB) for coalesced access", .{
+                    private_repacked_count,
+                    @as(f64, @floatFromInt(private_repacked_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                });
+            }
         }
 
         log.debug("Metal inference engine initialized: {d} layers, {d}x{d} heads, dim={d}", .{
             cfg.n_layers, cfg.n_heads, cfg.head_dim, cfg.hidden_dim,
         });
         log.debug("Metal decode buffers: {s}", .{if (self.private_decode_buffers) "private+staged-readback" else "shared"});
+        if (self.gemma_moe_validation_enabled) {
+            log.info("Gemma MoE validation enabled for layer 0 position 0", .{});
+        }
         if (self.q8_tg_override) |tg| {
             log.debug("Metal q8_0 threadgroup override: {d}", .{tg});
         }
@@ -2001,7 +3813,7 @@ pub const InferenceEngine = struct {
             },
         );
         log.debug(
-            "Metal pipeline caps: dmmv_q4k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q6k_moe tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048_1024 tw={d} max={d} stgmem={d}",
+            "Metal pipeline caps: dmmv_q4k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k512 tw={d} max={d} stgmem={d} | dmmv_q5k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q6k_moe tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048 tw={d} max={d} stgmem={d} | dmmv_q4k_moe_k2048_1024 tw={d} max={d} stgmem={d}",
             .{
                 self.dmmv_q4k_moe_pipe.thread_execution_width,
                 self.dmmv_q4k_moe_pipe.max_threads_per_threadgroup,
@@ -2009,6 +3821,9 @@ pub const InferenceEngine = struct {
                 self.dmmv_q5k_moe_pipe.thread_execution_width,
                 self.dmmv_q5k_moe_pipe.max_threads_per_threadgroup,
                 self.dmmv_q5k_moe_pipe.static_threadgroup_memory_length,
+                self.dmmv_q5k_moe_k512_pipe.thread_execution_width,
+                self.dmmv_q5k_moe_k512_pipe.max_threads_per_threadgroup,
+                self.dmmv_q5k_moe_k512_pipe.static_threadgroup_memory_length,
                 self.dmmv_q5k_moe_k2048_pipe.thread_execution_width,
                 self.dmmv_q5k_moe_k2048_pipe.max_threads_per_threadgroup,
                 self.dmmv_q5k_moe_k2048_pipe.static_threadgroup_memory_length,
@@ -2037,11 +3852,121 @@ pub const InferenceEngine = struct {
             },
         );
 
+        // Wire engine-owned scratch + KV cache + per-layer norm buffers into
+        // a residency set, mirroring the model loader's weight residency set
+        // (loader_metal.zig:weight_rset). Required because the engine uses
+        // `commandBufferWithUnretainedReferences` (shim.m:mtl_begin_command_mode),
+        // which disables Metal's per-command-buffer auto-residency tracking.
+        // Cycle 57 saw the weight residency set move decode 0.2 → 3.4 tok/s on
+        // the dense 31B; the scratch buffers (KV cache, hidden/q/k/v/gate/up/
+        // down/swiglu, per-layer norms) are touched on every layer too and
+        // share the same paging pressure.
+        if (shim.mtl_rset_supported() != 0) {
+            // Generous capacity estimate: 30 standalone scratch + 4*n_experts_used
+            //   + 2*n_layers (KV cache) + 6*n_layers (norms) + ssm slack.
+            const capacity_estimate: u32 = @intCast(64 +
+                4 * cfg.n_experts_used +
+                @as(usize, 8) * cfg.n_layers +
+                @as(usize, 8) * cfg.n_layers);
+            if (shim.mtl_rset_create(ctx, capacity_estimate)) |rs| {
+                self.addScratchToResidencySet(rs);
+                shim.mtl_rset_commit_and_request(rs);
+                self.scratch_rset = rs;
+                log.info("Metal engine wired scratch + KV cache + norm buffers into MTLResidencySet", .{});
+            } else {
+                log.warn("Metal engine: scratch MTLResidencySet creation failed; scratch remains pageable", .{});
+            }
+        }
+
         return self;
+    }
+
+    /// Add every persistently-allocated engine buffer to the given residency
+    /// set. Buffers with null handles (uninitialized optionals or Gemma
+    /// SWA-only layers) are skipped by `mtl_rset_add_buffer`.
+    fn addScratchToResidencySet(self: *InferenceEngine, rs: *shim.MetalRSet) void {
+        const add = struct {
+            fn one(set: *shim.MetalRSet, buf: *const MetalBuffer) void {
+                if (buf.handle) |h| shim.mtl_rset_add_buffer(set, h);
+            }
+        }.one;
+
+        add(rs, &self.hidden_buf);
+        add(rs, &self.residual_buf);
+        add(rs, &self.norm_buf);
+        add(rs, &self.q_buf);
+        add(rs, &self.k_buf);
+        add(rs, &self.v_buf);
+        add(rs, &self.attn_out_buf);
+        add(rs, &self.gate_buf);
+        add(rs, &self.up_buf);
+        add(rs, &self.swiglu_buf);
+        add(rs, &self.down_buf);
+        add(rs, &self.moe_out_buf);
+        add(rs, &self.router_logits_buf);
+        add(rs, &self.router_output_buf);
+        add(rs, &self.logits_buf);
+        add(rs, &self.logits_readback_buf);
+        add(rs, &self.argmax_buf);
+        add(rs, &self.embed_staging);
+        add(rs, &self.prefill_embed_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_norm_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_qkv_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_z_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_alpha_buf);
+        add(rs, &self.qwen_ssm_prefill_proj_beta_buf);
+        add(rs, &self.qwen_ssm_prefill_branch_buf);
+        add(rs, &self.lm_head_private_buf);
+        add(rs, &self.expert_ids_buf);
+        add(rs, &self.expert_gate_batch_buf);
+        add(rs, &self.expert_up_batch_buf);
+        add(rs, &self.expert_swiglu_batch_buf);
+        add(rs, &self.expert_down_batch_buf);
+
+        for (self.expert_gate_bufs) |*b| add(rs, b);
+        for (self.expert_up_bufs) |*b| add(rs, b);
+        for (self.expert_swiglu_bufs) |*b| add(rs, b);
+        for (self.expert_down_bufs) |*b| add(rs, b);
+
+        for (self.kv_k_cache) |*b| add(rs, b);
+        for (self.kv_v_cache) |*b| add(rs, b);
+        add(rs, &self.page_table_buf);
+        add(rs, &self.attn_sinks_buf);
+
+        for (self.attn_norm_bufs) |*b| add(rs, b);
+        for (self.attn_q_norm_bufs) |*b| add(rs, b);
+        for (self.attn_k_norm_bufs) |*b| add(rs, b);
+        for (self.post_attn_norm_bufs) |*b| add(rs, b);
+        for (self.ffn_norm_bufs) |*b| add(rs, b);
+        for (self.post_ffn_norm_bufs) |*b| add(rs, b);
+        add(rs, &self.final_norm_gpu);
+        add(rs, &self.unit_rms_norm_weights);
+        add(rs, &self.rope_freq_buf);
+        add(rs, &self.rope_variant_freq_buf);
+
+        if (self.ssm_conv_state_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.ssm_state_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.ssm_conv_kernel_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.ssm_dt_bias_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.ssm_a_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.ssm_norm_weight_bufs) |bufs| for (bufs) |*b| add(rs, b);
+
+        if (self.private_router_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.private_ssm_qkv_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.private_ssm_gate_bufs) |bufs| for (bufs) |*b| add(rs, b);
+        if (self.private_ssm_out_bufs) |bufs| for (bufs) |*b| add(rs, b);
     }
 
     /// Release all GPU buffers, pipelines, and associated resources.
     pub fn deinit(self: *InferenceEngine) void {
+        // The scratch residency set holds (retained) MTLBuffer references.
+        // End its residency before freeing the underlying buffers so Metal
+        // stops tracking them first (matches loader_metal.zig:Model.deinit
+        // ordering).
+        if (self.scratch_rset) |rs| {
+            shim.mtl_rset_free(rs);
+            self.scratch_rset = null;
+        }
         metal_buffer.freeBuffer(&self.hidden_buf);
         metal_buffer.freeBuffer(&self.residual_buf);
         metal_buffer.freeBuffer(&self.norm_buf);
@@ -2060,12 +3985,35 @@ pub const InferenceEngine = struct {
         metal_buffer.freeBuffer(&self.logits_readback_buf);
         metal_buffer.freeBuffer(&self.argmax_buf);
         metal_buffer.freeBuffer(&self.embed_staging);
+        metal_buffer.freeBuffer(&self.prefill_embed_buf);
         metal_buffer.freeBuffer(&self.lm_head_private_buf);
         metal_buffer.freeBuffer(&self.expert_ids_buf);
         metal_buffer.freeBuffer(&self.expert_gate_batch_buf);
         metal_buffer.freeBuffer(&self.expert_up_batch_buf);
         metal_buffer.freeBuffer(&self.expert_swiglu_batch_buf);
         metal_buffer.freeBuffer(&self.expert_down_batch_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_norm_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_qkv_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_z_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_alpha_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_proj_validate_beta_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_layer_input_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_norm_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_routing_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_gate_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_up_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_down_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_hidden_before_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_post_hidden_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_gate_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_up_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_moe_route_validate_shared_down_ref_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_norm_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_qkv_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_z_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_alpha_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_proj_beta_buf);
+        metal_buffer.freeBuffer(&self.qwen_ssm_prefill_branch_buf);
 
         for (0..self.expert_gate_bufs.len) |i| {
             metal_buffer.freeBuffer(&self.expert_gate_bufs[i]);
@@ -2093,29 +4041,67 @@ pub const InferenceEngine = struct {
 
         metal_pipeline.freePipeline(&self.dmmv_q4k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_dual_llama_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_qk_dual_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_1024_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_lmhead_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_native_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q6k_llama_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_0_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_pipe);
         metal_pipeline.freePipeline(&self.dmmv_mxfp4_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_mxfp4_moe_sg_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_lmhead_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k4096_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k4096_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_k512_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_pair_swiglu_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_k2048_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_dual_fused_norm_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_quad_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k2048_qwen_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q8_0_repacked_k4096_qwen_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f16_pipe);
         metal_pipeline.freePipeline(&self.dmmv_f32_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_f32_dual_small_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_geglu_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_dense_gate_up_swiglu_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5_1_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_moe_cols_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_tri_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k512_quad_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q5k_moe_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q6k_moe_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q6k_moe_cols_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_pipe);
         metal_pipeline.freePipeline(&self.dmmv_q4k_moe_k2048_1024_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_dual_k2048_pipe);
+        metal_pipeline.freePipeline(&self.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
         metal_pipeline.freePipeline(&self.deinterleave_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_q8_pipe);
@@ -2123,26 +4109,65 @@ pub const InferenceEngine = struct {
         metal_pipeline.freePipeline(&self.kv_cache_write_q8_pipe);
         metal_pipeline.freePipeline(&self.rope_pipe);
         metal_pipeline.freePipeline(&self.rope_native_pipe);
+        metal_pipeline.freePipeline(&self.rope_kv_cache_write_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_mul_pipe);
         metal_pipeline.freePipeline(&self.geglu_pipe);
         metal_pipeline.freePipeline(&self.geglu_batched_pipe);
         metal_pipeline.freePipeline(&self.swiglu_pipe);
         metal_pipeline.freePipeline(&self.swiglu_batched_pipe);
+        metal_pipeline.freePipeline(&self.swiglu_oai_batched_bias_pipe);
         metal_pipeline.freePipeline(&self.scale_acc_pipe);
+        metal_pipeline.freePipeline(&self.scale_in_place_pipe);
+        metal_pipeline.freePipeline(&self.add_bias_pipe);
         metal_pipeline.freePipeline(&self.rms_norm_pipe);
+        metal_pipeline.freePipeline(&self.rms_norm_offset_pipe);
+        metal_pipeline.freePipeline(&self.gemma_moe_post_norm_residual_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_pipe);
         metal_pipeline.freePipeline(&self.moe_acc_batched_pipe);
+        metal_pipeline.freePipeline(&self.moe_acc_batched_bias_pipe);
+        metal_pipeline.freePipeline(&self.moe_acc_batched_bias_routed_pipe);
         metal_pipeline.freePipeline(&self.softmax_topk_pipe);
+        metal_pipeline.freePipeline(&self.softmax_topk_scaled_pipe);
+        metal_pipeline.freePipeline(&self.softmax_topk_weight_bias_pipe);
+        metal_pipeline.freePipeline(&self.router_f32_topk_bias_pipe);
+        metal_pipeline.freePipeline(&self.router_f32_topk_batched_pipe);
+        metal_pipeline.freePipeline(&self.router_q8_0_topk_pipe);
+        metal_pipeline.freePipeline(&self.router_q8_0_topk_k2048_pipe);
+        metal_pipeline.freePipeline(&self.router_q8_0_topk_repacked_k2048_pipe);
+        metal_pipeline.freePipeline(&self.softmax_topk_batched_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_pack_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_pack_blocks_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_ids_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_gather_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_set_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_shared_residual_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_shared_residual_gate_f32_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_scaled_pipe);
+        metal_pipeline.freePipeline(&self.moe_route_scatter_direct_scaled_pipe);
         metal_pipeline.freePipeline(&self.sigmoid_scale_acc_pipe);
+        metal_pipeline.freePipeline(&self.sigmoid_scale_acc_batched_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_scaled_pipe);
         metal_pipeline.freePipeline(&self.residual_rms_norm_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_k2048_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe);
+        metal_pipeline.freePipeline(&self.residual_rms_norm_router_f32_topk_pipe);
+        metal_pipeline.freePipeline(&self.post_norm_residual_rms_norm_pipe);
         metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_qwen2048_pipe);
+        metal_pipeline.freePipeline(&self.moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe);
         metal_pipeline.freePipeline(&self.copy_u32_pipe);
         metal_pipeline.freePipeline(&self.copy_f32_pipe);
         metal_pipeline.freePipeline(&self.zero_f32_pipe);
         metal_pipeline.freePipeline(&self.argmax_pipe);
         metal_pipeline.freePipeline(&self.gemm_q4k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q5k_pipe);
         metal_pipeline.freePipeline(&self.gemm_q6k_pipe);
+        metal_pipeline.freePipeline(&self.gemm_q8_0_pipe);
+        metal_pipeline.freePipeline(&self.gemm_f32_small_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_pipe);
         metal_pipeline.freePipeline(&self.flash_attn_batched_q8_pipe);
         metal_pipeline.freePipeline(&self.rope_batched_pipe);
@@ -2174,7 +4199,14 @@ pub const InferenceEngine = struct {
         self.allocator.free(self.layer_tensors);
 
         metal_pipeline.freePipeline(&self.ssm_conv1d_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_qwen_d4_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_pipe);
+        metal_pipeline.freePipeline(&self.ssm_conv1d_prefill_qwen_d4_pipe);
         metal_pipeline.freePipeline(&self.ssm_delta_net_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_offset_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_prefill_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_gated_norm_pipe);
+        metal_pipeline.freePipeline(&self.ssm_delta_net_gated_norm_qwen_pipe);
         metal_pipeline.freePipeline(&self.ssm_gated_norm_pipe);
 
         if (self.ssm_conv_state_bufs) |bufs| {
@@ -2206,6 +4238,10 @@ pub const InferenceEngine = struct {
             for (arr) |s| self.allocator.free(s);
             self.allocator.free(arr);
         }
+        if (self.private_router_bufs) |bufs| {
+            for (bufs) |*buf| metal_buffer.freeBuffer(buf);
+            self.allocator.free(bufs);
+        }
         if (self.private_ssm_qkv_bufs) |bufs| {
             for (bufs) |*buf| metal_buffer.freeBuffer(buf);
             self.allocator.free(bufs);
@@ -2229,10 +4265,13 @@ pub const InferenceEngine = struct {
             mutable.request_profile.sample_ns += profileElapsedNs(sample_start);
         };
 
-        if (self.config.final_logit_softcapping <= 0.0) if (self.argmax_buf.cpu_ptr) |ptr| {
+        // Final logit softcapping is monotonic, so it cannot change greedy
+        // argmax order. The LM-head path already writes argmax_buf; use it
+        // directly instead of rescanning Gemma's full vocab every token.
+        if (self.argmax_buf.cpu_ptr) |ptr| {
             const argmax_words: [*]const u32 = @ptrCast(@alignCast(ptr));
             return argmax_words[0];
-        };
+        }
 
         const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
         const logits = logits_ptr[0..self.config.vocab_size];
@@ -2269,6 +4308,13 @@ pub const InferenceEngine = struct {
         _ = self.normalizeRequestedContext(requested_context_tokens, 1);
         self.position = 0;
         self.request_profile.reset();
+        self.prefill_profile.reset();
+        self.qwen_ssm_proj_validate_captured_tokens = 0;
+        self.qwen_ssm_prefill_proj_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_active_tokens = 0;
+        self.qwen_ssm_prefill_branch_norm_active_tokens = 0;
+        self.qwen_moe_route_validate_target_tokens = 0;
+        self.qwen_moe_route_validate_failure_hint_emitted = false;
 
         if (self.ssm_conv_state_bufs) |bufs| {
             if (self.private_decode_buffers) {
@@ -2294,6 +4340,92 @@ pub const InferenceEngine = struct {
         }
     }
 
+    fn prefillBatchTokenMajorReference(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, target_context_tokens: u32) !void {
+        try self.resetRequestState(target_context_tokens);
+        state.position = 0;
+        state.generated_tokens.clearRetainingCapacity();
+
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbedding(token_id);
+            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null, 0);
+        }
+        state.position = self.position;
+    }
+
+    fn prefillBatchQwenRoutePackedFullValidate(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32, target_context_tokens: u32) !void {
+        // Validation-only replay of the production idea from llama.cpp
+        // `ggml_metal_op_mul_mat_id` and vLLM `moe_align_block_size`: run the
+        // layer-major route-packed candidate over the active prompt, then
+        // restore the token-major result so generation remains authoritative.
+        if (!self.canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(prompt_tokens.len, true)) {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[skipped]: route-packed candidate guard failed prompt_tokens={d}; running token-major reference only", .{prompt_tokens.len});
+            return self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+        }
+
+        try self.resetRequestState(target_context_tokens);
+        state.position = 0;
+        state.generated_tokens.clearRetainingCapacity();
+
+        self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens) catch |err| {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[failed]: candidate error={s}; running token-major reference only", .{@errorName(err)});
+            return self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+        };
+
+        const vocab: usize = @intCast(self.config.vocab_size);
+        const candidate_logits = try self.allocator.alloc(f32, vocab);
+        defer self.allocator.free(candidate_logits);
+        const logits_ptr: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+        @memcpy(candidate_logits, logits_ptr[0..vocab]);
+        const candidate_token = self.sampleGreedy();
+
+        try self.prefillBatchTokenMajorReference(state, prompt_tokens, target_context_tokens);
+
+        const ref_logits: [*]const f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+        var max_abs: f32 = 0.0;
+        var max_idx: usize = 0;
+        var sum_sq: f64 = 0.0;
+        for (0..vocab) |i| {
+            const diff = ref_logits[i] - candidate_logits[i];
+            const abs_diff = @abs(diff);
+            if (abs_diff > max_abs) {
+                max_abs = abs_diff;
+                max_idx = i;
+            }
+            sum_sq += @as(f64, diff) * @as(f64, diff);
+        }
+        const rms: f32 = @floatCast(@sqrt(sum_sq / @as(f64, @floatFromInt(vocab))));
+        const ref_token = self.sampleGreedy();
+        const tol: f32 = 5e-2;
+        const verdict: []const u8 = if (max_abs <= tol) "ok" else "failed";
+        if (max_abs <= tol) {
+            log.info("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[{s}]: prompt_tokens={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} ref_token={d} candidate_token={d} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                verdict,
+                prompt_tokens.len,
+                max_abs,
+                max_idx,
+                ref_logits[max_idx],
+                candidate_logits[max_idx],
+                rms,
+                tol,
+                ref_token,
+                candidate_token,
+            });
+        } else {
+            log.warn("ZINC_QWEN36_35B_ROUTE_PACK_VALIDATE_FULL[{s}]: prompt_tokens={d} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6} ref_token={d} candidate_token={d} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                verdict,
+                prompt_tokens.len,
+                max_abs,
+                max_idx,
+                ref_logits[max_idx],
+                candidate_logits[max_idx],
+                rms,
+                tol,
+                ref_token,
+                candidate_token,
+            });
+        }
+    }
+
     /// Run prompt prefill by replaying the decode path for each prompt token.
     pub fn prefillBatch(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
@@ -2312,11 +4444,528 @@ pub const InferenceEngine = struct {
         } else if (state.position != self.position) {
             return error.KvStateNotAvailable;
         }
-
-        for (prompt_tokens) |token_id| {
-            try self.loadTokenEmbedding(token_id);
-            try runDecodeStep(self);
+        if (qwenRoutePackedFullValidationEnabled() and
+            state.position == 0 and
+            state.generated_tokens.items.len == 0 and
+            !self.qwen_prefill_validation_enabled)
+        {
+            return self.prefillBatchQwenRoutePackedFullValidate(state, prompt_tokens, target_context_tokens);
         }
+        self.qwen_moe_route_validate_target_tokens = if (self.qwen_prefill_validation_enabled)
+            qwenMoeRoutePackValidateTokensForPrompt(prompt_tokens.len)
+        else
+            0;
+
+        if (self.canUseQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            return self.prefillBatchQueuedTokenMajor(state, prompt_tokens);
+        }
+
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbedding(token_id);
+            try runDecodeStep(self, i + 1 == prompt_tokens.len, null, 0, null, null, 0);
+        }
+        state.position = self.position;
+    }
+
+    fn canUseQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (prompt_len <= 1 or prompt_len > queued_prefill_embed_tokens) return false;
+        if (!self.private_decode_buffers) return false;
+        if (self.debug_validation_enabled or self.gemma_moe_validation_enabled or self.qwen_prefill_validation_enabled) return false;
+        if (self.config.n_experts == 0) return false;
+
+        const hidden_dim = self.config.hidden_dim;
+        const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else hidden_dim * 4;
+        for (self.layer_tensors, 0..) |lt, layer_idx| {
+            if (canUseGpuRoutedBatchedMoe(self, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(self, lt, layer_idx, hidden_dim, inter_dim)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn prefillBatchQueuedTokenMajor(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        // Mirror llama.cpp's Metal graph submission style: encode/commit the
+        // token-major prompt graph ahead of the CPU and synchronize only at the
+        // final prompt token. SSM recurrence and MoE routing stay on the existing
+        // per-token path; Qwen3.6 can additionally precompute layer-0 SSM
+        // projections over the queued prompt embeddings.
+        if (self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_tokens.len)) {
+            return self.prefillBatchQueuedTokenMajorSingleCommand(state, prompt_tokens);
+        }
+
+        const hidden_dim = self.config.hidden_dim;
+        const hidden_dim_usize: usize = @intCast(hidden_dim);
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
+        }
+        const pending_token_count = prompt_tokens.len - 1;
+        const pending_capacity = pending_token_count + 1;
+        var pending = try self.allocator.alloc(MetalCommand, pending_capacity);
+        defer self.allocator.free(pending);
+        for (pending) |*cmd| {
+            cmd.* = .{
+                .handle = null,
+                .dispatch_count = 0,
+                .barrier_count = 0,
+                .barrier_enabled = false,
+            };
+        }
+        defer releaseCommands(pending);
+
+        var pending_count: usize = 0;
+        if (try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &pending[pending_count])) {
+            pending_count += 1;
+        }
+
+        for (prompt_tokens[0..pending_token_count], 0..) |_, i| {
+            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+            const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                &self.qwen_ssm_prefill_branch_buf
+            else
+                &self.prefill_embed_buf;
+            try runDecodeStep(self, false, embed_src, embed_offset, &pending[pending_count], null, 0);
+            pending_count += 1;
+        }
+
+        const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
+        const final_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > pending_token_count)
+            &self.qwen_ssm_prefill_branch_buf
+        else
+            &self.prefill_embed_buf;
+        try runDecodeStep(self, true, final_src, final_offset, null, null, 0);
+        state.position = self.position;
+    }
+
+    fn canUseSingleCommandQueuedTokenMajorPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        if (!self.canUseQueuedTokenMajorPrefill(prompt_len)) return false;
+        if (!defaultQwen36SsmPrefillProjectionEnabled(self.config)) return false;
+        if (shouldCpuLmHeadFallback(self)) return false;
+        return true;
+    }
+
+    fn canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(self: *const InferenceEngine, prompt_len: usize, force_f32_shared_gate: bool) bool {
+        if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
+        if (!self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_len)) return false;
+        if (self.config.architecture != .qwen2_moe or
+            self.config.hidden_dim != 2048 or
+            self.config.ssm_d_inner != 4096 or
+            self.config.n_experts != 256 or
+            self.config.n_experts_used != 8)
+        {
+            return false;
+        }
+        if (self.layer_tensors.len == 0 or isFullAttentionLayer(self.config, 0)) return false;
+        if (!canUseQwenSsmPrefillProjectionChunk(self, prompt_len)) return false;
+        if (!canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, force_f32_shared_gate)) return false;
+
+        const lt = self.layer_tensors[0];
+        if (!canUseGpuRoutedBatchedMoe(self, lt)) return false;
+        const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else self.config.hidden_dim * 4;
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, self.config.hidden_dim) catch return false;
+        const down_exps = lt.ffn_down_exps orelse return false;
+        const router_t = lt.ffn_gate_inp orelse return false;
+        if (!canUseQwenRoutePackedPrefixRouter(self, router_t, prompt_len)) return false;
+        if (!supportsQwenMoeRoutePackCols(self, gate_up_layout.gate_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, gate_up_layout.up_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, down_exps.info.type_))
+        {
+            return false;
+        }
+        if (self.moe_route_pack_pipe.handle == null or
+            self.moe_route_gather_pipe.handle == null or
+            self.moe_route_scatter_pipe.handle == null or
+            self.moe_route_scatter_set_pipe.handle == null or
+            self.swiglu_batched_pipe.handle == null or
+            self.scale_acc_pipe.handle == null)
+        {
+            return false;
+        }
+        if (lt.ffn_gate_shexp) |gate| {
+            const up = lt.ffn_up_shexp orelse return false;
+            const down = lt.ffn_down_shexp orelse return false;
+            if (!canUseQwenSharedBatchedGemm(self, gate.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, up.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, down.info.type_))
+            {
+                return false;
+            }
+            if (lt.ffn_gate_inp_shexp) |gate_inp| {
+                if (!canUseQwenSharedGateInputBatched(self, gate_inp, self.config.hidden_dim)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn canUseQwenLayer0RoutePackedPrefill(self: *const InferenceEngine, prompt_len: usize) bool {
+        const force_f32_shared_gate = if (getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw|
+            std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")
+        else
+            false;
+        if (getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+            if (std.mem.eql(u8, raw, "0")) return false;
+        }
+        return self.canUseQwenLayer0RoutePackedPrefillWithSharedGateMode(prompt_len, force_f32_shared_gate);
+    }
+
+    fn queuedTokenMajorEarlyCommitTokens(prompt_len: usize) usize {
+        if (prompt_len < 64) return 0;
+        if (readU32Env("ZINC_QWEN36_PREFILL_EARLY_TOKENS")) |requested| {
+            return @min(prompt_len / 2, @as(usize, @intCast(requested)));
+        }
+
+        // Adapt llama.cpp `ggml-metal-context.m::ggml_metal_graph_compute`:
+        // commit a small leading graph slice so the GPU starts while the CPU
+        // records the remaining command buffer. Qwen token-major prefill has
+        // enough GPU work per token that the prior 10% node-style heuristic is
+        // too shallow on the Effort 16 verifier, so keep the useful 16-token
+        // front slice directly.
+        return @min(prompt_len / 2, @as(usize, 16));
+    }
+
+    fn logQwenLayer0RoutePackedPrefillBlocker(self: *const InferenceEngine, prompt_len: usize) void {
+        if (!self.profile_enabled) return;
+
+        if (getenv("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL")) |raw| {
+            if (std.mem.eql(u8, raw, "0")) {
+                log.info("Metal profile: Qwen route-packed prefill disabled: ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=0", .{});
+                return;
+            }
+        }
+        if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: prompt_len={d} outside [32,{d}]", .{ prompt_len, queued_prefill_embed_tokens });
+            return;
+        }
+        if (!self.canUseSingleCommandQueuedTokenMajorPrefill(prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: single-command token-major guard failed", .{});
+            return;
+        }
+        if (self.config.architecture != .qwen2_moe or
+            self.config.hidden_dim != 2048 or
+            self.config.ssm_d_inner != 4096 or
+            self.config.n_experts != 256 or
+            self.config.n_experts_used != 8)
+        {
+            log.info("Metal profile: Qwen route-packed prefill disabled: model shape arch={s} hidden={d} ssm_d_inner={d} experts={d} used={d}", .{
+                @tagName(self.config.architecture),
+                self.config.hidden_dim,
+                self.config.ssm_d_inner,
+                self.config.n_experts,
+                self.config.n_experts_used,
+            });
+            return;
+        }
+        if (self.layer_tensors.len == 0 or isFullAttentionLayer(self.config, 0)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 is unavailable or full-attention", .{});
+            return;
+        }
+
+        const lt = self.layer_tensors[0];
+        const inter_dim: u32 = if (self.config.intermediate_dim > 0) self.config.intermediate_dim else self.config.hidden_dim * 4;
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, self.config.hidden_dim) catch {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 MoE gate/up tensors missing", .{});
+            return;
+        };
+        const down_exps = lt.ffn_down_exps orelse {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 ffn_down_exps missing", .{});
+            return;
+        };
+        if (!supportsQwenMoeRoutePackCols(self, gate_up_layout.gate_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, gate_up_layout.up_tensor.info.type_) or
+            !supportsQwenMoeRoutePackCols(self, down_exps.info.type_))
+        {
+            log.info("Metal profile: Qwen route-packed prefill disabled: route-pack cols unsupported gate={s} up={s} down={s}", .{
+                @tagName(gate_up_layout.gate_tensor.info.type_),
+                @tagName(gate_up_layout.up_tensor.info.type_),
+                @tagName(down_exps.info.type_),
+            });
+            return;
+        }
+        if (lt.ffn_gate_shexp) |gate| {
+            const up = lt.ffn_up_shexp orelse {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared up expert missing", .{});
+                return;
+            };
+            const down = lt.ffn_down_shexp orelse {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared down expert missing", .{});
+                return;
+            };
+            if (!canUseQwenSharedBatchedGemm(self, gate.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, up.info.type_) or
+                !canUseQwenSharedBatchedGemm(self, down.info.type_))
+            {
+                log.info("Metal profile: Qwen route-packed prefill disabled: shared expert batched GEMM unsupported gate={s} up={s} down={s}", .{
+                    @tagName(gate.info.type_),
+                    @tagName(up.info.type_),
+                    @tagName(down.info.type_),
+                });
+                return;
+            }
+            if (lt.ffn_gate_inp_shexp) |gate_inp| {
+                if (!canUseQwenSharedGateInputBatched(self, gate_inp, self.config.hidden_dim)) {
+                    log.info("Metal profile: Qwen route-packed prefill disabled: shared gate input fused/batched unsupported type={s} dims=({d},{d},{d},{d})", .{
+                        @tagName(gate_inp.info.type_),
+                        gate_inp.info.dims[0],
+                        gate_inp.info.dims[1],
+                        gate_inp.info.dims[2],
+                        gate_inp.info.dims[3],
+                    });
+                    return;
+                }
+            }
+        }
+        if (!canUseQwenSsmPrefillProjectionChunk(self, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 SSM projection chunk guard failed", .{});
+            return;
+        }
+        if (!canUseQwenRoutePackedPrefixRouter(self, lt.ffn_gate_inp orelse {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 router tensor missing", .{});
+            return;
+        }, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 router batched top-k unsupported", .{});
+            return;
+        }
+        if (!canUseQwenRoutePackedPrefixSsmLayer(self, 0, prompt_len)) {
+            log.info("Metal profile: Qwen route-packed prefill disabled: layer0 route-packed SSM layer guard failed", .{});
+            logQwenRoutePackedPrefixSsmLayerBlocker(self, 0, prompt_len, false);
+            if (canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(self, 0, prompt_len, true)) {
+                log.info("Metal profile: Qwen route-packed prefill candidate available behind ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 (F32 shared-gate path)", .{});
+                logRoutePackCandidateBlocks(@intCast(prompt_len), self.config.n_experts, self.config.n_experts_used);
+            }
+            return;
+        }
+        log.info("Metal profile: Qwen route-packed prefill disabled: unknown guard mismatch", .{});
+    }
+
+    fn prefillBatchQueuedTokenMajorSingleCommand(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        // For Qwen3.6 hybrid prefill there are no CPU routing reads in the hot
+        // path, so long prompt graphs can be queued in a small number of ordered
+        // command buffers. llama.cpp's ggml_metal_graph_compute reports 1-2
+        // command buffers as the practical sweet spot; submit a small leading
+        // chunk so the GPU starts while the CPU records the long tail.
+        const hidden_dim = self.config.hidden_dim;
+        const hidden_dim_usize: usize = @intCast(hidden_dim);
+        for (prompt_tokens, 0..) |token_id, i| {
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, i * hidden_dim_usize);
+        }
+
+        if (self.canUseQwenLayer0RoutePackedPrefill(prompt_tokens.len)) {
+            return self.prefillBatchQwenLayer0RoutePacked(state, prompt_tokens);
+        }
+        self.logQwenLayer0RoutePackedPrefillBlocker(prompt_tokens.len);
+
+        var precompute_cmd = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (precompute_cmd.handle != null) precompute_cmd.wait();
+        _ = try prepareQwenSsmPrefillProjectionChunk(self, prompt_tokens.len, &precompute_cmd);
+
+        const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
+        const pending_token_count = prompt_tokens.len - 1;
+        const split_token: usize = queuedTokenMajorEarlyCommitTokens(prompt_tokens.len);
+        var first_prompt_cmd = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+
+        if (split_token > 0) {
+            first_prompt_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+            for (prompt_tokens[0..split_token], 0..) |_, i| {
+                const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+                const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                    &self.qwen_ssm_prefill_branch_buf
+                else
+                    &self.prefill_embed_buf;
+                try runDecodeStep(self, false, embed_src, embed_offset, null, &first_prompt_cmd, 0);
+            }
+            commitAsyncProfiled(&first_prompt_cmd, profile);
+        }
+
+        var prompt_cmd = try beginProfiledCommand(self, profile);
+        errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
+
+        for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
+            const embed_offset: u32 = @intCast(i * hidden_dim_usize);
+            const embed_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > i)
+                &self.qwen_ssm_prefill_branch_buf
+            else
+                &self.prefill_embed_buf;
+            try runDecodeStep(self, false, embed_src, embed_offset, null, &prompt_cmd, 0);
+        }
+        const final_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
+        const final_src = if (self.qwen_ssm_prefill_branch_norm_active_tokens > pending_token_count)
+            &self.qwen_ssm_prefill_branch_buf
+        else
+            &self.prefill_embed_buf;
+        try runDecodeStep(self, true, final_src, final_offset, null, &prompt_cmd, 0);
+        commitAndWaitProfiled(&prompt_cmd, profile);
+        state.position = self.position;
+    }
+
+    fn prefillBatchQwenLayer0RoutePacked(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
+        const cfg = self.config;
+        const hidden_dim = cfg.hidden_dim;
+        const hidden_dim_usize: usize = @intCast(hidden_dim);
+        const n_tokens: u32 = @intCast(prompt_tokens.len);
+        const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
+        const shexp_inter_dim: u32 = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+        const profile: ?*RuntimeProfile = if (self.profile_enabled) &self.request_profile else null;
+
+        const first_attn_dims = qwenFirstPrefixAttentionDims(self) orelse BatchedPrefillAttentionDims{ .max_q_dim = 1, .max_kv_dim = 1 };
+        var scratch = try BatchedPrefillScratch.init(self, n_tokens, first_attn_dims.max_q_dim, first_attn_dims.max_kv_dim, inter_dim);
+        defer scratch.deinit();
+
+        var layer0_cmd = try beginProfiledCommand(self, profile);
+        errdefer if (layer0_cmd.handle != null) layer0_cmd.wait();
+
+        // llama.cpp `ggml_metal_op_mul_mat_id` switches prompt-sized routed
+        // work to row-batched kernels at >=32 tokens, and vLLM keeps MoE
+        // prepare/finalize in token-major batches. Layer 0 was still using an
+        // older per-token SSM tail here; seed the scratch hidden matrix with
+        // embeddings and reuse the same layer-major Qwen SSM recorder that
+        // later prefix layers already use.
+        dispatchCopyF32OffsetOnCmd(self, &layer0_cmd, &self.prefill_embed_buf, &scratch.hidden, n_tokens * hidden_dim, 0, 0);
+        profileBarrier(&layer0_cmd, profile, .embed);
+        self.qwen_ssm_prefill_proj_active_tokens = n_tokens;
+        try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, 0, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+        if (self.profile_enabled) {
+            log.info("Metal profile: Qwen route-packed layer0 layer-major SSM active tokens={d}", .{n_tokens});
+        }
+
+        var route_packed_start_layer: usize = 1;
+        var route_packed_prefix_ssm_layers: u32 = 1;
+        var route_packed_prefix_attn_layers: u32 = 0;
+        const route_packed_prefix_layer_limit = qwenRoutePackedPrefixLayerLimit();
+        while (route_packed_start_layer < route_packed_prefix_layer_limit) {
+            if (canUseQwenRoutePackedPrefixSsmLayer(self, route_packed_start_layer, prompt_tokens.len)) {
+                try recordQwenRoutePackedPrefixSsmLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+                route_packed_start_layer += 1;
+                route_packed_prefix_ssm_layers += 1;
+                continue;
+            }
+            if (canUseQwenRoutePackedPrefixAttentionLayer(self, route_packed_start_layer, prompt_tokens.len)) {
+                try recordQwenRoutePackedPrefixAttentionLayerOnCmd(self, &layer0_cmd, profile, route_packed_start_layer, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+                route_packed_start_layer += 1;
+                route_packed_prefix_attn_layers += 1;
+                continue;
+            }
+            break;
+        }
+        if (profile != null) {
+            const stop_reason: []const u8 = if (route_packed_start_layer >= self.layer_tensors.len)
+                "model_end"
+            else if (route_packed_start_layer >= route_packed_prefix_layer_limit)
+                "limit"
+            else if (isFullAttentionLayer(cfg, route_packed_start_layer))
+                "attention_guard"
+            else
+                "ssm_guard";
+            const prefix_last_layer = if (route_packed_start_layer == 0) 0 else route_packed_start_layer - 1;
+            log.info("Metal profile: Qwen route-packed prefill prefix active layers=0..{d} total={d} ssm={d} attn={d} prompt_tokens={d} stop_layer={d} limit={d} stop={s}", .{
+                prefix_last_layer,
+                route_packed_start_layer,
+                route_packed_prefix_ssm_layers,
+                route_packed_prefix_attn_layers,
+                n_tokens,
+                route_packed_start_layer,
+                route_packed_prefix_layer_limit,
+                stop_reason,
+            });
+            if (route_packed_start_layer < self.layer_tensors.len and !isFullAttentionLayer(cfg, route_packed_start_layer)) {
+                logQwenRoutePackedPrefixSsmLayerBlocker(self, route_packed_start_layer, prompt_tokens.len, false);
+            }
+        }
+
+        commitAsyncProfiled(&layer0_cmd, profile);
+        var layer0_pending = layer0_cmd;
+        layer0_cmd = .{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (layer0_pending.handle != null) layer0_pending.wait();
+
+        if (route_packed_start_layer >= self.layer_tensors.len) {
+            // llama.cpp's Metal graph keeps prompt-sized work layer-major and
+            // materializes only requested graph outputs. Once the Qwen prefix
+            // reaches model_end, every prompt token's KV/SSM state and final
+            // hidden row already exist in scratch.hidden; avoid replaying
+            // token-major no-op decode steps just to advance position.
+            const tail_start = profileStart(profile != null);
+            if (profile) |p| {
+                p.decode_steps += n_tokens;
+                p.shared_cmd_steps += n_tokens;
+            }
+
+            var final_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (final_cmd.handle != null) final_cmd.wait();
+
+            const final_record_start = profileStart(profile != null);
+            dispatchRmsNormOnCmd(self, &final_cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
+            profileBarrier(&final_cmd, profile, .final);
+
+            const final_base = @as(usize, prompt_tokens.len - 1) * hidden_dim_usize;
+            if (shouldCpuLmHeadFallback(self)) {
+                commitAndWaitProfiled(&final_cmd, profile);
+                const norm_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.norm.cpu_ptr.?));
+                const out_ptr: [*]f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
+                try cpuLmHeadFallbackWithArgmax(self, norm_ptr + final_base, out_ptr);
+                if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            } else {
+                const x_offset_bytes: u32 = @intCast(final_base * @sizeOf(f32));
+                dispatchLmHeadWithInputOffset(self, &final_cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
+                profileBarrier(&final_cmd, profile, .final);
+                dispatchArgmaxOnCmd(self, &final_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
+                if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+                commitAndWaitProfiled(&final_cmd, profile);
+            }
+
+            waitCommandProfiled(&layer0_pending, profile);
+            self.position = @intCast(prompt_tokens.len);
+            state.position = self.position;
+            if (profile) |p| p.total_step_ns += profileElapsedNs(tail_start);
+            return;
+        }
+
+        self.position = 0;
+        const pending_token_count = prompt_tokens.len - 1;
+        const split_token: usize = queuedTokenMajorEarlyCommitTokens(prompt_tokens.len);
+
+        var first_prompt_cmd = MetalCommand{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+        defer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+
+        if (split_token > 0) {
+            first_prompt_cmd = try beginProfiledCommand(self, profile);
+            errdefer if (first_prompt_cmd.handle != null) first_prompt_cmd.wait();
+            for (prompt_tokens[0..split_token], 0..) |_, i| {
+                const hidden_offset: u32 = @intCast(i * hidden_dim_usize);
+                try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &first_prompt_cmd, route_packed_start_layer);
+            }
+            commitAsyncProfiled(&first_prompt_cmd, profile);
+        }
+
+        var prompt_cmd = try beginProfiledCommand(self, profile);
+        errdefer if (prompt_cmd.handle != null) prompt_cmd.wait();
+        for (prompt_tokens[split_token..pending_token_count], split_token..) |_, i| {
+            const hidden_offset: u32 = @intCast(i * hidden_dim_usize);
+            try runDecodeStep(self, false, &scratch.hidden, hidden_offset, null, &prompt_cmd, route_packed_start_layer);
+        }
+        const final_hidden_offset: u32 = @intCast(pending_token_count * hidden_dim_usize);
+        try runDecodeStep(self, true, &scratch.hidden, final_hidden_offset, null, &prompt_cmd, route_packed_start_layer);
+        commitAndWaitProfiled(&prompt_cmd, profile);
+        waitCommandProfiled(&layer0_pending, profile);
         state.position = self.position;
     }
 
@@ -2337,7 +4986,13 @@ pub const InferenceEngine = struct {
     /// exceeds 1e-3.
     pub fn prefillBatched(self: *InferenceEngine, state: *DecodeState, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
-        const mode = batchedPrefillMode();
+        const requested_mode = batchedPrefillMode();
+        const mode: BatchedPrefillMode = if (requested_mode == .off and
+            !batchedPrefillEnvPresent() and
+            shouldDefaultDenseGemmaBatchedPrefill(self))
+            .on
+        else
+            requested_mode;
         if (mode == .off or !canUseBatchedPrefill(self)) {
             return self.prefillBatch(state, prompt_tokens);
         }
@@ -2361,7 +5016,10 @@ pub const InferenceEngine = struct {
         const cfg = self.config;
         const hidden_dim = cfg.hidden_dim;
         const inter_dim: u32 = if (cfg.intermediate_dim > 0) cfg.intermediate_dim else hidden_dim * 4;
-        const attn = try resolveLayerAttentionParams(cfg, self.layer_tensors[0], hidden_dim, self.kv_cache_q8);
+        const shexp_inter_dim: u32 = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+        const attn_dims = try batchedPrefillAttentionDims(self);
+        const chunk_dense_gemma_prefill = cfg.architecture == .gemma and cfg.n_experts == 0;
+        const dense_gemma_prefill_chunk_layers: usize = 4;
 
         if (position_base == 0 and state.generated_tokens.items.len == 0) {
             try self.resetRequestState(target_context_tokens);
@@ -2369,51 +5027,66 @@ pub const InferenceEngine = struct {
             state.generated_tokens.clearRetainingCapacity();
         }
 
-        var scratch = try BatchedPrefillScratch.init(self, n_tokens, attn.q_dim, attn.kv_dim, inter_dim);
+        var scratch = try BatchedPrefillScratch.init(self, n_tokens, attn_dims.max_q_dim, attn_dims.max_kv_dim, inter_dim);
         defer scratch.deinit();
 
-        // Pre-dequantize embeddings for the whole prompt into scratch.hidden.
         {
             const mmap = self.model.mmap_data orelse return error.NoMmapData;
             const embed_offset = self.model.gguf_file.tensor_data_offset + self.token_embed.info.offset;
             const embed_raw = mmap[embed_offset..];
             const hidden_ptr: [*]f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
+            const embedding_scale: f32 = if (cfg.architecture == .gemma)
+                @floatCast(@sqrt(@as(f64, @floatFromInt(hidden_dim))))
+            else
+                1.0;
             for (prompt_tokens, 0..) |token_id, t| {
                 const out_slice = hidden_ptr[t * hidden_dim .. (t + 1) * hidden_dim];
                 dequantRow(embed_raw, token_id, hidden_dim, self.token_embed.info.type_, out_slice);
+                if (embedding_scale != 1.0) {
+                    for (out_slice) |*value| value.* *= embedding_scale;
+                }
             }
         }
 
-        var cmd = try metal_command.beginCommand(self.device.ctx);
+        var cmd = try metal_command.beginCommandWithMode(self.device.ctx, self.command_encoder_mode);
 
         for (0..cfg.n_layers) |layer_idx| {
             const lt = self.layer_tensors[layer_idx];
+            const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, self.kv_cache_q8);
             const q_t = lt.attn_q.?;
             const k_t = lt.attn_k.?;
-            const v_t = lt.attn_v.?;
+            const v_t = if (attn.use_k_as_v) k_t else lt.attn_v.?;
             const o_t = lt.attn_output.?;
-            const gate_t = lt.ffn_gate.?;
-            const up_t = lt.ffn_up.?;
-            const down_t = lt.ffn_down.?;
+            const is_gemma_moe = cfg.architecture == .gemma and hasExplicitGemmaMoeTensors(cfg, lt);
 
-            // === Attention block ===
             dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
             cmd.barrier();
 
             dispatchGemmBatchedOnCmd(self, &cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
             dispatchGemmBatchedOnCmd(self, &cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
-            dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
+            if (!attn.use_k_as_v) {
+                dispatchGemmBatchedOnCmd(self, &cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
+            }
             cmd.barrier();
 
-            // Per-head Q/K RMSNorms (Qwen3 and similar). Each head-slice of a token
-            // is one workgroup; batching is just n_tokens × n_heads workgroups.
+            const apply_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
+            if (apply_v_unit_norm) {
+                const v_src = if (attn.use_k_as_v) &scratch.k else &scratch.v;
+                dispatchRmsNormOnCmd(self, &cmd, v_src, &scratch.v, &self.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads * n_tokens);
+                if (attn.use_k_as_v) {
+                    cmd.barrier();
+                }
+            } else if (attn.use_k_as_v) {
+                dispatchCopyF32OnCmd(self, &cmd, &scratch.k, &scratch.v, n_tokens * attn.kv_dim);
+                cmd.barrier();
+            }
             if (self.attn_q_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.q, &scratch.q, &self.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
             }
             if (self.attn_k_norm_present[layer_idx]) {
                 dispatchRmsNormOnCmd(self, &cmd, &scratch.k, &scratch.k, &self.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
             }
-            if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx]) {
+            if (self.attn_q_norm_present[layer_idx] or self.attn_k_norm_present[layer_idx] or apply_v_unit_norm) {
                 cmd.barrier();
             }
 
@@ -2447,6 +5120,7 @@ pub const InferenceEngine = struct {
                     kv_len,
                     n_tokens,
                     position_base,
+                    attn.sliding_window_size,
                     attn.kv_cache_head_stride_bytes,
                     attn.kv_cache_bytes_per_token,
                 );
@@ -2464,78 +5138,91 @@ pub const InferenceEngine = struct {
                     kv_len,
                     n_tokens,
                     position_base,
+                    attn.sliding_window_size,
                 );
             }
             cmd.barrier();
 
             dispatchGemmBatchedOnCmd(self, &cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
             cmd.barrier();
+            if (self.post_attn_norm_present[layer_idx]) {
+                dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+                cmd.barrier();
+            }
 
-            // Fused residual-add + FFN-norm over all N tokens: eliminates
-            // separate scale_acc → barrier → rms_norm dispatches per layer.
             {
-                const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0 };
+                const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
                 const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &self.ffn_norm_bufs[layer_idx] };
                 cmd.dispatchV2(&self.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
             }
             cmd.barrier();
 
-            dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, inter_dim, hidden_dim, n_tokens);
-            dispatchGemmBatchedOnCmd(self, &cmd, up_t, &scratch.norm, &scratch.up, inter_dim, hidden_dim, n_tokens);
-            cmd.barrier();
+            if (is_gemma_moe) {
+                try recordGemmaBatchedPrefillMoeOnCmd(self, &cmd, layer_idx, lt, &scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+            } else {
+                const gate_t = lt.ffn_gate.?;
+                const up_t = lt.ffn_up.?;
+                const down_t = lt.ffn_down.?;
+                dispatchGemmBatchedOnCmd(self, &cmd, gate_t, &scratch.norm, &scratch.gate, inter_dim, hidden_dim, n_tokens);
+                dispatchGemmBatchedOnCmd(self, &cmd, up_t, &scratch.norm, &scratch.up, inter_dim, hidden_dim, n_tokens);
+                cmd.barrier();
 
-            // Batched SwiGLU: grid.x covers inter_dim, grid.y is the token index.
-            {
-                const push = SwiGLUPush{ .n = inter_dim };
-                const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
-                cmd.dispatchV2(&self.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+                {
+                    const push = SwiGLUPush{ .n = inter_dim };
+                    const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
+                    const pipe = if (usesGeglu(cfg)) &self.geglu_batched_pipe else &self.swiglu_batched_pipe;
+                    cmd.dispatchV2(pipe, .{ (inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+                }
+                cmd.barrier();
+
+                dispatchGemmBatchedOnCmd(self, &cmd, down_t, &scratch.swiglu, &scratch.down, hidden_dim, inter_dim, n_tokens);
+                cmd.barrier();
+                if (self.post_ffn_norm_present[layer_idx]) {
+                    dispatchRmsNormOnCmd(self, &cmd, &scratch.down, &scratch.down, &self.post_ffn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+                    cmd.barrier();
+                }
+
+                {
+                    const total = n_tokens * hidden_dim;
+                    const push = ScaleAccPush{ .n = total, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+                    const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
+                    cmd.dispatchV2(&self.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+                }
+                cmd.barrier();
             }
-            cmd.barrier();
 
-            dispatchGemmBatchedOnCmd(self, &cmd, down_t, &scratch.swiglu, &scratch.down, hidden_dim, inter_dim, n_tokens);
-            cmd.barrier();
-
-            {
-                const total = n_tokens * hidden_dim;
-                const push = ScaleAccPush{ .n = total, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
-                const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
-                cmd.dispatchV2(&self.scale_acc_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+            const layer_output_scale = self.layer_output_scales[layer_idx];
+            if (layer_output_scale != 1.0) {
+                dispatchScaleInPlaceOnCmd(self, &cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, null, .dense_ffn);
             }
-            cmd.barrier();
+
+            const next_layer = layer_idx + 1;
+            if (chunk_dense_gemma_prefill and
+                (next_layer % dense_gemma_prefill_chunk_layers == 0 or next_layer == @as(usize, @intCast(cfg.n_layers))))
+            {
+                cmd.commitAndWait();
+                cmd = try metal_command.beginCommandWithMode(self.device.ctx, self.command_encoder_mode);
+            }
         }
 
-        // Final RMSNorm over all N tokens into scratch.norm. The last token is
-        // what feeds the LM head.
         dispatchRmsNormOnCmd(self, &cmd, &scratch.hidden, &scratch.norm, &self.final_norm_gpu, hidden_dim, n_tokens);
         cmd.barrier();
 
-        // LM head on the last token via DmmvPush.x_offset (bytes into scratch.norm).
         if (shouldCpuLmHeadFallback(self)) {
-            // Rare quant path (Gemma Q8). Fall back to the CPU LM head.
             cmd.commitAndWait();
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
-            const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
+            const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
             const dst_ptr: [*]f32 = @ptrCast(@alignCast(self.hidden_buf.cpu_ptr.?));
-            @memcpy(dst_ptr[0..hidden_dim], src_ptr[src_base .. src_base + hidden_dim]);
-            var final_cmd = try metal_command.beginCommand(self.device.ctx);
-            dispatchRmsNormOnCmd(self, &final_cmd, &self.hidden_buf, &self.norm_buf, &self.final_norm_gpu, hidden_dim, 1);
-            final_cmd.commitAndWait();
-            const mmap = self.model.mmap_data orelse return error.NoMmapData;
-            const tdo = self.model.gguf_file.tensor_data_offset;
-            const in_ptr: [*]const f32 = @ptrCast(@alignCast(self.norm_buf.cpu_ptr.?));
+            @memcpy(dst_ptr[0..hidden_dim], hidden_ptr[src_base .. src_base + hidden_dim]);
+            const norm_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.norm.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(self.logits_buf.cpu_ptr.?));
-            try cpuDmmvFallback(mmap, self.lm_head, tdo, in_ptr, out_ptr, cfg.vocab_size, hidden_dim, 0, self.allocator);
-            var argmax_cmd = try metal_command.beginCommand(self.device.ctx);
-            dispatchArgmaxOnCmd(self, &argmax_cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
-            argmax_cmd.commitAndWait();
+            try cpuLmHeadFallbackWithArgmax(self, norm_ptr + src_base, out_ptr);
         } else {
             const x_offset_bytes: u32 = (n_tokens - 1) * hidden_dim * @sizeOf(f32);
             dispatchLmHeadWithInputOffset(self, &cmd, &scratch.norm, &self.logits_buf, hidden_dim, cfg.vocab_size, x_offset_bytes);
             cmd.barrier();
             dispatchArgmaxOnCmd(self, &cmd, &self.logits_buf, &self.argmax_buf, cfg.vocab_size);
             cmd.commitAndWait();
-            // Keep engine.hidden_buf consistent with the advancing position so
-            // any subsequent single-token decodeStep sees the right residual.
             const src_base = @as(usize, n_tokens - 1) * hidden_dim;
             const src_ptr: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
             const dst_ptr: [*]f32 = @ptrCast(@alignCast(self.hidden_buf.cpu_ptr.?));
@@ -2588,7 +5275,7 @@ pub const InferenceEngine = struct {
             state.position + 1;
         if (next_token_target > self.max_context_tokens) return error.ContextLengthExceeded;
         try self.loadTokenEmbedding(token_id);
-        try runDecodeStep(self);
+        try runDecodeStep(self, true, null, 0, null, null, 0);
         state.position = self.position;
     }
 
@@ -2596,6 +5283,7 @@ pub const InferenceEngine = struct {
     pub fn enableProfiling(self: *InferenceEngine) !void {
         self.profile_enabled = true;
         self.request_profile.reset();
+        self.prefill_profile.reset();
     }
 
     /// Log the collected Metal profiling summary for the current request.
@@ -2649,27 +5337,77 @@ pub const InferenceEngine = struct {
                 @as(f64, @floatFromInt(profile.fallback_moe_layers)) / steps_f,
                 @as(f64, @floatFromInt(profile.dense_ffn_layers)) / steps_f,
             });
+            log.info("  dispatch/step: total {d:.1} barriers {d:.1} (cmds {d:.2} commits {d:.2})", .{
+                @as(f64, @floatFromInt(profile.dispatch_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.command_buffers)) / steps_f,
+                @as(f64, @floatFromInt(profile.commit_waits)) / steps_f,
+            });
+            log.info("  barriers/step: embed {d:.1} attn {d:.1} ssm {d:.1} router {d:.1} gpu-moe {d:.1} fallback-moe {d:.1} dense {d:.1} final {d:.1}", .{
+                @as(f64, @floatFromInt(profile.embed_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.full_attn_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.ssm_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.router_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.gpu_routed_moe_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.fallback_moe_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.dense_ffn_barrier_calls)) / steps_f,
+                @as(f64, @floatFromInt(profile.final_barrier_calls)) / steps_f,
+            });
         }
         if (profile.dmmv_total_bytes > 0) {
-            log.info("  dmmv bytes: q8_0 {d:.2} GiB ({d:.1}%) q4_k {d:.2} GiB ({d:.1}%) q5_k {d:.2} GiB ({d:.1}%) q6_k {d:.2} GiB ({d:.1}%)", .{
+            log.info("  dmmv bytes: q8_0 {d:.2} GiB ({d:.1}%) q4_k {d:.2} GiB ({d:.1}%) q5_1 {d:.2} GiB ({d:.1}%) q5_k {d:.2} GiB ({d:.1}%) q6_k {d:.2} GiB ({d:.1}%)", .{
                 bytesToGiB(profile.dmmv_q8_0_bytes),
                 pctOf(profile.dmmv_total_bytes, profile.dmmv_q8_0_bytes),
                 bytesToGiB(profile.dmmv_q4k_bytes),
                 pctOf(profile.dmmv_total_bytes, profile.dmmv_q4k_bytes),
+                bytesToGiB(profile.dmmv_q5_1_bytes),
+                pctOf(profile.dmmv_total_bytes, profile.dmmv_q5_1_bytes),
                 bytesToGiB(profile.dmmv_q5k_bytes),
                 pctOf(profile.dmmv_total_bytes, profile.dmmv_q5k_bytes),
                 bytesToGiB(profile.dmmv_q6k_bytes),
                 pctOf(profile.dmmv_total_bytes, profile.dmmv_q6k_bytes),
             });
-            log.info("  path bytes: ssm {d:.2} GiB attn {d:.2} GiB moe-expert {d:.2} GiB shared {d:.2} GiB lm-head {d:.2} GiB router {d:.2} GiB", .{
+            log.info("  path bytes: ssm {d:.2} GiB attn {d:.2} GiB dense {d:.2} GiB moe-expert {d:.2} GiB shared {d:.2} GiB lm-head {d:.2} GiB router {d:.2} GiB", .{
                 bytesToGiB(profile.ssm_bytes),
                 bytesToGiB(profile.full_attn_bytes),
+                bytesToGiB(profile.dense_ffn_bytes),
                 bytesToGiB(profile.moe_expert_bytes),
                 bytesToGiB(profile.shared_expert_bytes),
                 bytesToGiB(profile.lm_head_bytes),
                 bytesToGiB(profile.router_bytes),
             });
+            if (self.prefill_profile.decode_steps > 0) {
+                logDetailedProfileBuckets("prefill", self.prefill_profile);
+            } else {
+                logDetailedProfileBuckets(label, profile);
+            }
+            if (profile.route_pack_layers > 0) {
+                log.info("  route-pack: layers {d} route_slots {d} active_block_upper {d} dense_dispatch_blocks {d} upper/dense {d:.1}%", .{
+                    profile.route_pack_layers,
+                    profile.route_pack_slots,
+                    profile.route_pack_active_block_upper_bound,
+                    profile.route_pack_dense_dispatch_blocks,
+                    pctOf(profile.route_pack_dense_dispatch_blocks, profile.route_pack_active_block_upper_bound),
+                });
+            }
             if (profile.dmmv_q8_0_bytes > 0) {
+                const q8_repacked_calls =
+                    profile.q8_repacked_tg128_calls +
+                    profile.q8_repacked_exact_qwen_calls +
+                    profile.q8_repacked_quad_calls +
+                    profile.q8_repacked_generic_calls;
+                if (q8_repacked_calls > 0) {
+                    log.info("  q8 repacked kernels: tg128 {d:.2} GiB/{d} exact-qwen {d:.2} GiB/{d} quad {d:.2} GiB/{d} generic {d:.2} GiB/{d}", .{
+                        bytesToGiB(profile.q8_repacked_tg128_bytes),
+                        profile.q8_repacked_tg128_calls,
+                        bytesToGiB(profile.q8_repacked_exact_qwen_bytes),
+                        profile.q8_repacked_exact_qwen_calls,
+                        bytesToGiB(profile.q8_repacked_quad_bytes),
+                        profile.q8_repacked_quad_calls,
+                        bytesToGiB(profile.q8_repacked_generic_bytes),
+                        profile.q8_repacked_generic_calls,
+                    });
+                }
                 var top_idxs: [4]?usize = .{ null, null, null, null };
                 for (profile.q8_shape_stats, 0..) |slot, idx| {
                     if (slot.calls == 0) continue;
@@ -2710,7 +5448,7 @@ pub const InferenceEngine = struct {
         }
         if (profile.gpu_routed_moe_layers == 0 and profile.fallback_moe_layers > 0 and self.layer_tensors.len > 0) {
             const layer0 = self.layer_tensors[0];
-            log.info("  fallback-moe path: gate_exps={s} up_exps={s} down_exps={s} (GPU-routed path currently supports q4_k/q4_k/{{q4_k,q5_k}})", .{
+            log.info("  fallback-moe path: gate_exps={s} up_exps={s} down_exps={s} (GPU-routed path currently supports q4_k/q4_k/{{q4_k,q5_1,q5_k,q6_k}})", .{
                 if (layer0.ffn_gate_exps) |t| @tagName(t.info.type_) else "-",
                 if (layer0.ffn_up_exps) |t| @tagName(t.info.type_) else "-",
                 if (layer0.ffn_down_exps) |t| @tagName(t.info.type_) else "-",
@@ -2721,7 +5459,7 @@ pub const InferenceEngine = struct {
         }
     }
 
-    fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
+    fn loadTokenEmbeddingInto(self: *InferenceEngine, token_id: u32, dst_buf: *const MetalBuffer, dst_offset_f32: usize) !void {
         const embed_start = profileStart(self.profile_enabled);
         defer if (self.profile_enabled) {
             self.request_profile.embedding_ns += profileElapsedNs(embed_start);
@@ -2730,29 +5468,43 @@ pub const InferenceEngine = struct {
         const mmap = self.model.mmap_data orelse return error.NoMmapData;
         const embed_data_offset = self.model.gguf_file.tensor_data_offset + self.token_embed.info.offset;
         const embed_raw = mmap[embed_data_offset..];
-        const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
         const hidden_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
-        dequantRow(embed_raw, token_id, self.config.hidden_dim, self.token_embed.info.type_, hidden_ptr[0..self.config.hidden_dim]);
+        const hidden_dim_usize: usize = @intCast(self.config.hidden_dim);
+        const dst = hidden_ptr[dst_offset_f32 .. dst_offset_f32 + hidden_dim_usize];
+        dequantRow(embed_raw, token_id, self.config.hidden_dim, self.token_embed.info.type_, dst);
         // Gemma models scale embeddings by sqrt(hidden_dim). Keep parity when
         // config.architecture == .gemma.
         if (self.config.architecture == .gemma) {
             const scale = @as(f32, @floatCast(@sqrt(@as(f64, @floatFromInt(self.config.hidden_dim)))));
-            for (hidden_ptr[0..self.config.hidden_dim]) |*value| value.* *= scale;
+            for (dst) |*value| value.* *= scale;
+        }
+    }
+
+    fn loadTokenEmbedding(self: *InferenceEngine, token_id: u32) !void {
+        const dst_buf = if (self.private_decode_buffers) &self.embed_staging else &self.hidden_buf;
+        try self.loadTokenEmbeddingInto(token_id, dst_buf, 0);
+        const validate_tokens = qwenMoeRoutePackValidateTokens(self);
+        if (self.qwen_prefill_validation_enabled and self.position < validate_tokens) {
+            const offset: usize = @as(usize, @intCast(self.position)) * @as(usize, @intCast(self.config.hidden_dim));
+            try self.loadTokenEmbeddingInto(token_id, &self.prefill_embed_buf, offset);
         }
     }
 
     /// Get the DMMV pipeline, push constant buffer index, rows-per-workgroup, and block size.
     /// Q4_K: native Metal kernel — 32 threads (1 simdgroup) per row, 4 rows per threadgroup (64 threads).
-    /// Q4_K wide: specialized large-M kernel — 16 rows per threadgroup (512 threads).
+    /// Q4_K wide: specialized large-M kernels — 16 rows per threadgroup (512 threads).
     /// Q4_K LM head 1024: dedicated vocab projection kernel — 32 rows per threadgroup (1024 threads).
     /// On Apple9/M4, the 1024-thread shape tends to trade away too much
     /// occupancy for reuse, so keep that path reserved for Apple10-class parts.
-    /// Reusing the wider shape outside the LM head improves staged-vector reuse on
-    /// the large decode-side Q4_K projections that still dominate token time.
+    /// Keep Gemma 31B's K=5376 layer decode on the llama.cpp-style
+    /// 2-simdgroup Q4_K kernel: caching the 21 KiB activation vector costs
+    /// occupancy and buys little reuse compared with the much larger weight
+    /// stream. The vocab projection is the exception: its very large M can
+    /// amortize the cached input across 16 rows per threadgroup.
     /// Q5_K/Q6_K/F32: SPIRV-Cross — each thread handles 1 row (64 rows per workgroup, 64 threads).
     /// Q8_0/F16: SPIRV-Cross — each workgroup handles 2 rows (64 threads cooperate via simd_sum).
     fn dmmvPipelineForType(
-        self: *InferenceEngine,
+        self: *const InferenceEngine,
         tensor: *const metal_loader.LoadedTensor,
         M: u32,
         K: u32,
@@ -2771,7 +5523,13 @@ pub const InferenceEngine = struct {
                 {
                     break :blk .{ .pipe = &self.dmmv_q4k_lmhead_1024_pipe, .push_idx = 1, .rows_per_wg = 32, .block_size = 1024 };
                 }
-                if (k2048_or_less and
+                // K=5376 (Gemma 31B dense) and other wide-K Q4_K shapes fall
+                // through to the llama.cpp-style 2-simdgroup base kernel below.
+                // The previous specialized 512-thread/16-row variant ran at
+                // ~5 GB/s effective on Apple9 (cycle 24 of Effort 12 profile)
+                // versus llama.cpp's ~440 GB/s on the same shape; do not
+                // re-specialize without bench-metal-shapes evidence.
+                if (K <= 3072 and
                     self.dmmv_q4k_lmhead_pipe.max_threads_per_threadgroup >= 512 and
                     ((tensor == self.lm_head and M >= 65536) or M >= 1024))
                 {
@@ -2786,10 +5544,105 @@ pub const InferenceEngine = struct {
             .q5_1 => .{ .pipe = &self.dmmv_q5_1_pipe, .push_idx = 0, .rows_per_wg = 2, .block_size = 64 },
             .mxfp4 => .{ .pipe = &self.dmmv_mxfp4_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
             .q5_k => .{ .pipe = &self.dmmv_q5k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
-            .q6_k => .{ .pipe = &self.dmmv_q6k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 },
+            .q6_k => blk: {
+                // dmmv_q6k_llama is a faithful llama.cpp port (N_SG=2, N_R0=2,
+                // simdgroup-parallel). The legacy dmmv_q6k_pipe is a SPIRV-Cross
+                // single-thread-per-row Vulkan port. For dense Q6_K matvec at
+                // K%256==0 (Gemma final norm, Qwen3 lm_head) the llama variant
+                // is strictly better.
+                if ((self.config.architecture == .gemma or self.config.architecture == .qwen2) and
+                    self.config.n_experts == 0 and
+                    K % 256 == 0 and
+                    self.dmmv_q6k_llama_pipe.handle != null)
+                {
+                    break :blk .{ .pipe = &self.dmmv_q6k_llama_pipe, .push_idx = 1, .rows_per_wg = 4, .block_size = 64 };
+                }
+                break :blk .{ .pipe = &self.dmmv_q6k_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 64 };
+            },
             .q8_0 => blk: {
                 const simd_width = if (self.dmmv_q8_0_pipe.thread_execution_width > 0) self.dmmv_q8_0_pipe.thread_execution_width else @as(u32, 32);
                 if (self.device.chip == .apple9 and simd_width == 32) {
+                    if (self.config.architecture == .gpt_oss and
+                        tensor == self.lm_head and K <= 4096 and M >= 65536 and M % 2 == 0 and
+                        self.dmmv_q8_0_lmhead_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_lmhead_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q8_0_lmhead_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k512_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k512_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 shared-down shape: split each K=512 Q8
+                        // block across two lanes and process eight adjacent
+                        // rows per simdgroup, reusing each X half-block load.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k512_quad_pipe, .push_idx = 0, .rows_per_wg = 128, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSharedDownQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Qwen3.6 shared down is a narrow K=512 projection.
+                        // Four rows per simdgroup halves workgroups versus
+                        // the K<=2048 nr=2 path while preserving per-row math.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSsmQ8QuadPath(self.config, tensor, M, K) and
+                        K == 2048 and
+                        self.dmmv_q8_0_k2048_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 SSM qkv/gate shape: same four-row
+                        // simdgroup geometry as dmmv_q8_0_quad, with K=2048
+                        // baked into the hot loop.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k2048_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSsmOutQ8K4096Path(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k4096_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k4096_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 SSM out shape: four adjacent rows per
+                        // simdgroup share the K=4096 activation vector, reducing
+                        // simdgroup count versus the conservative nr=2 fallback.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k4096_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenFullAttnQ8K2048QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k2048_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 full-attention packed Q(+gate)
+                        // shape. This applies the same llama.cpp-style
+                        // adjacent-row Q8 matvec grouping used for SSM qkv to
+                        // the remaining hot attn M=8192,K=2048 prompt bucket.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k2048_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenFullAttnOutQ8K4096Path(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k4096_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k4096_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 attention-output projection. Reuse the
+                        // accepted K=4096 quad-row Q8 kernel from SSM out for
+                        // the full-attention out M=2048,K=4096 prompt bucket.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k4096_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
+                    if (preferApple9QwenSsmOutQ8K4096Path(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_k4096_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_k4096_pipe.max_threads_per_threadgroup >= 128)
+                    {
+                        // Exact Qwen3.6 SSM out shape: same conservative
+                        // 128-thread nr=2 geometry as the current path, with
+                        // K=4096 baked into the shader.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_k4096_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 128 };
+                    }
+                    if (preferApple9QwenSsmQ8QuadPath(self.config, tensor, M, K) and
+                        self.dmmv_q8_0_quad_pipe.thread_execution_width == 32 and
+                        self.dmmv_q8_0_quad_pipe.max_threads_per_threadgroup >= 512)
+                    {
+                        // Exact Qwen3.6 SSM qkv/gate shape: four adjacent rows
+                        // per simdgroup reuse the 2048-wide activation vector
+                        // across the hottest prompt-side Q8 projections.
+                        break :blk .{ .pipe = &self.dmmv_q8_0_quad_pipe, .push_idx = 0, .rows_per_wg = 64, .block_size = 512 };
+                    }
                     if (preferApple9Q8K2048Path(tensor, M, K) and
                         self.dmmv_q8_0_k2048_pipe.thread_execution_width == 32 and
                         self.dmmv_q8_0_k2048_pipe.max_threads_per_threadgroup >= 512)
@@ -2797,10 +5650,18 @@ pub const InferenceEngine = struct {
                         // nr=2: each SG processes 2 rows
                         break :blk .{ .pipe = &self.dmmv_q8_0_k2048_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
                     }
+                    if (self.config.architecture == .qwen2_moe and
+                        self.config.ssm_d_inner > 0 and
+                        getenv("ZINC_METAL_Q8_TG_SIZE") == null and
+                        preferLlamaQ8SmallThreadgroupForQwenSsm(tensor, M, K) and
+                        self.dmmv_q8_0_pipe.max_threads_per_threadgroup >= 128)
+                    {
+                        break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 8, .block_size = 128 };
+                    }
                     if (preferApple9Q8WidePath(tensor, M, K) and self.dmmv_q8_0_pipe.max_threads_per_threadgroup >= 512) {
                         break :blk .{ .pipe = &self.dmmv_q8_0_pipe, .push_idx = 0, .rows_per_wg = 32, .block_size = 512 };
                     }
-                    // lm_head (M=248320 for Qwen3.5-35B): use 512-thread wide path.
+                    // lm_head (M=248320 for Qwen3.6-35B): use 512-thread wide path.
                     // Adapted from llama.cpp's Q8_0 mul_mat_vec with N_R0=2 (nr=2).
                     if (K <= 2048 and M >= 65536 and tensor == self.lm_head and
                         self.dmmv_q8_0_k2048_pipe.max_threads_per_threadgroup >= 512)
@@ -2859,7 +5720,7 @@ pub const InferenceEngine = struct {
 fn loadShaderPipeline(ctx: ?*shim.MetalCtx, name: []const u8) !MetalPipeline {
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "src/shaders/metal/{s}.metal", .{name}) catch return error.PathTooLong;
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(path, .{}) catch |err| {
         log.err("Failed to open shader '{s}': {s}", .{ name, @errorName(err) });
         return error.ShaderNotFound;
     };
@@ -2955,10 +5816,79 @@ fn dmmvWeightBytes(quant_type: GGMLType, rows: u32, cols: u32) u64 {
     return @as(u64, rows) * @as(u64, blocks_per_row) * @as(u64, bpb);
 }
 
+fn tensorNameContains(name: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, name, needle) != null;
+}
+
+fn isMoeGateUpExpertTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_gate_exps") or
+        tensorNameContains(name, "ffn_up_exps") or
+        tensorNameContains(name, "ffn_gate_up_exps");
+}
+
+fn isMoeDownExpertTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_down_exps");
+}
+
+fn isSharedGateUpTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_gate_shexp") or
+        tensorNameContains(name, "ffn_gate_inp_shexp") or
+        tensorNameContains(name, "ffn_up_shexp") or
+        tensorNameContains(name, "ffn_gate_up_shexp");
+}
+
+fn isSharedDownTensor(name: []const u8) bool {
+    return tensorNameContains(name, "ffn_down_shexp");
+}
+
+fn recordDetailedDmmvBytes(profile: *RuntimeProfile, path: DmmvPathClass, name: []const u8, bytes: u64) void {
+    switch (path) {
+        .full_attn => {
+            if (std.mem.endsWith(u8, name, "attn_output.weight")) {
+                profile.full_attn_output_bytes += bytes;
+            } else {
+                profile.full_attn_projection_bytes += bytes;
+            }
+        },
+        .ssm => {
+            if (std.mem.endsWith(u8, name, "ssm_out.weight")) {
+                profile.ssm_out_bytes += bytes;
+            } else {
+                profile.ssm_projection_bytes += bytes;
+                if (std.mem.endsWith(u8, name, "attn_qkv.weight")) {
+                    profile.ssm_qkv_projection_bytes += bytes;
+                } else if (std.mem.endsWith(u8, name, "attn_gate.weight")) {
+                    profile.ssm_gate_projection_bytes += bytes;
+                } else if (std.mem.endsWith(u8, name, "ssm_alpha.weight") or
+                    std.mem.endsWith(u8, name, "ssm_beta.weight"))
+                {
+                    profile.ssm_tail_projection_bytes += bytes;
+                }
+            }
+        },
+        .shared_expert => {
+            if (isSharedDownTensor(name)) {
+                profile.shared_expert_down_bytes += bytes;
+            } else if (isSharedGateUpTensor(name)) {
+                profile.shared_expert_gate_up_bytes += bytes;
+            }
+        },
+        .moe_expert => {
+            if (isMoeDownExpertTensor(name)) {
+                profile.moe_expert_down_bytes += bytes;
+            } else if (isMoeGateUpExpertTensor(name)) {
+                profile.moe_expert_gate_up_bytes += bytes;
+            }
+        },
+        else => {},
+    }
+}
+
 fn recordDispatchQuantBytes(profile: *RuntimeProfile, quant_type: GGMLType, bytes: u64) void {
     profile.dmmv_total_bytes += bytes;
     switch (quant_type) {
         .q4_k => profile.dmmv_q4k_bytes += bytes,
+        .q5_1 => profile.dmmv_q5_1_bytes += bytes,
         .q5_k => profile.dmmv_q5k_bytes += bytes,
         .q6_k => profile.dmmv_q6k_bytes += bytes,
         .q8_0 => profile.dmmv_q8_0_bytes += bytes,
@@ -2993,8 +5923,10 @@ fn classifyDmmvPath(engine: *InferenceEngine, tensor: *const metal_loader.Loaded
         std.mem.endsWith(u8, name, "ffn_up.weight") or
         std.mem.endsWith(u8, name, "ffn_down.weight"))
     {
+        if (engine.config.architecture == .gemma and engine.config.n_experts > 0) return .shared_expert;
         return .dense_ffn;
     }
+    if (isMoeGateUpExpertTensor(name) or isMoeDownExpertTensor(name)) return .moe_expert;
     return .other;
 }
 
@@ -3026,6 +5958,37 @@ fn recordQ8ShapeProfile(
     }
 }
 
+fn recordQ8RepackedKernelProfile(
+    engine: *InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+    kernel: Q8RepackedKernel,
+) void {
+    if (!engine.profile_enabled or tensor.info.type_ != .q8_0) return;
+
+    const bytes = dmmvWeightBytes(.q8_0, rows, cols);
+    var profile = &engine.request_profile;
+    switch (kernel) {
+        .tg128 => {
+            profile.q8_repacked_tg128_bytes += bytes;
+            profile.q8_repacked_tg128_calls += 1;
+        },
+        .exact_qwen => {
+            profile.q8_repacked_exact_qwen_bytes += bytes;
+            profile.q8_repacked_exact_qwen_calls += 1;
+        },
+        .quad => {
+            profile.q8_repacked_quad_bytes += bytes;
+            profile.q8_repacked_quad_calls += 1;
+        },
+        .generic => {
+            profile.q8_repacked_generic_bytes += bytes;
+            profile.q8_repacked_generic_calls += 1;
+        },
+    }
+}
+
 fn recordDmmvProfile(
     engine: *InferenceEngine,
     tensor: *const metal_loader.LoadedTensor,
@@ -3045,8 +6008,10 @@ fn recordDmmvProfile(
         .ssm => profile.ssm_bytes += bytes,
         .full_attn => profile.full_attn_bytes += bytes,
         .dense_ffn => profile.dense_ffn_bytes += bytes,
+        .moe_expert => profile.moe_expert_bytes += bytes,
         else => {},
     }
+    recordDetailedDmmvBytes(profile, path, tensor.info.name, bytes);
     if (tensor.info.type_ == .q8_0) {
         recordQ8ShapeProfile(profile, path, rows, cols, bytes);
     }
@@ -3054,17 +6019,18 @@ fn recordDmmvProfile(
 
 fn recordMoeDmmvProfile(
     engine: *InferenceEngine,
-    quant_type: GGMLType,
+    tensor: *const metal_loader.LoadedTensor,
     rows: u32,
     cols: u32,
     expert_count: u32,
 ) void {
     if (!engine.profile_enabled) return;
 
-    const bytes = @as(u64, expert_count) * dmmvWeightBytes(quant_type, rows, cols);
+    const bytes = @as(u64, expert_count) * dmmvWeightBytes(tensor.info.type_, rows, cols);
     var profile = &engine.request_profile;
-    recordDispatchQuantBytes(profile, quant_type, bytes);
+    recordDispatchQuantBytes(profile, tensor.info.type_, bytes);
     profile.moe_expert_bytes += bytes;
+    recordDetailedDmmvBytes(profile, .moe_expert, tensor.info.name, bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -3078,8 +6044,20 @@ fn dispatchCopyF32OnCmd(
     dst_buf: *const MetalBuffer,
     n: u32,
 ) void {
+    dispatchCopyF32OffsetOnCmd(engine, cmd, src_buf, dst_buf, n, 0, 0);
+}
+
+fn dispatchCopyF32OffsetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    src_buf: *const MetalBuffer,
+    dst_buf: *const MetalBuffer,
+    n: u32,
+    src_offset: u32,
+    dst_offset: u32,
+) void {
     if (n == 0) return;
-    const push = CopyF32Push{ .n = n };
+    const push = CopyF32Push{ .n = n, .src_offset = src_offset, .dst_offset = dst_offset };
     const bufs = [_]*const MetalBuffer{ src_buf, dst_buf };
     cmd.dispatchV2(&engine.copy_f32_pipe, .{ (n + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(CopyF32Push), 2);
 }
@@ -3128,6 +6106,149 @@ fn dispatchArgmaxOnCmd(
     cmd.dispatchV2(&engine.argmax_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ArgmaxPush), 2);
 }
 
+fn writeCpuArgmax(engine: *const InferenceEngine, logits: [*]const f32, n: u32) void {
+    if (n == 0) return;
+    const ptr = engine.argmax_buf.cpu_ptr orelse return;
+
+    var max_val: f32 = logits[0];
+    var max_idx: u32 = 0;
+    for (logits[0..n], 0..) |value, i| {
+        if (value > max_val) {
+            max_val = value;
+            max_idx = @intCast(i);
+        }
+    }
+
+    const argmax_words: [*]u32 = @ptrCast(@alignCast(ptr));
+    argmax_words[0] = max_idx;
+    argmax_words[1] = 0;
+}
+
+const CpuArgmaxResult = struct {
+    idx: u32 = 0,
+    val: f32 = -std.math.inf(f32),
+};
+
+fn betterArgmax(candidate: CpuArgmaxResult, best: CpuArgmaxResult) bool {
+    return candidate.val > best.val or (candidate.val == best.val and candidate.idx < best.idx);
+}
+
+fn writeCpuArgmaxResult(engine: *const InferenceEngine, result: CpuArgmaxResult) void {
+    const ptr = engine.argmax_buf.cpu_ptr orelse return;
+    const argmax_words: [*]u32 = @ptrCast(@alignCast(ptr));
+    argmax_words[0] = result.idx;
+    argmax_words[1] = 0;
+}
+
+fn cpuDmmvQ8_0RowsArgmax(
+    raw: []const u8,
+    start_row: u32,
+    end_row: u32,
+    K: u32,
+    input: [*]const f32,
+    output: [*]f32,
+) CpuArgmaxResult {
+    var best = CpuArgmaxResult{};
+    var row = start_row;
+    while (row < end_row) : (row += 1) {
+        const value = dotQ8_0Row(raw, row, K, input);
+        output[row] = value;
+        const candidate = CpuArgmaxResult{ .idx = row, .val = value };
+        if (betterArgmax(candidate, best)) best = candidate;
+    }
+    return best;
+}
+
+fn cpuDmmvQ8_0RowsArgmaxWorker(
+    raw: []const u8,
+    start_row: u32,
+    end_row: u32,
+    K: u32,
+    input: [*]const f32,
+    output: [*]f32,
+    partial: *CpuArgmaxResult,
+) void {
+    partial.* = cpuDmmvQ8_0RowsArgmax(raw, start_row, end_row, K, input, output);
+}
+
+fn cpuDmmvQ8_0ParallelArgmax(
+    raw: []const u8,
+    M: u32,
+    K: u32,
+    input: [*]const f32,
+    output: [*]f32,
+    allocator: std.mem.Allocator,
+) CpuArgmaxResult {
+    if (M == 0) return .{};
+
+    const row_count: usize = @intCast(M);
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const worker_count = @min(@min(cpu_count, @as(usize, 16)), row_count);
+    if (worker_count <= 1 or row_count < 2048) {
+        return cpuDmmvQ8_0RowsArgmax(raw, 0, M, K, input, output);
+    }
+
+    const partials = allocator.alloc(CpuArgmaxResult, worker_count) catch {
+        return cpuDmmvQ8_0RowsArgmax(raw, 0, M, K, input, output);
+    };
+    defer allocator.free(partials);
+
+    const threads = allocator.alloc(std.Thread, worker_count) catch {
+        return cpuDmmvQ8_0RowsArgmax(raw, 0, M, K, input, output);
+    };
+    defer allocator.free(threads);
+
+    const rows_per_worker = (row_count + worker_count - 1) / worker_count;
+    var spawned: usize = 0;
+    while (spawned < worker_count) : (spawned += 1) {
+        const start: u32 = @intCast(spawned * rows_per_worker);
+        const end_usize = @min(row_count, (spawned + 1) * rows_per_worker);
+        const end: u32 = @intCast(end_usize);
+        if (start >= end) break;
+        partials[spawned] = .{};
+        threads[spawned] = std.Thread.spawn(.{}, cpuDmmvQ8_0RowsArgmaxWorker, .{
+            raw,
+            start,
+            end,
+            K,
+            input,
+            output,
+            &partials[spawned],
+        }) catch {
+            for (threads[0..spawned]) |thread| thread.join();
+            return cpuDmmvQ8_0RowsArgmax(raw, 0, M, K, input, output);
+        };
+    }
+
+    for (threads[0..spawned]) |thread| thread.join();
+
+    var best = CpuArgmaxResult{};
+    for (partials[0..spawned]) |partial| {
+        if (betterArgmax(partial, best)) best = partial;
+    }
+    return best;
+}
+
+fn cpuLmHeadFallbackWithArgmax(
+    engine: *InferenceEngine,
+    input: [*]const f32,
+    output: [*]f32,
+) !void {
+    const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+    const tdo = engine.model.gguf_file.tensor_data_offset;
+    recordDmmvProfile(engine, engine.lm_head, engine.config.vocab_size, engine.config.hidden_dim);
+    if (engine.lm_head.info.type_ == .q8_0) {
+        const off: usize = @intCast(tdo + engine.lm_head.info.offset);
+        const raw = mmap[off..];
+        const result = cpuDmmvQ8_0ParallelArgmax(raw, engine.config.vocab_size, engine.config.hidden_dim, input, output, engine.allocator);
+        writeCpuArgmaxResult(engine, result);
+        return;
+    }
+
+    try cpuDmmvFallback(mmap, engine.lm_head, tdo, input, output, engine.config.vocab_size, engine.config.hidden_dim, 0, engine.allocator);
+    writeCpuArgmax(engine, output, engine.config.vocab_size);
+}
+
 fn canUseFusedNormQ8Dmmv(
     engine: *const InferenceEngine,
     tensor: *const metal_loader.LoadedTensor,
@@ -3157,6 +6278,30 @@ fn canUseFusedNormDualQ8Dmmv(
         engine.dmmv_q8_0_dual_fused_norm_pipe.max_threads_per_threadgroup >= block_size;
 }
 
+fn canUseQwenSsmFusedNormProjections(
+    engine: *const InferenceEngine,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) bool {
+    if (!engine.fused_ssm_norm_enabled) return false;
+    if (engine.debug_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.config.architecture != .qwen2_moe or engine.config.ssm_d_inner == 0) return false;
+
+    // Keep this first production use pinned to the Effort 16 Qwen3.6 35B-A3B
+    // SSM projection shape. Broaden only after exact-shape evidence.
+    if (hidden_dim != 2048 or conv_channels != 8192 or d_inner != 4096 or dt_rank != 32) return false;
+
+    return canUseFusedNormDualQ8Dmmv(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim) and
+        canUseFusedNormQ8Dmmv(engine, alpha_t, hidden_dim) and
+        canUseFusedNormQ8Dmmv(engine, beta_t, hidden_dim);
+}
+
 fn canUseDualQ8Dmmv(
     engine: *const InferenceEngine,
     tensor0: *const metal_loader.LoadedTensor,
@@ -3173,6 +6318,368 @@ fn canUseDualQ8Dmmv(
         M1 > 0 and
         engine.dmmv_q8_0_dual_pipe.thread_execution_width == 32 and
         engine.dmmv_q8_0_dual_pipe.max_threads_per_threadgroup >= block_size;
+}
+
+fn isGemmaSharedGateUpQ8Pair(
+    engine: *const InferenceEngine,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+) bool {
+    if (engine.config.architecture != .gemma) return false;
+    if (tensor0.info.type_ != .q8_0 or tensor1.info.type_ != .q8_0) return false;
+
+    const name0 = tensor0.info.name;
+    const name1 = tensor1.info.name;
+    return (std.mem.endsWith(u8, name0, "ffn_gate_shexp.weight") and
+        std.mem.endsWith(u8, name1, "ffn_up_shexp.weight")) or
+        (std.mem.endsWith(u8, name0, "ffn_up_shexp.weight") and
+            std.mem.endsWith(u8, name1, "ffn_gate_shexp.weight"));
+}
+
+fn pairedQ8DmmvBlockSize(
+    engine: *const InferenceEngine,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+) u32 {
+    if (isGemmaSharedGateUpQ8Pair(engine, tensor0, tensor1) and
+        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= 256)
+    {
+        return 256;
+    }
+    return engine.q8_dual_tg_override orelse 512;
+}
+
+fn canUsePairedQ8Dmmv(
+    engine: *const InferenceEngine,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    M0: u32,
+    M1: u32,
+    K: u32,
+) bool {
+    // On Apple9/M4, the paired Q8 shader does more per-dispatch work but loses
+    // enough occupancy that separate Q8 matvecs are faster for Gemma 12B's
+    // K=2816 attention and shared-expert shapes.
+    if (engine.device.chip == .apple9 and engine.config.architecture == .gemma) return false;
+
+    const block_size = pairedQ8DmmvBlockSize(engine, tensor0, tensor1);
+    return tensor0.info.type_ == .q8_0 and
+        tensor1.info.type_ == .q8_0 and
+        M0 == M1 and
+        M0 > 0 and
+        K <= 4096 and
+        engine.dmmv_q8_0_pair_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_pair_pipe.max_threads_per_threadgroup >= block_size;
+}
+
+fn canUseQwenSharedQ8SwiGLU(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    const cfg = engine.config;
+    const block_size = pairedQ8DmmvBlockSize(engine, gate, up);
+    return cfg.architecture == .qwen2_moe and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        M == 512 and
+        K == 2048 and
+        gate.info.type_ == .q8_0 and
+        up.info.type_ == .q8_0 and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width == 32 and
+        engine.dmmv_q8_0_pair_swiglu_pipe.max_threads_per_threadgroup >= block_size;
+}
+
+fn canUseQwen36FullAttnQ8Pair(
+    engine: *const InferenceEngine,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    M0: u32,
+    M1: u32,
+    K: u32,
+) bool {
+    const cfg = engine.config;
+    // llama.cpp's `kernel_mul_mv_q8_0_f32_impl` amortizes X-vector loads across
+    // adjacent row work. Use ZINC's paired-Q8 variant only for the measured
+    // Qwen3.6 hybrid shape so unrelated Q8 attention paths stay unchanged.
+    return cfg.architecture == .qwen2_moe and
+        cfg.hidden_dim == 2048 and
+        cfg.ssm_d_inner == 4096 and
+        cfg.n_experts == 256 and
+        cfg.n_experts_used == 8 and
+        canUsePairedQ8Dmmv(engine, tensor0, tensor1, M0, M1, K);
+}
+
+fn canUseQwen36FinalTailKvFusedNorm(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    attn: LayerAttentionParams,
+    hidden_dim: u32,
+) bool {
+    if ((readBoolEnv("ZINC_METAL_QWEN_FINAL_TAIL_KV_FUSED_NORM") orelse true) == false) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (!defaultQwen36SsmPrefillProjectionEnabled(engine.config)) return false;
+    if (attn.use_k_as_v or attn.kv_dim == 0 or hidden_dim == 0) return false;
+
+    const k_tensor = lt.attn_k orelse return false;
+    const v_tensor = lt.attn_v orelse return false;
+    return canUseFusedNormDualQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim);
+}
+
+fn canUseDenseQ4KGateUpDual(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // llama.cpp keeps single-token FFN gate/up as ordinary mul_mv nodes.
+    // vLLM-style packing/fusion only pays off when there are multiple
+    // token-expert rows to group, so keep Gemma 31B decode on the measured
+    // single-projection Q4_K kernel instead of the custom K=5376 dual dispatch.
+    const can_use_staged_dual = K < 5376 and
+        engine.dmmv_q4k_dual_pipe.handle != null and
+        engine.dmmv_q4k_dual_pipe.max_threads_per_threadgroup >= 256;
+
+    return engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        M > 0 and
+        K > 0 and
+        K % 256 == 0 and
+        can_use_staged_dual;
+}
+
+/// Pairs the dense Gemma attention Q and K projections (same K, both Q4_K,
+/// distinct M_q and M_k) into one dispatch via `dmmv_q4k_qk_dual.metal`.
+/// The kernel uses a single-axis row layout (rows 0..M_q-1 → Q, rows
+/// M_q..M_q+M_k-1 → K), so total threadgroups equal the sum of the two
+/// separate single-projection dispatches and no GPU work is wasted —
+/// the only saving is one fewer encoded dispatch per dense full-attn
+/// layer (≈60/token on Gemma 31B's 60 layers). Requires
+/// M_q % (NSG*NR0) == 0 (NSG=2, NR0=2 → 4) so a threadgroup never
+/// straddles the projection boundary.
+fn canUseDenseQ4KQKDual(
+    engine: *const InferenceEngine,
+    q: *const metal_loader.LoadedTensor,
+    k: *const metal_loader.LoadedTensor,
+    M_q: u32,
+    M_k: u32,
+    K: u32,
+) bool {
+    // Gemma-only: on Qwen3-8B (M_q=4096, M_k=1024) the dual kernel measured
+    // ~4% slower than the two separate Q and K matvec dispatches the
+    // concurrent encoder runs in parallel — the fused kernel's per-thread
+    // Q-vs-K branch cost doesn't amortize on smaller M_q the way it does on
+    // Gemma 31B (M_q=8192, M_k=4096). See EFFORT_14_NOTES.md Cycle 4.
+    return engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        q.info.type_ == .q4_k and
+        k.info.type_ == .q4_k and
+        K > 0 and
+        K % 256 == 0 and
+        M_q > 0 and
+        M_k > 0 and
+        (M_q % 4) == 0 and
+        engine.dmmv_q4k_qk_dual_pipe.handle != null and
+        engine.dmmv_q4k_qk_dual_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn dispatchDenseQ4KQKDualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    q_tensor: *const metal_loader.LoadedTensor,
+    k_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    q_buf: *const MetalBuffer,
+    k_buf: *const MetalBuffer,
+    M_q: u32,
+    M_k: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, q_tensor, M_q, K);
+    recordDmmvProfile(engine, k_tensor, M_k, K);
+
+    const push = QKDualPush{
+        .M_q = M_q,
+        .M_k = M_k,
+        .K = K,
+        .a_q_offset = tensorPageOffset(engine.model, q_tensor),
+        .a_k_offset = tensorPageOffset(engine.model, k_tensor),
+        .x_offset = 0,
+        .y_q_offset = 0,
+        .y_k_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &q_tensor.gpu_buffer, &k_tensor.gpu_buffer, input_buf, q_buf, k_buf };
+    const rows_per_wg: u32 = 4; // NSG=2 * NR0=2
+    const block_size: u32 = 64;
+    const total_rows = M_q + M_k;
+    cmd.dispatchV2(&engine.dmmv_q4k_qk_dual_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(QKDualPush), 2);
+}
+
+fn dispatchDenseQ4KGateUpDualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    up_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, gate, M, K);
+    recordDmmvProfile(engine, up, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, gate_buf, up_buf };
+    const use_llama_dual = K >= 5376 and engine.dmmv_q4k_dual_llama_pipe.handle != null;
+    const pipe = if (use_llama_dual) &engine.dmmv_q4k_dual_llama_pipe else &engine.dmmv_q4k_dual_pipe;
+    const rows_per_wg: u32 = if (use_llama_dual) 4 else 16;
+    const block_size: u32 = if (use_llama_dual) 64 else 256;
+    const projections: u32 = if (use_llama_dual) 2 else 1;
+    cmd.dispatchV2(pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, projections, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 2);
+}
+
+fn canUseDenseQ4KGateUpGeGLU(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // Effort-12 cycle-40 bench-metal-shapes confirmed dense Gemma 31B kernels run
+    // at ~500 GB/s but per-token GPU wait is 57x the sum of kernel times — the
+    // bottleneck is per-dispatch overhead, not per-kernel bandwidth. llama.cpp
+    // keeps single-token gate/up as separate mul_mv nodes because it pays no
+    // dispatch tax on its target hardware, but on Apple9 with 60 dependent
+    // layers each saved dispatch removes one encoder-pipeline stall. Re-enable
+    // the gate/up+GeGLU fusion for K=5376 to drop two dispatches per layer
+    // (gate, up, GeGLU → one fused dispatch) — 120 fewer dispatches per token.
+    return !engine.debug_validation_enabled and
+        engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        usesGeglu(engine.config) and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        M > 0 and
+        K > 0 and
+        K % 256 == 0 and
+        engine.dmmv_q4k_dense_gate_up_geglu_pipe.handle != null and
+        engine.dmmv_q4k_dense_gate_up_geglu_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn dispatchDenseQ4KGateUpGeGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, gate, M, K);
+    recordDmmvProfile(engine, up, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, output_buf };
+    const rows_per_wg: u32 = 4;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_dense_gate_up_geglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        2,
+    );
+}
+
+fn canUseDenseQ4KGateUpSwiGLU(
+    engine: *const InferenceEngine,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // Sibling of canUseDenseQ4KGateUpGeGLU but for SwiGLU architectures
+    // (Qwen3 dense — `.qwen2` enum covers Qwen3 8B, Mistral/Llama also use
+    // SwiGLU but are not yet validated through this path). Drops 2
+    // dispatches + 1 barrier per dense FFN layer and avoids the DRAM
+    // round trip for the inter_dim-wide gate/up intermediates.
+    return !engine.debug_validation_enabled and
+        engine.config.architecture == .qwen2 and
+        engine.config.n_experts == 0 and
+        !usesGeglu(engine.config) and
+        gate.info.type_ == .q4_k and
+        up.info.type_ == .q4_k and
+        M > 0 and
+        K > 0 and
+        K % 256 == 0 and
+        engine.dmmv_q4k_dense_gate_up_swiglu_pipe.handle != null and
+        engine.dmmv_q4k_dense_gate_up_swiglu_pipe.max_threads_per_threadgroup >= 64;
+}
+
+fn dispatchDenseQ4KGateUpSwiGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+) void {
+    recordDmmvProfile(engine, gate, M, K);
+    recordDmmvProfile(engine, up, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, output_buf };
+    const rows_per_wg: u32 = 4;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_dense_gate_up_swiglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ 64, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        2,
+    );
 }
 
 fn dispatchDualQ8DmmvOnCmd(
@@ -3212,6 +6719,77 @@ fn dispatchDualQ8DmmvOnCmd(
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
 }
 
+fn dispatchPairedQ8DmmvOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor0: *const metal_loader.LoadedTensor,
+    tensor1: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output0_buf: *const MetalBuffer,
+    output1_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, tensor0, M, K);
+    recordDmmvProfile(engine, tensor1, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, tensor0),
+        .a1_offset = tensorPageOffset(engine.model, tensor1),
+        .x_offset = x_byte_offset,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor0.gpu_buffer, &tensor1.gpu_buffer, input_buf, output0_buf, output1_buf };
+    const block_size = pairedQ8DmmvBlockSize(engine, tensor0, tensor1);
+    const simd_width = if (engine.dmmv_q8_0_pair_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_pipe.thread_execution_width else @as(u32, 32);
+    const rows_per_wg: u32 = (block_size / simd_width) * 2;
+    cmd.dispatchV2(&engine.dmmv_q8_0_pair_pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+}
+
+fn dispatchPairedQ8SwiGLUOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const metal_loader.LoadedTensor,
+    up: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, gate, M, K);
+    recordDmmvProfile(engine, up, M, K);
+
+    const push = DualQ8DmmvPush{
+        .M0 = M,
+        .M1 = M,
+        .K = K,
+        .a0_offset = tensorPageOffset(engine.model, gate),
+        .a1_offset = tensorPageOffset(engine.model, up),
+        .x_offset = x_byte_offset,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate.gpu_buffer, &up.gpu_buffer, input_buf, output_buf };
+    const block_size = pairedQ8DmmvBlockSize(engine, gate, up);
+    const simd_width = if (engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width > 0) engine.dmmv_q8_0_pair_swiglu_pipe.thread_execution_width else @as(u32, 32);
+    const rows_per_wg: u32 = (block_size / simd_width) * 2;
+    cmd.dispatchV2(
+        &engine.dmmv_q8_0_pair_swiglu_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ block_size, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DualQ8DmmvPush),
+        0,
+    );
+}
+
 /// Fused RMSNorm + Dual Q8_0 DMMV: reads raw hidden state, computes norm inline,
 /// eliminating the separate RMSNorm dispatch and barrier.
 fn dispatchFusedNormDualQ8DmmvOnCmd(
@@ -3248,7 +6826,7 @@ fn dispatchFusedNormDualQ8DmmvOnCmd(
     const total_rows = M0 + M1;
     const block_size = engine.q8_dual_tg_override orelse 1024;
     const simd_width = if (engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width > 0) engine.dmmv_q8_0_dual_fused_norm_pipe.thread_execution_width else @as(u32, 32);
-    const rows_per_wg: u32 = block_size / simd_width;
+    const rows_per_wg: u32 = (block_size / simd_width) * 4;
     cmd.dispatchV2(&engine.dmmv_q8_0_dual_fused_norm_pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
 }
 
@@ -3305,6 +6883,129 @@ fn dispatchDmmvOnCmdWithWeightBuf(
             .y_offset = 0,
         };
         const bufs = [_]*const MetalBuffer{ weight_buf, input_buf, output_buf };
+        if (getenv("ZINC_METAL_Q8_TG_SIZE") == null and
+            preferLlamaQ8SmallThreadgroupForQwenSsm(tensor, M, K) and
+            engine.dmmv_q8_0_repacked_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_pipe.max_threads_per_threadgroup >= 128)
+        {
+            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl` (N_R0_Q8_0=2,
+            // N_SG_Q8_0=4) to the private-repacked SSM Q8 path. Keep the
+            // accepted TG128 occupancy shape, but use fixed-K kernels for the
+            // hot Qwen3.6 SSM projections so the active prompt path avoids
+            // dynamic group-count and row-stride work.
+            const block_size: u32 = 128;
+            const rows_per_wg: u32 = (block_size / 32) * 2;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            if (K == 2048 and
+                M % 2 == 0 and
+                engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+            if (K == 4096 and
+                M % 2 == 0 and
+                engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_nr2_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+            if (K == 2048 and
+                engine.dmmv_q8_0_repacked_k2048_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k2048_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+            if (K == 4096 and
+                engine.dmmv_q8_0_repacked_k4096_pipe.thread_execution_width == 32 and
+                engine.dmmv_q8_0_repacked_k4096_pipe.max_threads_per_threadgroup >= block_size)
+            {
+                recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+                cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+                return;
+            }
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .tg128);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 2048 and
+            M % 4 == 0 and
+            engine.dmmv_q8_0_repacked_k2048_qwen_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k2048_qwen_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl`'s fixed row-group
+            // discipline to Qwen3.6's exact SSM/full-attn Q8 shapes: all
+            // production rows are multiples of four, so avoid the generic
+            // tail predicates in the hottest repacked K=2048 path.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 2048 and
+            engine.dmmv_q8_0_repacked_k2048_quad_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k2048_quad_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Same adjacent-row matvec discipline as llama.cpp's
+            // kernel_mul_mv_q8_0_f32_impl, but with ZINC's repacked row
+            // stride and the Qwen3.6 SSM K=2048 shape baked into the shader.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k2048_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 4096 and
+            M % 4 == 0 and
+            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k4096_qwen_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Same exact-row specialization for Qwen3.6 SSM out and
+            // full-attention output projections with K=4096.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .exact_qwen);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_qwen_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            K == 4096 and
+            engine.dmmv_q8_0_repacked_k4096_quad_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_k4096_quad_pipe.max_threads_per_threadgroup >= 512)
+        {
+            // Adapt llama.cpp's `kernel_mul_mv_q8_0_f32_impl` adjacent-row
+            // matvec grouping to ZINC's repacked Q8 SSM-out K=4096 shape.
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_k4096_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
+        if (preferApple9QwenSsmRepackedQ8QuadPath(engine.config, tensor, M, K) and
+            engine.dmmv_q8_0_repacked_quad_pipe.thread_execution_width == 32 and
+            engine.dmmv_q8_0_repacked_quad_pipe.max_threads_per_threadgroup >= 512)
+        {
+            const block_size: u32 = 512;
+            const rows_per_wg: u32 = (block_size / 32) * 4;
+            const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+            recordQ8RepackedKernelProfile(engine, tensor, M, K, .quad);
+            cmd.dispatchV2(&engine.dmmv_q8_0_repacked_quad_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+            return;
+        }
         const simd_w: u32 = if (engine.dmmv_q8_0_repacked_pipe.thread_execution_width > 0)
             engine.dmmv_q8_0_repacked_pipe.thread_execution_width
         else
@@ -3312,6 +7013,7 @@ fn dispatchDmmvOnCmdWithWeightBuf(
         const block_size: u32 = @min(512, engine.dmmv_q8_0_repacked_pipe.max_threads_per_threadgroup);
         const rows_per_wg: u32 = block_size / simd_w * 2; // nr=2
         const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        recordQ8RepackedKernelProfile(engine, tensor, M, K, .generic);
         cmd.dispatchV2(&engine.dmmv_q8_0_repacked_pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
         return;
     }
@@ -3348,6 +7050,75 @@ fn dispatchLmHeadOnCmd(
     dispatchDmmvOnCmd(engine, cmd, engine.lm_head, input_buf, output_buf, vocab_size, hidden_dim, 0);
 }
 
+/// True when the dense Gemma final LM head can fuse `final_norm` (RMS
+/// scaled by `final_norm_gpu`) into its Q4_K matvec via
+/// `dmmv_q4k_lmhead_norm.metal`. The fused kernel mirrors the base
+/// llama.cpp `kernel_mul_mv_q4_K_f32` row layout (NSG=2, NR0=2, 64
+/// threads) used by `dmmv_q4k.metal` for K=hidden_dim=5376 on Gemma
+/// 31B, so we only enable it where the base kernel would already have
+/// been selected (Q4_K, K%256==0, no private weight buffer).
+//
+// Tried porting this to Q6_K (dmmv_q6k_lmhead_norm.metal, deleted)
+// for Qwen3-8B's Q6_K LM head: decode regressed ~10% (43.3 → 39.0
+// tok/s on M1 Max). The per-simdgroup-redundant RMS plus the extra
+// norm_weight reads thrashed L1 across the vocab=151936 LM head's
+// 76K simdgroups. The Q4_K version pays off on Gemma because the
+// dense-decode matvec budget per simdgroup is larger relative to
+// the redundant norm-weight reads. Do not re-attempt without a
+// different fusion strategy (e.g. a single-TG pre-RMS that writes a
+// scratch then the unfused matvec re-reads it).
+fn canUseLmHeadFusedNorm(engine: *const InferenceEngine, hidden_dim: u32) bool {
+    return engine.lm_head.info.type_ == .q4_k and
+        hidden_dim > 0 and
+        hidden_dim % 256 == 0 and
+        engine.lm_head_private_buf.handle == null and
+        engine.dmmv_q4k_lmhead_norm_pipe.handle != null and
+        engine.dmmv_q4k_lmhead_norm_pipe.max_threads_per_threadgroup >= 64;
+}
+
+/// Fused `final_norm` + Q4_K LM head DMMV. Reads the unnormalized
+/// hidden vector + `final_norm_gpu` weights, computes the RMS
+/// reciprocal per simdgroup, and applies `norm_weight * rms_inv` to
+/// the X loads inside the matvec. Saves one dispatch + one barrier
+/// in the final phase of dense Gemma decode.
+fn dispatchLmHeadFusedNormOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden_buf: *const MetalBuffer,
+    norm_weight_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    hidden_dim: u32,
+    vocab_size: u32,
+) void {
+    recordDmmvProfile(engine, engine.lm_head, vocab_size, hidden_dim);
+
+    const push = DmmvNormPush{
+        .M = vocab_size,
+        .K = hidden_dim,
+        .a_offset = tensorPageOffset(engine.model, engine.lm_head),
+        .x_offset = 0,
+        .y_offset = 0,
+        .eps = engine.config.rms_norm_eps,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &engine.lm_head.gpu_buffer,
+        hidden_buf,
+        output_buf,
+        norm_weight_buf,
+    };
+    const rows_per_wg: u32 = 4; // NSG=2 * NR0=2
+    const block_size: u32 = 64;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_lmhead_norm_pipe,
+        .{ (vocab_size + rows_per_wg - 1) / rows_per_wg, 1, 1 },
+        .{ block_size, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(DmmvNormPush),
+        1,
+    );
+}
+
 /// Variant of `dispatchLmHeadOnCmd` that accepts a byte offset into `input_buf`.
 /// Used by `prefillBatched` to point at the last token's slice inside the
 /// contiguous [N × hidden_dim] normalized hidden buffer without a CPU memcpy.
@@ -3361,6 +7132,7 @@ fn dispatchLmHeadWithInputOffset(
     x_offset_bytes: u32,
 ) void {
     const tensor = engine.lm_head;
+    recordDmmvProfile(engine, tensor, vocab_size, hidden_dim);
     const weight_buf: *const MetalBuffer = if (engine.lm_head_private_buf.handle != null)
         &engine.lm_head_private_buf
     else
@@ -3387,7 +7159,9 @@ fn dispatchLmHeadWithInputOffset(
 }
 
 fn shouldCpuLmHeadFallbackForType(arch: config_mod.Architecture, quant_type: GGMLType) bool {
-    return arch == .gemma and quant_type == .q8_0;
+    _ = arch;
+    _ = quant_type;
+    return false;
 }
 
 fn shouldCpuLmHeadFallback(engine: *const InferenceEngine) bool {
@@ -3422,6 +7196,15 @@ fn dispatchDmmvOnCmdWithInputOffset(
     extra_byte_offset: u32,
     x_byte_offset: u32,
 ) void {
+    recordDmmvProfile(engine, tensor, M, K);
+    if (canUseDenseQ6kSimdgroupDmmv(engine, tensor, M, K)) {
+        dispatchDenseQ6kSimdgroupDmmvOnCmd(engine, cmd, tensor, input_buf, output_buf, M, K, extra_byte_offset, x_byte_offset);
+        return;
+    }
+    if (canUseDenseGemmaDecodeGemm(engine, tensor, M, K, extra_byte_offset, x_byte_offset)) {
+        dispatchGemmBatchedOnCmd(engine, cmd, tensor, input_buf, output_buf, M, K, 1);
+        return;
+    }
     const pip = engine.dmmvPipelineForType(tensor, M, K) orelse {
         // CPU fallback for unsupported quant types. Re-open a command buffer
         // afterwards so later kernels in the same logical sequence still record.
@@ -3447,6 +7230,36 @@ fn dispatchDmmvOnCmdWithInputOffset(
         .a_offset = page_off + extra_byte_offset,
         .x_offset = x_byte_offset,
         .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
+    const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
+    cmd.dispatchV2(pip.pipe, .{ wgs, 1, 1 }, .{ pip.block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), pip.push_idx);
+}
+
+/// DMMV with explicit byte offsets into both input and output buffers.
+fn dispatchDmmvOnCmdWithInputOutputOffset(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, tensor, M, K);
+    const pip = engine.dmmvPipelineForType(tensor, M, K) orelse {
+        log.err("No DMMV pipeline for quant type {d} (tensor {s})", .{ @intFromEnum(tensor.info.type_), tensor.info.name });
+        return;
+    };
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
     const wgs = (M + pip.rows_per_wg - 1) / pip.rows_per_wg;
@@ -3482,6 +7295,7 @@ fn dispatchDmmvMoeQ4kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q4_k) {
         log.err("Batched MoE DMMV only supports Q4_K (tensor {s})", .{tensor.info.name});
@@ -3494,7 +7308,7 @@ fn dispatchDmmvMoeQ4kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -3505,7 +7319,7 @@ fn dispatchDmmvMoeQ4kOnCmd(
         x_expert_stride != 0 and
         M >= 1024 and
         engine.dmmv_q4k_moe_k2048_1024_pipe.max_threads_per_threadgroup >= 1024;
-    const rows_per_wg: u32 = if (use_1024_k2048) 32 else if (k2048_or_less) 16 else 8;
+    const rows_per_wg: u32 = if (use_1024_k2048) 32 else 16;
     const block_size: u32 = if (use_1024_k2048) 1024 else if (k2048_or_less) 512 else 256;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
     const pipe = if (use_1024_k2048)
@@ -3529,6 +7343,7 @@ fn dispatchDmmvMoeQ5kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q5_k) {
         log.err("Batched MoE DMMV only supports Q5_K (tensor {s})", .{tensor.info.name});
@@ -3545,18 +7360,44 @@ fn dispatchDmmvMoeQ5kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const qwen_q5k_down_k512 =
+        K == 512 and
+        M >= 1024 and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        engine.config.n_experts_used == 8 and
+        std.mem.endsWith(u8, tensor.info.name, "ffn_down_exps.weight");
+    // Mirrors llama.cpp's routed matvec row grouping: reuse one selected expert input
+    // vector across more adjacent output rows before falling back to narrower groups.
+    const use_k512_quad =
+        qwen_q5k_down_k512 and
+        (readBoolEnv("ZINC_METAL_QWEN_Q5K_DOWN_K512_QUAD") orelse true) and
+        engine.dmmv_q5k_moe_k512_quad_pipe.max_threads_per_threadgroup >= 512;
+    const use_k512_tri =
+        !use_k512_quad and
+        qwen_q5k_down_k512 and
+        (readBoolEnv("ZINC_METAL_QWEN_Q5K_DOWN_K512_TRI") orelse true) and
+        engine.dmmv_q5k_moe_k512_tri_pipe.max_threads_per_threadgroup >= 512;
+    const use_k512 =
+        !use_k512_tri and
+        !use_k512_quad and
+        qwen_q5k_down_k512 and
+        engine.dmmv_q5k_moe_k512_pipe.max_threads_per_threadgroup >= 512;
     const k2048_or_less = K <= 2048;
     const use_k2048 =
+        !use_k512_tri and
+        !use_k512_quad and
+        !use_k512 and
         k2048_or_less and
         engine.dmmv_q5k_moe_k2048_pipe.max_threads_per_threadgroup >= 512;
-    const rows_per_wg: u32 = if (use_k2048) 16 else 8;
-    const block_size: u32 = if (use_k2048) 512 else 256;
+    const rows_per_wg: u32 = if (use_k512_tri) 48 else if (use_k512_quad) 64 else if (use_k512) 32 else if (use_k2048) 16 else 8;
+    const block_size: u32 = if (use_k512_tri or use_k512_quad or use_k512 or use_k2048) 512 else 256;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
-    const pipe = if (use_k2048) &engine.dmmv_q5k_moe_k2048_pipe else &engine.dmmv_q5k_moe_pipe;
+    const pipe = if (use_k512_tri) &engine.dmmv_q5k_moe_k512_tri_pipe else if (use_k512_quad) &engine.dmmv_q5k_moe_k512_quad_pipe else if (use_k512) &engine.dmmv_q5k_moe_k512_pipe else if (use_k2048) &engine.dmmv_q5k_moe_k2048_pipe else &engine.dmmv_q5k_moe_pipe;
     cmd.dispatchV2(pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
 }
 
@@ -3572,6 +7413,7 @@ fn dispatchDmmvMoeQ5_1OnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q5_1) {
         log.err("Batched Q5_1 MoE DMMV called with wrong type (tensor {s})", .{tensor.info.name});
@@ -3583,15 +7425,84 @@ fn dispatchDmmvMoeQ5_1OnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
-    // 2 rows per workgroup (matches dmmv_q5_1.metal: 2 simdgroups × 32 threads).
-    const rows_per_wg: u32 = 2;
+    // Match llama.cpp's Metal mul_mv_id Q5_1 shape: two simdgroups per
+    // threadgroup, four Q5_1 rows per simdgroup, one cached activation vector.
+    const rows_per_wg: u32 = 8;
     const block_size: u32 = 64;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
     cmd.dispatchV2(&engine.dmmv_q5_1_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+}
+
+fn canUseDenseGemmaDecodeGemm(
+    engine: *const InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .gemma or cfg.n_experts != 0 or cfg.ssm_d_inner != 0) return false;
+    if (extra_byte_offset != 0 or x_byte_offset != 0) return false;
+    if (M < 1024 or K % 256 != 0) return false;
+    _ = tensor;
+
+    // This call site is single-token decode (N=1). llama.cpp's
+    // `ggml_metal_op_mul_mat` keeps that case on `kernel_mul_mv_*` and only
+    // switches to simdgroup matrix-matrix once the RHS batch clears its
+    // break-even threshold. Dense batched prefill still calls
+    // `dispatchGemmBatchedOnCmd` directly with N > 1.
+    return false;
+}
+
+fn canUseDenseQ6kSimdgroupDmmv(
+    engine: *const InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    M: u32,
+    K: u32,
+) bool {
+    // Dense single-token decode should follow llama.cpp's mul_mv Q6_K path.
+    // The MoE Q6_K shader stages X in threadgroup memory for routed experts;
+    // that does not match this N=1 dense projection shape.
+    return engine.config.architecture == .gemma and
+        engine.config.n_experts == 0 and
+        tensor.info.type_ == .q6_k and
+        M > 0 and
+        K % 256 == 0 and
+        engine.dmmv_q6k_llama_pipe.handle != null;
+}
+
+fn dispatchDenseQ6kSimdgroupDmmvOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) void {
+    if (engine.dmmv_q6k_llama_pipe.handle != null) {
+        const push = DmmvPush{
+            .M = M,
+            .K = K,
+            .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+            .x_offset = x_byte_offset,
+            .y_offset = 0,
+        };
+        const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf };
+        const rows_per_wg: u32 = 4;
+        const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        cmd.dispatchV2(&engine.dmmv_q6k_llama_pipe, .{ wgs, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 1);
+        return;
+    }
+
+    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, tensor, &tensor.gpu_buffer, tensorPageOffset(engine.model, tensor), input_buf, output_buf, M, K, extra_byte_offset);
 }
 
 fn dispatchDmmvMoeQ6kOnCmd(
@@ -3606,6 +7517,7 @@ fn dispatchDmmvMoeQ6kOnCmd(
     expert_stride: u32,
     x_expert_stride: u32,
     extra_byte_offset: u32,
+    x_byte_offset: u32,
 ) void {
     if (tensor.info.type_ != .q6_k) {
         log.err("Batched MoE DMMV only supports Q6_K (tensor {s})", .{tensor.info.name});
@@ -3622,7 +7534,7 @@ fn dispatchDmmvMoeQ6kOnCmd(
         .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
         .expert_stride = expert_stride,
         .x_expert_stride = x_expert_stride,
-        .x_offset = 0,
+        .x_offset = x_byte_offset,
         .y_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
@@ -3630,6 +7542,48 @@ fn dispatchDmmvMoeQ6kOnCmd(
     const block_size: u32 = 256;
     const wgs = (M + rows_per_wg - 1) / rows_per_wg;
     cmd.dispatchV2(&engine.dmmv_q6k_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+}
+
+fn dispatchDmmvMoeMxfp4OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) !void {
+    if (tensor.info.type_ != .mxfp4) return error.UnsupportedQuantType;
+    if (K > 4096) return error.UnsupportedQuantType;
+    if (engine.dmmv_mxfp4_moe_pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_byte_offset,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    if (engine.dmmv_mxfp4_moe_sg_pipe.handle != null and K <= 4096 and
+        engine.dmmv_mxfp4_moe_sg_pipe.thread_execution_width == 32 and
+        engine.dmmv_mxfp4_moe_sg_pipe.max_threads_per_threadgroup >= 512)
+    {
+        const rows_per_wg: u32 = 16;
+        const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        cmd.dispatchV2(&engine.dmmv_mxfp4_moe_sg_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    } else {
+        const rows_per_wg: u32 = 64;
+        const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+        cmd.dispatchV2(&engine.dmmv_mxfp4_moe_pipe, .{ wgs, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    }
 }
 
 fn dispatchDmmvMoeOnCmd(
@@ -3645,15 +7599,365 @@ fn dispatchDmmvMoeOnCmd(
     x_expert_stride: u32,
     extra_byte_offset: u32,
 ) !void {
-    recordMoeDmmvProfile(engine, tensor.info.type_, M, K, engine.config.n_experts_used);
+    try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, 0);
+}
+
+fn dispatchDmmvMoeOnCmdWithInputOffset(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+) !void {
+    recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used);
 
     switch (tensor.info.type_) {
-        .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
-        .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset),
+        .q4_k => dispatchDmmvMoeQ4kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q5_1 => dispatchDmmvMoeQ5_1OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q5_k => dispatchDmmvMoeQ5kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .q6_k => dispatchDmmvMoeQ6kOnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
+        .mxfp4 => try dispatchDmmvMoeMxfp4OnCmd(engine, cmd, tensor, input_buf, output_buf, routing_buf, M, K, expert_stride, x_expert_stride, extra_byte_offset, x_byte_offset),
         else => return error.UnsupportedQuantType,
     }
+}
+
+fn dispatchDmmvMoeGateUpQ4kOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    gate_output_buf: *const MetalBuffer,
+    up_output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    gate_base_offset: u32,
+    up_base_offset: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+) !void {
+    if (tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
+    if (engine.dmmv_q4k_moe_gate_up_pipe.handle == null) return error.UnsupportedQuantType;
+
+    recordMoeDmmvProfile(engine, tensor, M, K, engine.config.n_experts_used * 2);
+
+    const push = MoeGateUpDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .expert_stride = expert_stride,
+        .gate_base_offset = gate_base_offset,
+        .up_base_offset = up_base_offset,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_offset,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, gate_output_buf, up_output_buf, routing_buf };
+    const rows_per_wg: u32 = 16;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_moe_gate_up_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeGateUpDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeGateUpDualQ4kOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    gate_output_buf: *const MetalBuffer,
+    up_output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+) !void {
+    if (gate_tensor.info.type_ != .q4_k or up_tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
+    if (engine.dmmv_q4k_moe_gate_up_dual_pipe.handle == null) return error.UnsupportedQuantType;
+
+    recordMoeDmmvProfile(engine, gate_tensor, M, K, engine.config.n_experts_used);
+    recordMoeDmmvProfile(engine, up_tensor, M, K, engine.config.n_experts_used);
+
+    const push = MoeGateUpDualDmmvPush{
+        .M = M,
+        .K = K,
+        .gate_a_offset = tensorPageOffset(engine.model, gate_tensor),
+        .up_a_offset = tensorPageOffset(engine.model, up_tensor),
+        .gate_expert_stride = gate_expert_stride,
+        .up_expert_stride = up_expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_offset,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, gate_output_buf, up_output_buf, routing_buf };
+    const use_qwen_k2048 =
+        engine.config.architecture == .qwen2_moe and
+        M == 512 and
+        K == 2048 and
+        engine.config.n_experts_used == 8 and
+        engine.dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null;
+    const pipe = if (use_qwen_k2048)
+        &engine.dmmv_q4k_moe_gate_up_dual_k2048_pipe
+    else
+        &engine.dmmv_q4k_moe_gate_up_dual_pipe;
+    const block_size: u32 = if (use_qwen_k2048) 512 else 256;
+    const rows_per_wg: u32 = 16;
+    cmd.dispatchV2(
+        pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
+        .{ block_size, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeGateUpDualDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate_tensor: *const metal_loader.LoadedTensor,
+    up_tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    gate_expert_stride: u32,
+    up_expert_stride: u32,
+    x_expert_stride: u32,
+    x_offset: u32,
+) !void {
+    if (gate_tensor.info.type_ != .q4_k or up_tensor.info.type_ != .q4_k) return error.UnsupportedQuantType;
+    if (engine.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle == null) return error.UnsupportedQuantType;
+
+    recordMoeDmmvProfile(engine, gate_tensor, M, K, engine.config.n_experts_used);
+    recordMoeDmmvProfile(engine, up_tensor, M, K, engine.config.n_experts_used);
+
+    const push = MoeGateUpDualDmmvPush{
+        .M = M,
+        .K = K,
+        .gate_a_offset = tensorPageOffset(engine.model, gate_tensor),
+        .up_a_offset = tensorPageOffset(engine.model, up_tensor),
+        .gate_expert_stride = gate_expert_stride,
+        .up_expert_stride = up_expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = x_offset,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_tensor.gpu_buffer, &up_tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+    const rows_per_wg: u32 = 16;
+    cmd.dispatchV2(
+        &engine.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, engine.config.n_experts_used, 1 },
+        .{ 512, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeGateUpDualDmmvPush),
+        1,
+    );
+}
+
+/// Dispatch route-slot ordered MoE DMMV. Unlike grouped-column prefill, this
+/// mirrors llama.cpp's small-batch `mul_mv_id` branch: grid.y is one selected
+/// token/expert route, and `routing_buf[route]` is the real expert id.
+fn dispatchDmmvMoeRoutesOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    routing_buf: *const MetalBuffer,
+    route_slots: u32,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    x_expert_stride: u32,
+    extra_byte_offset: u32,
+) !void {
+    recordMoeDmmvProfile(engine, tensor, M, K, route_slots);
+
+    const push = MoeDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_expert_stride = x_expert_stride,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, routing_buf };
+
+    switch (tensor.info.type_) {
+        .q4_k => {
+            const k2048_or_less = K <= 2048;
+            const use_1024_k2048 =
+                k2048_or_less and
+                engine.device.chip.isM5Class() and
+                x_expert_stride != 0 and
+                M >= 1024 and
+                engine.dmmv_q4k_moe_k2048_1024_pipe.max_threads_per_threadgroup >= 1024;
+            const rows_per_wg: u32 = if (use_1024_k2048) 32 else 16;
+            const block_size: u32 = if (use_1024_k2048) 1024 else if (k2048_or_less) 512 else 256;
+            const pipe = if (use_1024_k2048)
+                &engine.dmmv_q4k_moe_k2048_1024_pipe
+            else if (k2048_or_less)
+                &engine.dmmv_q4k_moe_k2048_pipe
+            else
+                &engine.dmmv_q4k_moe_pipe;
+            cmd.dispatchV2(pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, route_slots, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+        },
+        .q5_1 => {
+            const rows_per_wg: u32 = 8;
+            const block_size: u32 = 64;
+            cmd.dispatchV2(&engine.dmmv_q5_1_moe_pipe, .{ (M + rows_per_wg - 1) / rows_per_wg, route_slots, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+        },
+        else => return error.UnsupportedQuantType,
+    }
+}
+
+/// Dispatch a grouped column MoE DMMV for batched Gemma prefill. The grouped
+/// kernels consume route-packed IDs and produce route-slot-indexed output:
+/// `[token * k + slot][M]`. `input_buf` is also route-slot-indexed; callers
+/// that start from token-ordered hidden states must gather/expand them first.
+fn dispatchDmmvMoeColsOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    n_experts: u32,
+    max_count: u32,
+) !void {
+    const route_blocks = @max(max_count, 1);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
+
+    const pipe: *const MetalPipeline = switch (tensor.info.type_) {
+        .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
+        .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
+        .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
+        else => return error.UnsupportedQuantType,
+    };
+    if (pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeColsDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
+        .ids_stride = ids_stride,
+        .x_route_divisor = @max(x_route_divisor, 1),
+        .use_active_blocks = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input_buf, output_buf, counts_buf, packed_ids_buf, packed_ids_buf, counts_buf };
+    const rows_per_wg: u32 = 8;
+    const cols_per_wg: u32 = 4;
+    cmd.dispatchV2(
+        pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, n_experts, (route_blocks + cols_per_wg - 1) / cols_per_wg },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeColsDmmvPush),
+        1,
+    );
+}
+
+fn dispatchDmmvMoeColsActiveBlocksOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input_buf: *const MetalBuffer,
+    output_buf: *const MetalBuffer,
+    counts_buf: *const MetalBuffer,
+    packed_ids_buf: *const MetalBuffer,
+    active_blocks_buf: *const MetalBuffer,
+    active_block_count_buf: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    expert_stride: u32,
+    extra_byte_offset: u32,
+    x_byte_offset: u32,
+    y_byte_offset: u32,
+    ids_stride: u32,
+    x_route_divisor: u32,
+    active_block_upper_bound: u32,
+) !void {
+    const route_blocks = @max(active_block_upper_bound, 1);
+    recordMoeDmmvProfile(engine, tensor, M, K, route_blocks);
+
+    const pipe: *const MetalPipeline = switch (tensor.info.type_) {
+        .q4_k => &engine.dmmv_q4k_moe_cols_pipe,
+        .q5_1 => &engine.dmmv_q5_1_moe_cols_pipe,
+        .q5_k => &engine.dmmv_q5k_moe_cols_pipe,
+        .q6_k => &engine.dmmv_q6k_moe_cols_pipe,
+        else => return error.UnsupportedQuantType,
+    };
+    if (pipe.handle == null) return error.UnsupportedQuantType;
+
+    const push = MoeColsDmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = tensorPageOffset(engine.model, tensor) + extra_byte_offset,
+        .expert_stride = expert_stride,
+        .x_offset = x_byte_offset,
+        .y_offset = y_byte_offset,
+        .ids_stride = ids_stride,
+        .x_route_divisor = @max(x_route_divisor, 1),
+        .use_active_blocks = 1,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &tensor.gpu_buffer,
+        input_buf,
+        output_buf,
+        counts_buf,
+        packed_ids_buf,
+        active_blocks_buf,
+        active_block_count_buf,
+    };
+    const rows_per_wg: u32 = 8;
+    cmd.dispatchV2(
+        pipe,
+        .{ (M + rows_per_wg - 1) / rows_per_wg, route_blocks, 1 },
+        .{ 256, 1, 1 },
+        &bufs,
+        &push,
+        @sizeOf(MoeColsDmmvPush),
+        1,
+    );
 }
 
 /// Preload norm weights from mmap into an f32 Metal buffer (done once at init).
@@ -3693,6 +7997,76 @@ fn dispatchRmsNormOnCmd(
     cmd.dispatchV2(&engine.rms_norm_pipe, .{ n_groups, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(RmsNormPush), 0);
 }
 
+fn dispatchRmsNormOnCmdWithWeightOffset(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    weights: *const MetalBuffer,
+    weight_offset: u32,
+    n: u32,
+    n_groups: u32,
+) void {
+    const push = RmsNormOffsetPush{ .n = n, .eps = engine.config.rms_norm_eps, .weight_offset = weight_offset };
+    const bufs = [_]*const MetalBuffer{ input, output, weights };
+    const tg_size: u32 = @min(
+        @max(engine.rms_norm_offset_pipe.max_threads_per_threadgroup, 32),
+        if (n >= 1024) @as(u32, 1024) else if (n >= 256) @as(u32, 256) else @as(u32, 32),
+    );
+    cmd.dispatchV2(&engine.rms_norm_offset_pipe, .{ n_groups, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(RmsNormOffsetPush), 0);
+}
+
+fn dispatchRmsNormOnCmdWithTensorWeights(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    weights: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_groups: u32,
+) void {
+    const weight_offset: u32 = @intCast(tensorPageOffset(engine.model, weights) / @sizeOf(f32));
+    dispatchRmsNormOnCmdWithWeightOffset(engine, cmd, input, output, &weights.gpu_buffer, weight_offset, n, n_groups);
+}
+
+fn dispatchGemmaMoePostNormResidualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    expert_in: *const MetalBuffer,
+    shared_in: *const MetalBuffer,
+    hidden: *const MetalBuffer,
+    expert_weights: *const metal_loader.LoadedTensor,
+    shared_weights: *const metal_loader.LoadedTensor,
+    final_weights: *const MetalBuffer,
+    gate_buf: *const MetalBuffer,
+    n: u32,
+    has_gate: bool,
+    has_final_norm: bool,
+) void {
+    const push = GemmaMoePostNormResidualPush{
+        .n = n,
+        .eps = engine.config.rms_norm_eps,
+        .expert_weight_offset = @intCast(tensorPageOffset(engine.model, expert_weights) / @sizeOf(f32)),
+        .shared_weight_offset = @intCast(tensorPageOffset(engine.model, shared_weights) / @sizeOf(f32)),
+        .has_gate = if (has_gate) 1 else 0,
+        .has_final_norm = if (has_final_norm) 1 else 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        expert_in,
+        shared_in,
+        hidden,
+        &expert_weights.gpu_buffer,
+        &shared_weights.gpu_buffer,
+        final_weights,
+        gate_buf,
+    };
+    const tg_size: u32 = @min(
+        @max(engine.gemma_moe_post_norm_residual_pipe.max_threads_per_threadgroup, 32),
+        if (n >= 1024) @as(u32, 1024) else if (n >= 256) @as(u32, 256) else @as(u32, 32),
+    );
+    cmd.dispatchV2(&engine.gemma_moe_post_norm_residual_pipe, .{ 1, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(GemmaMoePostNormResidualPush), 0);
+}
+
 /// Fused residual-add + RMS norm: hidden += scale * residual; norm_out = weights * normalize(hidden).
 /// Eliminates one barrier per layer vs separate scale_acc + barrier + rms_norm.
 /// residual_rms_norm.metal: buffer(0)=push, buffer(1)=hidden, buffer(2)=residual, buffer(3)=norm_out, buffer(4)=weights.
@@ -3706,9 +8080,207 @@ fn dispatchResidualRmsNormOnCmd(
     n: u32,
     scale: f32,
 ) void {
-    const push = ResidualRmsNormPush{ .n = n, .eps = engine.config.rms_norm_eps, .scale = scale };
+    dispatchResidualRmsNormOffsetOnCmd(engine, cmd, hidden, residual, norm_out, weights, n, scale, 0);
+}
+
+fn dispatchResidualRmsNormOffsetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    weights: *const MetalBuffer,
+    n: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    const push = ResidualRmsNormPush{ .n = n, .eps = engine.config.rms_norm_eps, .scale = scale, .residual_offset = residual_offset };
     const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, weights };
     cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+}
+
+fn canUseQwenResidualRmsNormRouterQ8Topk(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    residual_offset: u32,
+) bool {
+    return (readBoolEnv("ZINC_METAL_QWEN_RESIDUAL_ROUTER_Q8_FUSED") orelse true) and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k <= 16 and
+        residual_offset == 0 and
+        router.info.type_ == .q8_0 and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_pipe.max_threads_per_threadgroup >= 1024;
+}
+
+fn canUseQwenRouterQ8K2048Exact(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+) bool {
+    return engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k == 8 and
+        router.info.type_ == .q8_0;
+}
+
+const RouterWeightRef = struct {
+    buffer: *const MetalBuffer,
+    offset: u32,
+};
+
+fn routerWeightRef(engine: *const InferenceEngine, layer_idx: usize, router: *const metal_loader.LoadedTensor) RouterWeightRef {
+    if (engine.private_router_bufs) |bufs| {
+        if (layer_idx < bufs.len and bufs[layer_idx].handle != null) {
+            return .{ .buffer = &bufs[layer_idx], .offset = 0 };
+        }
+    }
+    return .{ .buffer = &router.gpu_buffer, .offset = tensorPageOffset(engine.model, router) };
+}
+
+fn dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    router: *const metal_loader.LoadedTensor,
+    router_buf: *const MetalBuffer,
+    router_offset: u32,
+    output: *const MetalBuffer,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    const push = ResidualRmsNormRouterQ8TopkPush{
+        .n = hidden_dim,
+        .eps = engine.config.rms_norm_eps,
+        .scale = scale,
+        .residual_offset = residual_offset,
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = router_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, router_buf, output };
+    if (router_buf.is_repacked_q8 and
+        canUseQwenRouterQ8K2048Exact(engine, router, hidden_dim, n_experts, k) and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_repacked_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+        return;
+    }
+    if (canUseQwenRouterQ8K2048Exact(engine, router, hidden_dim, n_experts, k) and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.handle != null and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_q8_0_topk_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+        return;
+    }
+    cmd.dispatchV2(&engine.residual_rms_norm_router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterQ8TopkPush), 0);
+}
+
+fn canUseQwenResidualRmsNormRouterF32Topk(
+    engine: *const InferenceEngine,
+    router: *const metal_loader.LoadedTensor,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+) bool {
+    return (readBoolEnv("ZINC_METAL_QWEN_RESIDUAL_ROUTER_F32_FUSED") orelse true) and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        hidden_dim == 2048 and
+        n_experts == 256 and
+        k == 8 and
+        router.info.type_ == .f32 and
+        engine.residual_rms_norm_router_f32_topk_pipe.handle != null and
+        engine.residual_rms_norm_router_f32_topk_pipe.thread_execution_width == 32 and
+        engine.residual_rms_norm_router_f32_topk_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    router: *const metal_loader.LoadedTensor,
+    output: *const MetalBuffer,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    scale: f32,
+    residual_offset: u32,
+) void {
+    recordDmmvProfile(engine, router, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    const push = ResidualRmsNormRouterF32TopkPush{
+        .n = hidden_dim,
+        .eps = engine.config.rms_norm_eps,
+        .scale = scale,
+        .residual_offset = residual_offset,
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, router),
+    };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, norm_out, norm_weight, &router.gpu_buffer, output };
+    cmd.dispatchV2(&engine.residual_rms_norm_router_f32_topk_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
+}
+
+/// Triple-fused: residual_norm + residual_add + output_norm.
+///   residual_normed[i] = residual_w[i] * residual[i] * rsqrt(mean(residual^2))
+///   hidden[i]         += residual_normed[i]
+///   norm_out[i]        = output_w[i]   * hidden[i]   * rsqrt(mean(hidden^2))
+/// Replaces (post_*_norm in-place) + barrier + (residual_rms_norm) with a
+/// single dispatch on the dense-FFN/next-attn boundary.
+/// post_norm_residual_rms_norm.metal: buffer(0)=push, (1)=hidden,
+/// (2)=residual, (3)=residual_w, (4)=norm_out, (5)=output_w.
+fn dispatchPostNormResidualRmsNormOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    hidden: *const MetalBuffer,
+    residual: *const MetalBuffer,
+    residual_w: *const MetalBuffer,
+    norm_out: *const MetalBuffer,
+    output_w: *const MetalBuffer,
+    n: u32,
+    hidden_scale: f32,
+) void {
+    const push = PostNormResidualRmsNormPush{
+        .n = n,
+        .eps = engine.config.rms_norm_eps,
+        .hidden_scale = hidden_scale,
+    };
+    const bufs = [_]*const MetalBuffer{ hidden, residual, residual_w, norm_out, output_w };
+    cmd.dispatchV2(&engine.post_norm_residual_rms_norm_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(PostNormResidualRmsNormPush), 0);
 }
 
 /// Dispatch a Q4_K × f32 batched matmul.
@@ -3746,6 +8318,38 @@ fn dispatchGemmQ4KOnCmd(
     cmd.dispatchV2WithTgMem(&engine.gemm_q4k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
 }
 
+/// Dispatch a Q5_K × f32 batched matmul. Same llama.cpp simdgroup-MM tile
+/// shape as Q4_K/Q6_K, with Q5_K's 176-byte blocks.
+fn dispatchGemmQ5KOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 256 == 0);
+    recordDmmvProfile(engine, weight, M, K);
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 256) * 176,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = tensorPageOffset(engine.model, weight),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q5k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
 /// Dispatch a Q6_K × f32 batched matmul. Same tile layout as gemm_q4k.
 /// Q6_K blocks are 210 bytes / 256 elements.
 fn dispatchGemmQ6KOnCmd(
@@ -3775,6 +8379,55 @@ fn dispatchGemmQ6KOnCmd(
     const bufs = [_]*const MetalBuffer{ &weight.gpu_buffer, input, output };
     const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
     cmd.dispatchV2WithTgMem(&engine.gemm_q6k_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+}
+
+/// Dispatch a Q8_0 x f32 batched matmul.
+///
+/// Computes `output[N x M] = weight[M x K] x input[N x K]` and stores output
+/// token-major, matching the existing batched prefill GEMM layout.
+fn dispatchGemmQ8_0OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, weight, &weight.gpu_buffer, tensorPageOffset(engine.model, weight), input, output, M, K, N);
+}
+
+fn dispatchGemmQ8_0OnCmdWithWeightBuf(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    weight: *const metal_loader.LoadedTensor,
+    weight_buf: *const MetalBuffer,
+    weight_offset: u32,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    M: u32,
+    K: u32,
+    N: u32,
+) void {
+    std.debug.assert(K % 32 == 0);
+    recordDmmvProfile(engine, weight, M, K);
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = @as(u64, K / 32) * 34,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = @as(u64, K) * 4,
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = weight_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ weight_buf, input, output };
+    const grid = [_]u32{ (N + 31) / 32, (M + 63) / 64, 1 };
+    cmd.dispatchV2WithTgMem(&engine.gemm_q8_0_pipe, grid, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
 }
 
 /// Dispatch batched RoPE for N tokens at consecutive positions.
@@ -3822,6 +8475,7 @@ fn dispatchFlashAttnBatchedOnCmd(
     kv_len: u32,
     n_queries: u32,
     kv_pos_offset: u32,
+    sliding_window_size: u32,
 ) void {
     const push = BatchedFlashAttnPush{
         .head_dim = head_dim,
@@ -3830,6 +8484,8 @@ fn dispatchFlashAttnBatchedOnCmd(
         .kv_len = kv_len,
         .n_queries = n_queries,
         .kv_pos_offset = kv_pos_offset,
+        .sliding_window_size = sliding_window_size,
+        .attn_scale_bits = if (engine.config.attn_scale != 0) @as(u32, @bitCast(engine.config.attn_scale)) else 0,
     };
     const bufs = [_]*const MetalBuffer{ q_buf, k_cache, v_cache, out_buf };
     cmd.dispatchV2(&engine.flash_attn_batched_pipe, .{ n_heads, n_queries, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(BatchedFlashAttnPush), 0);
@@ -3850,6 +8506,7 @@ fn dispatchFlashAttnBatchedQ8OnCmd(
     kv_len: u32,
     n_queries: u32,
     kv_pos_offset: u32,
+    sliding_window_size: u32,
     kv_head_stride_bytes: u32,
     kv_token_stride_bytes: u32,
 ) void {
@@ -3860,6 +8517,8 @@ fn dispatchFlashAttnBatchedQ8OnCmd(
         .kv_len = kv_len,
         .n_queries = n_queries,
         .kv_pos_offset = kv_pos_offset,
+        .sliding_window_size = sliding_window_size,
+        .attn_scale_bits = if (engine.config.attn_scale != 0) @as(u32, @bitCast(engine.config.attn_scale)) else 0,
         .kv_head_stride_bytes = kv_head_stride_bytes,
         .kv_token_stride_bytes = kv_token_stride_bytes,
     };
@@ -3978,7 +8637,14 @@ fn dispatchFlashAttnOnCmd(
         &engine.attn_sinks_buf,
     };
     const pipe = if (engine.kv_cache_q8) &engine.flash_attn_q8_pipe else &engine.flash_attn_pipe;
-    cmd.dispatchV2(pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    // Cycle 99: flash_attn.metal FLASH_TG_SIZE halved 64 → 32 (single
+    // simdgroup) to unblock V-loop utilization at Qwen3-8B vec4_dim=32 and
+    // collapse all threadgroup reductions to bare simd_max/simd_sum. The
+    // dispatch threads-per-TG MUST match FLASH_TG_SIZE — mismatched dispatch
+    // breaks the reduction merge contract (subgroup_size < FLASH_TG_SIZE
+    // branch). flash_attn_q8 still uses 64 (unchanged).
+    const tg_threads: u32 = if (engine.kv_cache_q8) 64 else 32;
+    cmd.dispatchV2(pipe, .{ n_heads, 1, 1 }, .{ tg_threads, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
 }
 
 fn dispatchKvCacheWriteOnCmd(
@@ -4068,16 +8734,34 @@ fn dispatchScaleInPlaceOnCmd(
     barrier_class: BarrierClass,
 ) void {
     if (n == 0 or scale == 1.0) return;
+    _ = scratch;
 
-    dispatchCopyF32OnCmd(engine, cmd, buf, scratch, n);
-    profileBarrier(cmd, profile, barrier_class);
-    dispatchZeroF32OnCmd(engine, cmd, buf, n);
-    profileBarrier(cmd, profile, barrier_class);
-
+    // Single-dispatch in-place scale: data[i] *= scale. Replaces a 3-step
+    // copy/zero/scale_acc round trip (which took 3 dispatches and 3 barriers
+    // per call) with one dispatch + one trailing barrier. On dense Gemma 31B
+    // this fires once per layer and the old path was responsible for ≈180
+    // dispatches and ≈180 barriers per token. Mirrors the Vulkan
+    // `scale_in_place.comp` shader; adapted for Metal's SPIRV-Cross buffer
+    // convention (push at buffer 0, data at buffer 1).
     const push = ScaleAccPush{ .n = n, .scale_bits = @as(u32, @bitCast(scale)) };
-    const bufs = [_]*const MetalBuffer{ buf, scratch };
-    cmd.dispatchV2(&engine.scale_acc_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+    const bufs = [_]*const MetalBuffer{buf};
+    cmd.dispatchV2(&engine.scale_in_place_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
     profileBarrier(cmd, profile, barrier_class);
+}
+
+fn dispatchAddBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    data: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n: u32,
+) void {
+    const push = AddBiasPush{
+        .n = n,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ data, &bias.gpu_buffer };
+    cmd.dispatchV2(&engine.add_bias_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(AddBiasPush), 0);
 }
 
 fn dispatchSigmoidMulOnCmd(
@@ -4106,6 +8790,242 @@ fn dispatchFfnActivationOnCmd(
     cmd.dispatchV2(pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
 }
 
+fn dispatchOaiSwiGLUBatchedBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    up: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    gate_bias: *const metal_loader.LoadedTensor,
+    up_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+) void {
+    const push = OaiSwiGLUBatchedBiasPush{
+        .n = n,
+        .gate_bias_offset = tensorPageOffset(engine.model, gate_bias),
+        .up_bias_offset = tensorPageOffset(engine.model, up_bias),
+    };
+    const bufs = [_]*const MetalBuffer{ gate, output, up, routing, &gate_bias.gpu_buffer, &up_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.swiglu_oai_batched_bias_pipe, .{ (n + 63) / 64, engine.config.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(OaiSwiGLUBatchedBiasPush), 0);
+}
+
+fn weightOrZero(weights: []const f32, idx: usize) f32 {
+    return if (idx < weights.len) weights[idx] else 0.0;
+}
+
+fn dispatchMoeAccBatchedBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    dst: *const MetalBuffer,
+    experts: *const MetalBuffer,
+    shared: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    down_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+    expert_stride: u32,
+    weights: []const f32,
+    shared_weight: f32,
+) void {
+    const push = MoeAccBatchedBiasPush{
+        .n = n,
+        .expert_stride = expert_stride,
+        .expert_count = @intCast(weights.len),
+        .bias_offset = tensorPageOffset(engine.model, down_bias),
+        .w0 = weightOrZero(weights, 0),
+        .w1 = weightOrZero(weights, 1),
+        .w2 = weightOrZero(weights, 2),
+        .w3 = weightOrZero(weights, 3),
+        .w4 = weightOrZero(weights, 4),
+        .w5 = weightOrZero(weights, 5),
+        .w6 = weightOrZero(weights, 6),
+        .w7 = weightOrZero(weights, 7),
+        .w_sh = shared_weight,
+    };
+    const bufs = [_]*const MetalBuffer{ dst, experts, shared, routing, &down_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_acc_batched_bias_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeAccBatchedBiasPush), 0);
+}
+
+fn dispatchMoeAccBatchedBiasRoutedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    dst: *const MetalBuffer,
+    experts: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    down_bias: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_used: u32,
+    expert_stride: u32,
+) void {
+    const push = MoeAccBatchedBiasRoutedPush{
+        .n = n,
+        .n_used = n_used,
+        .expert_stride = expert_stride,
+        .bias_offset = tensorPageOffset(engine.model, down_bias),
+    };
+    const bufs = [_]*const MetalBuffer{ dst, experts, routing, &down_bias.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_acc_batched_bias_routed_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeAccBatchedBiasRoutedPush), 0);
+}
+
+fn dispatchSoftmaxTopkWeightBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    logits: *const MetalBuffer,
+    output: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = SoftmaxTopkWeightBiasPush{
+        .n_experts = n_experts,
+        .k = k,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ logits, output, &bias.gpu_buffer };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    cmd.dispatchV2(&engine.softmax_topk_weight_bias_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkWeightBiasPush), 0);
+}
+
+fn canUseRouterF32TopkBias(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, bias: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32) bool {
+    return engine.config.architecture == .gpt_oss and
+        tensor.info.type_ == .f32 and
+        bias.info.type_ == .f32 and
+        n_experts <= 32 and
+        k <= 16 and
+        hidden_dim <= 4096 and
+        hidden_dim % 4 == 0 and
+        engine.router_f32_topk_bias_pipe.handle != null and
+        engine.router_f32_topk_bias_pipe.thread_execution_width == 32 and
+        engine.router_f32_topk_bias_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchRouterF32TopkBiasOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    bias: *const metal_loader.LoadedTensor,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    const push = RouterF32TopkBiasPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .x_offset = 0,
+        .bias_offset = tensorPageOffset(engine.model, bias),
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output, &bias.gpu_buffer };
+    cmd.dispatchV2(&engine.router_f32_topk_bias_pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBiasPush), 1);
+}
+
+fn canUseRouterF32TopkBatched(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32, n_tokens: u32) bool {
+    return !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        tensor.info.type_ == .f32 and
+        n_experts <= 256 and
+        n_experts % 2 == 0 and
+        k <= 16 and
+        hidden_dim > 0 and
+        hidden_dim <= 4096 and
+        hidden_dim % 4 == 0 and
+        n_tokens > 0 and
+        n_tokens <= queued_prefill_embed_tokens and
+        engine.router_f32_topk_batched_pipe.handle != null and
+        engine.router_f32_topk_batched_pipe.thread_execution_width == 32 and
+        engine.router_f32_topk_batched_pipe.max_threads_per_threadgroup >= 512;
+}
+
+fn dispatchRouterF32TopkBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    n_tokens: u32,
+    input_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    const push = RouterF32TopkBatchedPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = tensorPageOffset(engine.model, tensor),
+        .input_offset = input_byte_offset,
+        .input_stride = hidden_dim,
+        .output_stride = k * 2,
+    };
+    const bufs = [_]*const MetalBuffer{ &tensor.gpu_buffer, input, output };
+    cmd.dispatchV2(&engine.router_f32_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+}
+
+fn canUseRouterQ8Topk(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, n_experts: u32, k: u32, hidden_dim: u32) bool {
+    return !engine.debug_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.config.architecture == .qwen2_moe and
+        tensor.info.type_ == .q8_0 and
+        n_experts <= 256 and
+        n_experts % 2 == 0 and
+        k <= 16 and
+        hidden_dim > 0 and
+        hidden_dim % 32 == 0 and
+        engine.router_q8_0_topk_pipe.handle != null and
+        engine.router_q8_0_topk_pipe.thread_execution_width == 32 and
+        engine.router_q8_0_topk_pipe.max_threads_per_threadgroup >= 1024;
+}
+
+fn dispatchRouterQ8TopkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    tensor: *const metal_loader.LoadedTensor,
+    weight_buf: *const MetalBuffer,
+    weight_offset: u32,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    hidden_dim: u32,
+    x_byte_offset: u32,
+) void {
+    recordDmmvProfile(engine, tensor, n_experts, hidden_dim);
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    const push = RouterQ8TopkPush{
+        .n_experts = n_experts,
+        .K = hidden_dim,
+        .k = k,
+        .a_offset = weight_offset,
+        .x_offset = x_byte_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ weight_buf, input, output };
+    if (weight_buf.is_repacked_q8 and
+        canUseQwenRouterQ8K2048Exact(engine, tensor, hidden_dim, n_experts, k) and
+        engine.router_q8_0_topk_repacked_k2048_pipe.handle != null and
+        engine.router_q8_0_topk_repacked_k2048_pipe.thread_execution_width == 32 and
+        engine.router_q8_0_topk_repacked_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.router_q8_0_topk_repacked_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+        return;
+    }
+    if (canUseQwenRouterQ8K2048Exact(engine, tensor, hidden_dim, n_experts, k) and
+        engine.router_q8_0_topk_k2048_pipe.handle != null and
+        engine.router_q8_0_topk_k2048_pipe.thread_execution_width == 32 and
+        engine.router_q8_0_topk_k2048_pipe.max_threads_per_threadgroup >= 1024)
+    {
+        cmd.dispatchV2(&engine.router_q8_0_topk_k2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+        return;
+    }
+    cmd.dispatchV2(&engine.router_q8_0_topk_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+}
+
 fn fillRopeInvFreqs(dst: []f32, rope_dim: u32, freq_base: f32, freq_factors: ?[]const f32) void {
     for (dst, 0..) |*value, i| {
         const exponent = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(rope_dim));
@@ -4127,13 +9047,57 @@ fn dispatchSsmConv1dWithPipe(
     d_conv: u32,
     kernel_is_f16: bool,
 ) void {
+    dispatchSsmConv1dOffsetWithPipe(cmd, pipe, kernel, state, current_input, output, conv_channels, d_conv, kernel_is_f16, 0);
+}
+
+fn dispatchSsmConv1dOffsetWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    kernel: *const MetalBuffer,
+    state: *const MetalBuffer,
+    current_input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    conv_channels: u32,
+    d_conv: u32,
+    kernel_is_f16: bool,
+    input_offset: u32,
+) void {
     const push = SsmConv1dPush{
         .conv_channels = conv_channels,
         .d_conv = d_conv,
         .kernel_is_f16 = if (kernel_is_f16) 1 else 0,
+        .input_offset = input_offset,
     };
     const bufs = [_]*const MetalBuffer{ kernel, state, current_input, output };
-    cmd.dispatchV2(pipe, .{ (conv_channels + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
+    const block_size = ssmConv1dThreadgroupSize(pipe, conv_channels, d_conv, kernel_is_f16);
+    cmd.dispatchV2(pipe, .{ (conv_channels + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPush), 0);
+}
+
+fn dispatchSsmConv1dPrefillOnCmd(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    kernel: *const MetalBuffer,
+    state: *const MetalBuffer,
+    input: *const MetalBuffer,
+    output: *const MetalBuffer,
+    conv_channels: u32,
+    d_conv: u32,
+    n_tokens: u32,
+    input_stride: u32,
+    input_offset: u32,
+    output_offset: u32,
+) void {
+    const push = SsmConv1dPrefillPush{
+        .conv_channels = conv_channels,
+        .d_conv = d_conv,
+        .n_tokens = n_tokens,
+        .input_stride = input_stride,
+        .input_offset = input_offset,
+        .output_offset = output_offset,
+    };
+    const bufs = [_]*const MetalBuffer{ kernel, state, input, output };
+    const block_size = ssmConv1dThreadgroupSize(pipe, conv_channels, d_conv, false);
+    cmd.dispatchV2(pipe, .{ (conv_channels + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmConv1dPrefillPush), 0);
 }
 
 fn dispatchSsmGatedNormWithPipe(
@@ -4149,15 +9113,119 @@ fn dispatchSsmGatedNormWithPipe(
     d_state: u32,
     norm_per_head: bool,
 ) void {
+    dispatchSsmGatedNormOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0, 0);
+}
+
+fn dispatchSsmGatedNormOffsetWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    z_offset: u32,
+) void {
+    dispatchSsmGatedNormOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, z_offset, 0);
+}
+
+fn dispatchSsmGatedNormOffsetsWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    z_offset: u32,
+    output_offset: u32,
+) void {
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(cmd, pipe, delta_net_output, norm_weight, z_gate, output, d_inner, dt_rank, head_v_dim, d_state, norm_per_head, 0, z_offset, output_offset, 1);
+}
+
+fn dispatchSsmGatedNormBatchedOffsetsWithPipe(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    delta_net_output: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    norm_per_head: bool,
+    delta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
+    n_tokens: u32,
+) void {
     const push = SsmGatedNormPush{
         .d_inner = d_inner,
         .dt_rank = dt_rank,
         .head_v_dim = head_v_dim,
         .d_state = d_state,
         .norm_per_head = if (norm_per_head) 1 else 0,
+        .z_offset = z_offset,
+        .output_offset = output_offset,
+        .delta_offset = delta_offset,
     };
     const bufs = [_]*const MetalBuffer{ delta_net_output, norm_weight, z_gate, output };
-    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
+    cmd.dispatchV2(pipe, .{ dt_rank, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmGatedNormPush), 0);
+}
+
+fn dispatchSsmDeltaNetGatedNormOnCmd(
+    cmd: *MetalCommand,
+    pipe: *const MetalPipeline,
+    conv_out: *const MetalBuffer,
+    alpha: *const MetalBuffer,
+    dt_bias: *const MetalBuffer,
+    ssm_a: *const MetalBuffer,
+    beta: *const MetalBuffer,
+    state: *const MetalBuffer,
+    z_gate: *const MetalBuffer,
+    norm_weight: *const MetalBuffer,
+    output: *const MetalBuffer,
+    d_inner: u32,
+    dt_rank: u32,
+    head_v_dim: u32,
+    d_state: u32,
+    n_group: u32,
+    has_dt_bias: bool,
+    has_ssm_a: bool,
+    alpha_offset: u32,
+    beta_offset: u32,
+    z_offset: u32,
+    output_offset: u32,
+    norm_per_head: bool,
+) void {
+    const push = SsmDeltaNetGatedNormPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .ssm_a_is_f16 = 0,
+        .dt_bias_is_f16 = 0,
+        .has_dt_bias = if (has_dt_bias) 1 else 0,
+        .has_ssm_a = if (has_ssm_a) 1 else 0,
+        .alpha_offset = alpha_offset,
+        .beta_offset = beta_offset,
+        .z_offset = z_offset,
+        .output_offset = output_offset,
+        .norm_per_head = if (norm_per_head) 1 else 0,
+    };
+    const bufs = [_]*const MetalBuffer{ conv_out, alpha, dt_bias, ssm_a, beta, state, z_gate, norm_weight, output };
+    const block_size = ssmDeltaGatedNormThreadgroupSize(pipe, dt_rank, head_v_dim, d_state, n_group);
+    cmd.dispatchV2(pipe, .{ dt_rank, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetGatedNormPush), 0);
 }
 
 fn dispatchSoftmaxTopkOnCmd(
@@ -4168,9 +9236,1476 @@ fn dispatchSoftmaxTopkOnCmd(
     n_experts: u32,
     k: u32,
 ) void {
-    const push = SoftmaxTopkPush{ .n_experts = n_experts, .k = k };
+    const push = SoftmaxTopkPush{
+        .n_experts = n_experts,
+        .k = k,
+    };
     const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
     cmd.dispatchV2(&engine.softmax_topk_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkPush), 0);
+}
+
+fn dispatchSoftmaxTopkScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    logits: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_experts: u32,
+    k: u32,
+    logit_scale: f32,
+) void {
+    const push = SoftmaxTopkScaledPush{
+        .n_experts = n_experts,
+        .k = k,
+        .logit_scale_bits = @as(u32, @bitCast(logit_scale)),
+    };
+    const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += 1;
+    cmd.dispatchV2(&engine.softmax_topk_scaled_pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkScaledPush), 0);
+}
+
+fn dispatchSoftmaxTopkBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    logits: *const MetalBuffer,
+    output: *const MetalBuffer,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = SoftmaxTopkBatchedPush{
+        .n_experts = n_experts,
+        .k = k,
+        .logits_stride = n_experts,
+        .output_stride = k * 2,
+    };
+    const bufs = [_]*const MetalBuffer{ logits, output };
+    if (engine.profile_enabled) engine.request_profile.router_topk_calls += n_tokens;
+    cmd.dispatchV2(&engine.softmax_topk_batched_pipe, .{ n_tokens, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkBatchedPush), 0);
+}
+
+fn dispatchMoeRoutePackOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+    };
+    const bufs = [_]*const MetalBuffer{ routing, counts, ids };
+    cmd.dispatchV2(&engine.moe_route_pack_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+}
+
+fn dispatchMoeRoutePackBlocksOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    active_block_count: *const MetalBuffer,
+    active_blocks: *const MetalBuffer,
+    n_tokens: u32,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+    };
+    const bufs = [_]*const MetalBuffer{ routing, counts, ids, active_block_count, active_blocks };
+    cmd.dispatchV2(&engine.moe_route_pack_blocks_pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+}
+
+fn dispatchMoeRouteIdsOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    n_tokens: u32,
+    k: u32,
+) void {
+    const push = MoeRouteIdsPush{
+        .n_tokens = n_tokens,
+        .k = k,
+        .routing_stride = k * 2,
+    };
+    const route_slots = n_tokens * k;
+    const bufs = [_]*const MetalBuffer{ routing, ids };
+    cmd.dispatchV2(&engine.moe_route_ids_pipe, .{ (route_slots + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteIdsPush), 0);
+}
+
+fn dispatchMoeRouteScatterOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteScatterPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+        .debug = if (debug) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ counts, ids, routing, src, dst };
+    cmd.dispatchV2(&engine.moe_route_scatter_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
+}
+
+fn dispatchMoeRouteScatterSetOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteScatterPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+        .debug = if (debug) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ counts, ids, routing, src, dst };
+    cmd.dispatchV2(&engine.moe_route_scatter_set_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
+}
+
+fn dispatchMoeRouteScatterSharedResidualOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    routed_src: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    shared_gate: *const MetalBuffer,
+    hidden: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    has_gate: bool,
+) void {
+    const push = MoeRouteScatterSharedResidualPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .has_gate = if (has_gate) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ routing, routed_src, shared_src, shared_gate, hidden };
+    cmd.dispatchV2(&engine.moe_route_scatter_shared_residual_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualPush), 0);
+}
+
+fn dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    routed_src: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    norm_src: *const MetalBuffer,
+    gate_weight: *const metal_loader.LoadedTensor,
+    hidden: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+) void {
+    const push = MoeRouteScatterSharedResidualGateF32Push{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
+    };
+    const bufs = [_]*const MetalBuffer{ routing, routed_src, shared_src, norm_src, &gate_weight.gpu_buffer, hidden };
+    cmd.dispatchV2(&engine.moe_route_scatter_shared_residual_gate_f32_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualGateF32Push), 0);
+}
+
+fn dispatchMoeRouteScatterScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    counts: *const MetalBuffer,
+    ids: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    scales: *const metal_loader.LoadedTensor,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteScatterScaledPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .ids_stride = n_tokens,
+        .debug = if (debug) 1 else 0,
+        .scale_offset = @intCast(tensorPageOffset(engine.model, scales) / @sizeOf(f32)),
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ counts, ids, routing, src, dst, &scales.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_route_scatter_scaled_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterScaledPush), 0);
+}
+
+fn dispatchMoeRouteScatterDirectScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    scales: *const metal_loader.LoadedTensor,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteScatterDirectScaledPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .scale_offset = @intCast(tensorPageOffset(engine.model, scales) / @sizeOf(f32)),
+        .debug = if (debug) 1 else 0,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ routing, src, dst, &scales.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_route_scatter_direct_scaled_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterDirectScaledPush), 0);
+}
+
+fn dispatchMoeRouteGatherOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    routing: *const MetalBuffer,
+    src: *const MetalBuffer,
+    dst: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+    n_experts: u32,
+    k: u32,
+    debug: bool,
+) void {
+    const push = MoeRouteGatherPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = k * 2,
+        .debug = if (debug) 1 else 0,
+    };
+    const total = n_tokens * k * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ routing, src, dst };
+    cmd.dispatchV2(&engine.moe_route_gather_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteGatherPush), 0);
+}
+
+fn recordGemmaBatchedPrefillMoeOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    lt: LayerTensors,
+    scratch: *BatchedPrefillScratch,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    const cfg = engine.config;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+    const gate_scale = lt.ffn_gate_inp_scale orelse return error.MissingTensor;
+    const pre_ffw_norm_2 = lt.pre_ffw_norm_2 orelse return error.MissingTensor;
+    const post_ffw_norm_1 = lt.post_ffw_norm_1 orelse return error.MissingTensor;
+    const post_ffw_norm_2 = lt.post_ffw_norm_2 orelse return error.MissingTensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const down_scales = lt.ffn_down_exps_scale orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp orelse return error.MissingTensor;
+    const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
+    const down_shexp = lt.ffn_down_shexp orelse return error.MissingTensor;
+
+    const total_hidden = n_tokens * hidden_dim;
+    const route_slots = n_tokens * cfg.n_experts_used;
+    const use_route_slot_moe =
+        n_tokens < 32 and
+        engine.moe_route_ids_pipe.handle != null and
+        engine.moe_route_scatter_direct_scaled_pipe.handle != null;
+
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, gate_scale, hidden_dim, n_tokens);
+    cmd.barrier();
+    const router_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
+    dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, total_hidden, router_scale, null, .router);
+    dispatchGemmBatchedOnCmd(engine, cmd, router_t, &scratch.down, &scratch.gate, cfg.n_experts, hidden_dim, n_tokens);
+    cmd.barrier();
+
+    dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, &scratch.gate, &scratch.moe_routing, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    cmd.barrier();
+    if (use_route_slot_moe) {
+        dispatchMoeRouteIdsOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_packed_ids, n_tokens, cfg.n_experts_used);
+    } else {
+        dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    }
+    cmd.barrier();
+
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.hidden, &scratch.down, pre_ffw_norm_2, hidden_dim, n_tokens);
+    cmd.barrier();
+    dispatchMoeRouteGatherOnCmd(engine, cmd, &scratch.moe_routing, &scratch.down, &scratch.moe_route_input, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    cmd.barrier();
+
+    if (use_route_slot_moe) {
+        try dispatchDmmvMoeRoutesOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_gate,
+            &scratch.moe_packed_ids,
+            route_slots,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            hidden_dim,
+            gate_up_layout.gate_base_offset,
+        );
+        try dispatchDmmvMoeRoutesOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_up,
+            &scratch.moe_packed_ids,
+            route_slots,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            hidden_dim,
+            gate_up_layout.up_base_offset,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            1,
+            cfg.n_experts,
+            n_tokens,
+        );
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.moe_route_input,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            1,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
+    cmd.barrier();
+
+    {
+        const push = SwiGLUPush{ .n = inter_dim };
+        const bufs = [_]*const MetalBuffer{ &scratch.moe_expert_gate, &scratch.moe_expert_swiglu, &scratch.moe_expert_up };
+        cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    }
+    cmd.barrier();
+
+    dispatchZeroF32OnCmd(engine, cmd, &scratch.down, total_hidden);
+    if (use_route_slot_moe) {
+        try dispatchDmmvMoeRoutesOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_packed_ids,
+            route_slots,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            inter_dim,
+            0,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
+    cmd.barrier();
+    if (use_route_slot_moe) {
+        dispatchMoeRouteScatterDirectScaledOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, down_scales, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    } else {
+        dispatchMoeRouteScatterScaledOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, down_scales, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+    }
+    cmd.barrier();
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.down, &scratch.down, post_ffw_norm_2, hidden_dim, n_tokens);
+    cmd.barrier();
+
+    dispatchGemmBatchedOnCmd(engine, cmd, gate_shexp, &scratch.norm, &scratch.gate, shexp_inter_dim, hidden_dim, n_tokens);
+    dispatchGemmBatchedOnCmd(engine, cmd, up_shexp, &scratch.norm, &scratch.up, shexp_inter_dim, hidden_dim, n_tokens);
+    cmd.barrier();
+    {
+        const push = SwiGLUPush{ .n = shexp_inter_dim };
+        const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
+        cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (shexp_inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    }
+    cmd.barrier();
+    dispatchGemmBatchedOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
+    cmd.barrier();
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &scratch.moe_route_input, &scratch.moe_route_input, post_ffw_norm_1, hidden_dim, n_tokens);
+    cmd.barrier();
+
+    if (lt.ffn_gate_inp_shexp) |gate_t| {
+        dispatchGemmBatchedOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, 1, hidden_dim, n_tokens);
+        cmd.barrier();
+        dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, &scratch.gate, n_tokens, hidden_dim);
+    } else {
+        const push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+        const bufs = [_]*const MetalBuffer{ &scratch.down, &scratch.moe_route_input };
+        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+    }
+    cmd.barrier();
+
+    if (engine.post_ffn_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &scratch.down, &scratch.down, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+        cmd.barrier();
+    }
+
+    const res_push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+    const res_bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
+    cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
+    cmd.barrier();
+}
+
+fn canUseQwenSsmBatchedProjectionLayer(engine: *const InferenceEngine, layer_idx: usize) bool {
+    if (engine.gemm_q8_0_pipe.handle == null) return false;
+    if (layer_idx >= engine.layer_tensors.len) return false;
+    if (isFullAttentionLayer(engine.config, layer_idx)) return false;
+
+    const lt = engine.layer_tensors[layer_idx];
+    const wqkv_t = lt.attn_qkv orelse return false;
+    const z_t = lt.attn_gate orelse return false;
+    const alpha_t = lt.ssm_alpha orelse return false;
+    const beta_t = lt.ssm_beta orelse return false;
+    return wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        canUseQwenSsmProjectionTail(engine, alpha_t, engine.config.ssm_dt_rank, engine.config.hidden_dim) and
+        canUseQwenSsmProjectionTail(engine, beta_t, engine.config.ssm_dt_rank, engine.config.hidden_dim);
+}
+
+fn canBatchQwenSsmProjectionTail(engine: *const InferenceEngine, tensor: *const metal_loader.LoadedTensor, rows: u32, cols: u32) bool {
+    return canUseQwenSharedBatchedGemm(engine, tensor.info.type_) or
+        canUseQwenSsmProjectionTailF32Batched(engine, tensor, rows, cols);
+}
+
+fn canUseQwenSsmProjectionTail(
+    engine: *const InferenceEngine,
+    tensor: *const metal_loader.LoadedTensor,
+    rows: u32,
+    cols: u32,
+) bool {
+    return canBatchQwenSsmProjectionTail(engine, tensor, rows, cols) or engine.dmmvPipelineForType(tensor, rows, cols) != null;
+}
+
+fn qwenFirstPrefixAttentionDims(engine: *const InferenceEngine) ?BatchedPrefillAttentionDims {
+    const cfg = engine.config;
+    for (engine.layer_tensors, 0..) |lt, layer_idx| {
+        if (!isFullAttentionLayer(cfg, layer_idx)) continue;
+        const attn = resolveLayerAttentionParams(cfg, lt, cfg.hidden_dim, engine.kv_cache_q8) catch return null;
+        return .{ .max_q_dim = attn.q_dim, .max_kv_dim = attn.kv_dim };
+    }
+    return null;
+}
+
+fn canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    allow_f32_shared_gate_input: bool,
+) bool {
+    if (!canUseGpuRoutedBatchedMoe(engine, lt)) return false;
+
+    const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, hidden_dim) catch return false;
+    const down_exps = lt.ffn_down_exps orelse return false;
+    if (!supportsQwenMoeRoutePackCols(engine, gate_up_layout.gate_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, gate_up_layout.up_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, down_exps.info.type_))
+    {
+        return false;
+    }
+    if (engine.moe_route_pack_pipe.handle == null or
+        engine.moe_route_gather_pipe.handle == null or
+        engine.moe_route_scatter_pipe.handle == null or
+        engine.moe_route_scatter_set_pipe.handle == null or
+        engine.swiglu_batched_pipe.handle == null or
+        engine.scale_acc_pipe.handle == null)
+    {
+        return false;
+    }
+    if (lt.ffn_gate_shexp) |gate| {
+        const up = lt.ffn_up_shexp orelse return false;
+        const down = lt.ffn_down_shexp orelse return false;
+        if (!canUseQwenSharedBatchedGemm(engine, gate.info.type_) or
+            !canUseQwenSharedBatchedGemm(engine, up.info.type_) or
+            !canUseQwenSharedBatchedGemm(engine, down.info.type_))
+        {
+            return false;
+        }
+        if (lt.ffn_gate_inp_shexp) |gate_inp| {
+            const gate_supported = if (allow_f32_shared_gate_input)
+                canUseQwenSharedGateInputBatched(engine, gate_inp, hidden_dim)
+            else
+                canUseQwenSharedBatchedGemm(engine, gate_inp.info.type_);
+            if (!gate_supported) return false;
+        }
+    }
+    return true;
+}
+
+fn canUseQwenRoutePackedPrefixMoeLayer(engine: *const InferenceEngine, lt: LayerTensors, hidden_dim: u32, inter_dim: u32) bool {
+    return canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, hidden_dim, inter_dim, false);
+}
+
+fn canUseQwenRoutePackedPrefixRouter(engine: *const InferenceEngine, router_t: *const metal_loader.LoadedTensor, prompt_len: usize) bool {
+    const n_tokens: u32 = @intCast(@min(prompt_len, queued_prefill_embed_tokens));
+    const can_q8_router = canUseRouterQ8Topk(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim) and
+        engine.gemm_q8_0_pipe.handle != null and
+        engine.softmax_topk_batched_pipe.handle != null;
+    return can_q8_router or
+        canUseRouterF32TopkBatched(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens);
+}
+
+fn recordQwenRoutePackedRouterOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    router_t: *const metal_loader.LoadedTensor,
+    input: *const MetalBuffer,
+    logits_scratch: *const MetalBuffer,
+    routing_output: *const MetalBuffer,
+    n_tokens: u32,
+) !void {
+    if (canUseRouterF32TopkBatched(engine, router_t, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens)) {
+        dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, input, routing_output, engine.config.n_experts, engine.config.n_experts_used, engine.config.hidden_dim, n_tokens, 0);
+        return;
+    }
+    if (router_t.info.type_ == .q8_0 and engine.gemm_q8_0_pipe.handle != null) {
+        dispatchGemmQ8_0OnCmd(engine, cmd, router_t, input, logits_scratch, engine.config.n_experts, engine.config.hidden_dim, n_tokens);
+        profileBarrier(cmd, profile, .router);
+        dispatchSoftmaxTopkBatchedOnCmd(engine, cmd, logits_scratch, routing_output, n_tokens, engine.config.n_experts, engine.config.n_experts_used);
+        return;
+    }
+    return error.UnsupportedQwenRoutePackedRouter;
+}
+
+fn canUseQwenRoutePackedPrefixAttentionLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
+    if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.config.architecture != .qwen2_moe or
+        engine.config.hidden_dim != 2048 or
+        engine.config.ssm_d_inner != 4096 or
+        engine.config.n_experts != 256 or
+        engine.config.n_experts_used != 8)
+    {
+        return false;
+    }
+    if (layer_idx >= engine.layer_tensors.len or !isFullAttentionLayer(engine.config, layer_idx)) return false;
+    if (engine.rope_batched_pipe.handle == null or engine.softmax_topk_batched_pipe.handle == null) return false;
+    if (engine.kv_cache_q8) {
+        if (engine.kv_cache_write_q8_pipe.handle == null or engine.flash_attn_batched_q8_pipe.handle == null) return false;
+    } else {
+        if (engine.kv_cache_write_pipe.handle == null or engine.flash_attn_batched_pipe.handle == null) return false;
+    }
+    const hidden_dim = engine.config.hidden_dim;
+    const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else hidden_dim * 4;
+    const lt = engine.layer_tensors[layer_idx];
+    if (!canUseQwenRoutePackedPrefixMoeLayer(engine, lt, hidden_dim, inter_dim)) return false;
+
+    const attn = resolveLayerAttentionParams(engine.config, lt, hidden_dim, engine.kv_cache_q8) catch return false;
+    if (attn.use_k_as_v) return false;
+    if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+        lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+
+    const q_t = lt.attn_q orelse return false;
+    const k_t = lt.attn_k orelse return false;
+    const v_t = lt.attn_v orelse return false;
+    const o_t = lt.attn_output orelse return false;
+    const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+    const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+    if (gate_mode.packed_q_gate) return false;
+
+    if (!canUseQwenSharedBatchedGemm(engine, q_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, k_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, v_t.info.type_) or
+        !canUseQwenSharedBatchedGemm(engine, o_t.info.type_))
+    {
+        return false;
+    }
+    if (gate_mode.separate_attn_gate) {
+        const gate_t = lt.attn_gate orelse return false;
+        if (!canUseQwenSharedBatchedGemm(engine, gate_t.info.type_)) return false;
+    }
+
+    const router_t = lt.ffn_gate_inp orelse return false;
+    return canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len);
+}
+
+fn canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    prompt_len: usize,
+    allow_f32_shared_gate_input: bool,
+) bool {
+    if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+    if (engine.config.architecture != .qwen2_moe or
+        engine.config.hidden_dim != 2048 or
+        engine.config.ssm_d_inner != 4096 or
+        engine.config.n_experts != 256 or
+        engine.config.n_experts_used != 8)
+    {
+        return false;
+    }
+    if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return false;
+    if (engine.ssm_conv1d_prefill_pipe.handle == null or
+        engine.ssm_delta_net_offset_pipe.handle == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.config.ssm_d_conv > 8 or
+        engine.config.ssm_d_state > 128 or
+        engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1) > 128)
+    {
+        return false;
+    }
+
+    const lt = engine.layer_tensors[layer_idx];
+    const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
+    const router_t = lt.ffn_gate_inp orelse return false;
+    const ssm_out_t = lt.ssm_out orelse return false;
+    if (ssm_out_t.info.type_ != .q8_0) return false;
+    if (!canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len)) return false;
+    return canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, engine.config.hidden_dim, inter_dim, allow_f32_shared_gate_input);
+}
+
+fn canUseQwenRoutePackedPrefixSsmLayer(engine: *const InferenceEngine, layer_idx: usize, prompt_len: usize) bool {
+    return canUseQwenRoutePackedPrefixSsmLayerWithSharedGateMode(engine, layer_idx, prompt_len, false);
+}
+
+fn logQwenRoutePackedPrefixSsmLayerBlocker(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    prompt_len: usize,
+    allow_f32_shared_gate_input: bool,
+) void {
+    if (!engine.profile_enabled) return;
+
+    if (prompt_len < 32 or prompt_len > queued_prefill_embed_tokens) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: prompt_len={d} outside [32,{d}]", .{ layer_idx, prompt_len, queued_prefill_embed_tokens });
+        return;
+    }
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: validation mode active debug={} gemma={} qwen={}", .{
+            layer_idx,
+            engine.debug_validation_enabled,
+            engine.gemma_moe_validation_enabled,
+            engine.qwen_prefill_validation_enabled,
+        });
+        return;
+    }
+    if (engine.config.architecture != .qwen2_moe or
+        engine.config.hidden_dim != 2048 or
+        engine.config.ssm_d_inner != 4096 or
+        engine.config.n_experts != 256 or
+        engine.config.n_experts_used != 8)
+    {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: model shape arch={s} hidden={d} ssm_d_inner={d} experts={d} used={d}", .{
+            layer_idx,
+            @tagName(engine.config.architecture),
+            engine.config.hidden_dim,
+            engine.config.ssm_d_inner,
+            engine.config.n_experts,
+            engine.config.n_experts_used,
+        });
+        return;
+    }
+    if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) {
+        const lt = if (layer_idx < engine.layer_tensors.len) engine.layer_tensors[layer_idx] else null;
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: batched projection unsupported qkv={s} z={s} alpha={s} beta={s}", .{
+            layer_idx,
+            if (lt) |layer| if (layer.attn_qkv) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.attn_gate) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.ssm_alpha) |t| @tagName(t.info.type_) else "-" else "-",
+            if (lt) |layer| if (layer.ssm_beta) |t| @tagName(t.info.type_) else "-" else "-",
+        });
+        return;
+    }
+    if (engine.ssm_conv1d_prefill_pipe.handle == null or
+        engine.ssm_delta_net_offset_pipe.handle == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.config.ssm_d_conv > 8 or
+        engine.config.ssm_d_state > 128 or
+        engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1) > 128)
+    {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: SSM prefill shader/shape conv_pipe={} delta_offset_pipe={} delta_prefill_pipe={} d_conv={d} d_state={d} head_v_dim={d}", .{
+            layer_idx,
+            engine.ssm_conv1d_prefill_pipe.handle != null,
+            engine.ssm_delta_net_offset_pipe.handle != null,
+            engine.ssm_delta_net_prefill_pipe.handle != null,
+            engine.config.ssm_d_conv,
+            engine.config.ssm_d_state,
+            engine.config.ssm_d_inner / @max(engine.config.ssm_dt_rank, 1),
+        });
+        return;
+    }
+    if (layer_idx >= engine.layer_tensors.len) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: layer index outside tensor table len={d}", .{ layer_idx, engine.layer_tensors.len });
+        return;
+    }
+
+    const lt = engine.layer_tensors[layer_idx];
+    const inter_dim: u32 = if (engine.config.intermediate_dim > 0) engine.config.intermediate_dim else engine.config.hidden_dim * 4;
+    const router_t = lt.ffn_gate_inp orelse {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: router tensor missing", .{layer_idx});
+        return;
+    };
+    const ssm_out_t = lt.ssm_out orelse {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: ssm_out tensor missing", .{layer_idx});
+        return;
+    };
+    if (ssm_out_t.info.type_ != .q8_0) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: ssm_out type {s} unsupported", .{ layer_idx, @tagName(ssm_out_t.info.type_) });
+        return;
+    }
+    if (!canUseQwenRoutePackedPrefixRouter(engine, router_t, prompt_len)) {
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: router batched top-k unsupported type={s}", .{ layer_idx, @tagName(router_t.info.type_) });
+        return;
+    }
+    if (!canUseQwenRoutePackedPrefixMoeLayerWithSharedGateMode(engine, lt, engine.config.hidden_dim, inter_dim, allow_f32_shared_gate_input)) {
+        const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, engine.config.hidden_dim) catch {
+            log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: MoE gate/up tensors missing", .{layer_idx});
+            return;
+        };
+        const down_exps = lt.ffn_down_exps;
+        const gate_inp_shexp = lt.ffn_gate_inp_shexp;
+        const f32_gate_supported = if (gate_inp_shexp) |gate_t|
+            canUseQwenSharedGateInputF32(engine, gate_t, engine.config.hidden_dim)
+        else
+            false;
+        log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: MoE unsupported gate={s} up={s} down={s} shared_gate_inp={s} allow_f32_shared_gate={} f32_shared_gate_supported={}", .{
+            layer_idx,
+            @tagName(gate_up_layout.gate_tensor.info.type_),
+            @tagName(gate_up_layout.up_tensor.info.type_),
+            if (down_exps) |t| @tagName(t.info.type_) else "-",
+            if (gate_inp_shexp) |t| @tagName(t.info.type_) else "-",
+            allow_f32_shared_gate_input,
+            f32_gate_supported,
+        });
+        return;
+    }
+
+    log.info("Metal profile: Qwen route-packed SSM layer {d} guard failed: unknown mismatch", .{layer_idx});
+}
+
+fn recordQwenSsmProjectionChunkOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    input: *const MetalBuffer,
+    hidden_dim: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    conv_channels: u32,
+    n_tokens: u32,
+) !void {
+    const lt = engine.layer_tensors[layer_idx];
+    const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
+    const z_t = lt.attn_gate orelse return error.MissingTensor;
+    const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
+    const beta_t = lt.ssm_beta orelse return error.MissingTensor;
+
+    dispatchRmsNormOnCmd(engine, cmd, input, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    dispatchGemmQ8_0OnCmd(engine, cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
+    dispatchGemmQ8_0OnCmd(engine, cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+    try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+        engine,
+        cmd,
+        alpha_t,
+        beta_t,
+        &engine.qwen_ssm_prefill_proj_norm_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+        dt_rank,
+        hidden_dim,
+        n_tokens,
+    );
+    profileBarrierBuffers(cmd, profile, .ssm, &.{
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        &engine.qwen_ssm_prefill_proj_alpha_buf,
+        &engine.qwen_ssm_prefill_proj_beta_buf,
+    });
+}
+
+fn recordQwenRoutePackedPrefixAttentionLayerOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    scratch: *BatchedPrefillScratch,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    const cfg = engine.config;
+    const lt = engine.layer_tensors[layer_idx];
+    const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
+    const q_t = lt.attn_q orelse return error.MissingTensor;
+    const k_t = lt.attn_k orelse return error.MissingTensor;
+    const v_t = lt.attn_v orelse return error.MissingTensor;
+    const o_t = lt.attn_output orelse return error.MissingTensor;
+    const q_rows: u32 = @intCast(q_t.info.numElements() / hidden_dim);
+    const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+
+    // Adapted from llama.cpp `ggml_metal_op_mul_mat_id` and vLLM
+    // `moe_align_block_size`: once the prompt slice supplies many rows, keep
+    // this full-attention layer in layer-major order, then feed its per-token
+    // FFN inputs into the existing expert-major route-packed MoE.
+    dispatchRmsNormOnCmd(engine, cmd, &scratch.hidden, &scratch.norm, &engine.attn_norm_bufs[layer_idx], hidden_dim, n_tokens);
+    profileBarrier(cmd, profile, .full_attn);
+
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, q_t, &scratch.norm, &scratch.q, attn.q_dim, hidden_dim, n_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, k_t, &scratch.norm, &scratch.k, attn.kv_dim, hidden_dim, n_tokens);
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, v_t, &scratch.norm, &scratch.v, attn.kv_dim, hidden_dim, n_tokens);
+    if (gate_mode.separate_attn_gate) {
+        const gate_t = lt.attn_gate orelse return error.MissingTensor;
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.gate, attn.q_dim, hidden_dim, n_tokens);
+    }
+    profileBarrier(cmd, profile, .full_attn);
+
+    // Keep llama.cpp's layer-major graph shape through Q/K-norm attention
+    // layers instead of falling back to token-major decode. The layout matches
+    // generic batched prefill: q/k are token-major, and each head is a
+    // contiguous head_dim slice, so RMSNorm can run over N*heads slices.
+    if (engine.attn_q_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &scratch.q, &scratch.q, &engine.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads * n_tokens);
+    }
+    if (engine.attn_k_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &scratch.k, &scratch.k, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads * n_tokens);
+    }
+    if (engine.attn_q_norm_present[layer_idx] or engine.attn_k_norm_present[layer_idx]) {
+        profileBarrier(cmd, profile, .full_attn);
+    }
+
+    const rope_freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
+    dispatchRopeBatchedOnCmd(engine, cmd, &scratch.q, &scratch.q, rope_freq_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    dispatchRopeBatchedOnCmd(engine, cmd, &scratch.k, &scratch.k, rope_freq_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, 0, n_tokens, attn.rope_freq_base, attn.use_rope_freq_factors, 1.0);
+    profileBarrier(cmd, profile, .full_attn);
+
+    if (engine.kv_cache_q8) {
+        const n_blocks = n_tokens * (attn.kv_dim / 32);
+        dispatchKvCacheWriteBatchedQ8OnCmd(engine, cmd, layer_idx, &scratch.k, &scratch.v, 0, n_blocks);
+    } else {
+        dispatchKvCacheWriteBatchedOnCmd(engine, cmd, layer_idx, &scratch.k, &scratch.v, 0, n_tokens * attn.kv_dim);
+    }
+    if (profile) |p| p.full_attn_kv_write_calls += 1;
+    profileBarrier(cmd, profile, .full_attn);
+
+    if (engine.kv_cache_q8) {
+        dispatchFlashAttnBatchedQ8OnCmd(
+            engine,
+            cmd,
+            &scratch.q,
+            &engine.kv_k_cache[layer_idx],
+            &engine.kv_v_cache[layer_idx],
+            &scratch.attn_out,
+            attn.head_dim,
+            cfg.n_heads,
+            attn.n_kv_heads,
+            n_tokens,
+            n_tokens,
+            0,
+            attn.sliding_window_size,
+            attn.kv_cache_head_stride_bytes,
+            attn.kv_cache_bytes_per_token,
+        );
+    } else {
+        dispatchFlashAttnBatchedOnCmd(
+            engine,
+            cmd,
+            &scratch.q,
+            &engine.kv_k_cache[layer_idx],
+            &engine.kv_v_cache[layer_idx],
+            &scratch.attn_out,
+            attn.head_dim,
+            cfg.n_heads,
+            attn.n_kv_heads,
+            n_tokens,
+            n_tokens,
+            0,
+            attn.sliding_window_size,
+        );
+    }
+    if (profile) |p| p.full_attn_flash_calls += 1;
+    profileBarrier(cmd, profile, .full_attn);
+
+    if (gate_mode.apply_attn_gate) {
+        dispatchSigmoidMulOnCmd(engine, cmd, &scratch.gate, &scratch.attn_out, n_tokens * attn.q_dim);
+        profileBarrier(cmd, profile, .full_attn);
+    }
+
+    try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, o_t, &scratch.attn_out, &scratch.down, hidden_dim, attn.q_dim, n_tokens);
+    profileBarrier(cmd, profile, .full_attn);
+
+    {
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
+        const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
+        cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+    }
+    profileBarrier(cmd, profile, .router);
+
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+    try recordQwenRoutePackedRouterOnCmd(engine, cmd, profile, router_t, &scratch.norm, &scratch.gate, &scratch.moe_routing, n_tokens);
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    const moe_record_start = profileStart(profile != null);
+    try recordQwenRoutePackedLayerMoeOnCmd(engine, cmd, profile, lt, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+    if (profile) |p| {
+        p.full_attn_layers += n_tokens;
+        p.gpu_routed_moe_layers += n_tokens;
+        p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
+    }
+
+    const layer_output_scale = engine.layer_output_scales[layer_idx];
+    if (layer_output_scale != 1.0) {
+        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
+    }
+}
+
+fn recordQwenRoutePackedPrefixSsmLayerOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    scratch: *BatchedPrefillScratch,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    const cfg = engine.config;
+    const lt = engine.layer_tensors[layer_idx];
+    const d_inner = cfg.ssm_d_inner;
+    const d_state = cfg.ssm_d_state;
+    const n_group = cfg.ssm_n_group;
+    const dt_rank = cfg.ssm_dt_rank;
+    const d_conv = cfg.ssm_d_conv;
+    const head_v_dim = d_inner / @max(dt_rank, 1);
+    const conv_channels = d_inner + 2 * n_group * d_state;
+    const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
+    const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+        (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
+    else
+        &ssm_out_t.gpu_buffer;
+    const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+    const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
+    const beta_t = lt.ssm_beta orelse return error.MissingTensor;
+    const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
+    const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+
+    // llama.cpp switches Metal matmul work to a batched matrix path once the
+    // row batch is large enough (`ggml_metal_op_mul_mat_id`). Keep Qwen SSM
+    // recurrence token-ordered, but batch this layer's Q8 input projections,
+    // SSM-out projection, and route-packed MoE over the full prompt slice.
+    try recordQwenSsmProjectionChunkOnCmd(engine, cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n_tokens);
+    const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
+    dispatchSsmConv1dPrefillOnCmd(
+        cmd,
+        conv_prefill_pipe,
+        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+        &engine.ssm_conv_state_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        conv_channels,
+        d_conv,
+        n_tokens,
+        conv_channels,
+        0,
+        0,
+    );
+    if (profile) |p| p.ssm_conv_calls += n_tokens;
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+
+    const dt_rank_usize: usize = @intCast(dt_rank);
+    const hidden_dim_usize: usize = @intCast(hidden_dim);
+    const token_count: usize = @intCast(n_tokens);
+    if (!alpha_batched or !beta_batched) {
+        for (0..token_count) |i| {
+            const token_hidden_offset_bytes: u32 = @intCast(i * hidden_dim_usize * @sizeOf(f32));
+            const token_dt_offset_bytes: u32 = @intCast(i * dt_rank_usize * @sizeOf(f32));
+            if (!alpha_batched) {
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    cmd,
+                    alpha_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_alpha_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
+            }
+            if (!beta_batched) {
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    cmd,
+                    beta_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_beta_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
+            }
+        }
+        var tail_barrier_bufs: [2]*const MetalBuffer = undefined;
+        var tail_barrier_count: usize = 0;
+        if (!alpha_batched) {
+            tail_barrier_bufs[tail_barrier_count] = &engine.qwen_ssm_prefill_proj_alpha_buf;
+            tail_barrier_count += 1;
+        }
+        if (!beta_batched) {
+            tail_barrier_bufs[tail_barrier_count] = &engine.qwen_ssm_prefill_proj_beta_buf;
+            tail_barrier_count += 1;
+        }
+        profileBarrierBuffers(cmd, profile, .ssm, tail_barrier_bufs[0..tail_barrier_count]);
+    }
+
+    {
+        const push = SsmDeltaNetPrefillPush{
+            .d_inner = d_inner,
+            .dt_rank = dt_rank,
+            .head_v_dim = head_v_dim,
+            .d_state = d_state,
+            .n_group = n_group,
+            .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+            .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            .n_tokens = n_tokens,
+            .alpha_stride = dt_rank,
+            .beta_stride = dt_rank,
+            .conv_stride = conv_channels,
+            .output_stride = d_inner,
+            .alpha_offset = 0,
+            .beta_offset = 0,
+            .conv_offset = 0,
+            .output_offset = 0,
+        };
+        const dn_bufs = [_]*const MetalBuffer{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,  &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.ssm_dt_bias_bufs.?[layer_idx],  &engine.ssm_a_bufs.?[layer_idx],
+            &engine.qwen_ssm_prefill_proj_beta_buf, &engine.ssm_state_bufs.?[layer_idx],
+            &scratch.attn_out,
+        };
+        cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+        if (profile) |p| p.ssm_delta_calls += n_tokens;
+        engine.position = n_tokens - 1;
+        profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.attn_out});
+    }
+
+    // Adapt llama.cpp's Metal encoder barrier discipline
+    // (`ggml_metal_op_concurrency_reset` plus the graph encoder path): keep
+    // the recurrent state update token-ordered inside one layer-major dispatch,
+    // then expose only one ordered scratch.attn_out read to the gated norm below.
+
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(
+        cmd,
+        &engine.ssm_gated_norm_pipe,
+        &scratch.attn_out,
+        &engine.ssm_norm_weight_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        &scratch.swiglu,
+        d_inner,
+        dt_rank,
+        head_v_dim,
+        d_state,
+        engine.ssm_norm_per_head.?[layer_idx],
+        0,
+        0,
+        0,
+        n_tokens,
+    );
+    if (profile) |p| p.ssm_gated_norm_calls += 1;
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.swiglu});
+
+    dispatchGemmQ8_0OnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n_tokens);
+    profileBarrierBuffers(cmd, profile, .ssm, &.{&scratch.down});
+
+    // Adapt llama.cpp `ggml_metal_op_concurrency_reset` and vLLM
+    // `grouped_topk`: after the token-ordered SSM recurrence and batched
+    // ssm_out projection, the residual/FFN-router tail is row-independent.
+    // Keep it layer-major over the prompt slice instead of staging each token
+    // through the single-token scratch buffers.
+    {
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
+        const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
+        cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+    }
+    profileBarrierBuffers(cmd, profile, .router, &.{&scratch.norm});
+
+    try recordQwenRoutePackedRouterOnCmd(engine, cmd, profile, router_t, &scratch.norm, &scratch.gate, &scratch.moe_routing, n_tokens);
+    profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&scratch.moe_routing});
+
+    const moe_record_start = profileStart(profile != null);
+    try recordQwenRoutePackedLayerMoeOnCmd(engine, cmd, profile, lt, scratch, hidden_dim, inter_dim, shexp_inter_dim, n_tokens);
+    if (profile) |p| {
+        p.ssm_layers += n_tokens;
+        p.gpu_routed_moe_layers += n_tokens;
+        p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
+    }
+
+    const layer_output_scale = engine.layer_output_scales[layer_idx];
+    if (layer_output_scale != 1.0) {
+        dispatchScaleInPlaceOnCmd(engine, cmd, &scratch.hidden, &scratch.down, n_tokens * hidden_dim, layer_output_scale, profile, .gpu_routed_moe);
+    }
+}
+
+fn recordQwenRoutePackedLayerMoeOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    lt: LayerTensors,
+    scratch: *BatchedPrefillScratch,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    n_tokens: u32,
+) !void {
+    const cfg = engine.config;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const total_hidden = n_tokens * hidden_dim;
+    const route_slots = n_tokens * cfg.n_experts_used;
+    const use_active_blocks = engine.moe_route_pack_blocks_pipe.handle != null;
+    const active_block_upper_bound = maxPackedMoeRouteBlocks(route_slots, cfg.n_experts);
+    recordRoutePackProfile(profile, n_tokens, cfg.n_experts, cfg.n_experts_used, active_block_upper_bound);
+
+    if (use_active_blocks) {
+        dispatchMoeRoutePackBlocksOnCmd(
+            engine,
+            cmd,
+            &scratch.moe_routing,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_block_count,
+            &scratch.moe_active_blocks,
+            n_tokens,
+            cfg.n_experts,
+            cfg.n_experts_used,
+        );
+    } else {
+        dispatchMoeRoutePackOnCmd(engine, cmd, &scratch.moe_routing, &scratch.moe_expert_counts, &scratch.moe_packed_ids, n_tokens, cfg.n_experts, cfg.n_experts_used);
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    // Adapt llama.cpp `ggml_metal_op_mul_mat_id` source indexing: packed IDs
+    // already encode token*k+slot, so gate/up can read token-ordered norms
+    // directly instead of materializing a duplicated route-slot input buffer.
+    if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            active_block_upper_bound,
+        );
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            active_block_upper_bound,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.gate_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_gate,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            cfg.n_experts,
+            n_tokens,
+        );
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            gate_up_layout.up_tensor,
+            &scratch.norm,
+            &scratch.moe_expert_up,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n_tokens,
+            cfg.n_experts_used,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    {
+        const push = SwiGLUPush{ .n = inter_dim };
+        const bufs = [_]*const MetalBuffer{ &scratch.moe_expert_gate, &scratch.moe_expert_swiglu, &scratch.moe_expert_up };
+        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    if (use_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            &scratch.moe_active_blocks,
+            &scratch.moe_active_block_count,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            active_block_upper_bound,
+        );
+    } else {
+        try dispatchDmmvMoeColsOnCmd(
+            engine,
+            cmd,
+            down_exps,
+            &scratch.moe_expert_swiglu,
+            &scratch.moe_expert_down,
+            &scratch.moe_expert_counts,
+            &scratch.moe_packed_ids,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n_tokens,
+            1,
+            cfg.n_experts,
+            n_tokens,
+        );
+    }
+
+    const f32_shared_gate = if (lt.ffn_gate_inp_shexp) |gate_t|
+        canUseQwenSharedGateInputF32(engine, gate_t, hidden_dim)
+    else
+        false;
+    const can_fuse_shared_residual =
+        lt.ffn_gate_shexp != null and
+        (engine.moe_route_scatter_shared_residual_pipe.handle != null or f32_shared_gate);
+    if (!can_fuse_shared_residual) {
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+        dispatchMoeRouteScatterSetOnCmd(engine, cmd, &scratch.moe_expert_counts, &scratch.moe_packed_ids, &scratch.moe_routing, &scratch.moe_expert_down, &scratch.down, n_tokens, hidden_dim, cfg.n_experts, cfg.n_experts_used, false);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
+
+    if (lt.ffn_gate_shexp) |gate_shexp| {
+        const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
+        const down_shexp = lt.ffn_down_shexp orelse return error.MissingTensor;
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_shexp, &scratch.norm, &scratch.gate, shexp_inter_dim, hidden_dim, n_tokens);
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, up_shexp, &scratch.norm, &scratch.up, shexp_inter_dim, hidden_dim, n_tokens);
+        if (lt.ffn_gate_inp_shexp) |gate_t| {
+            if (!f32_shared_gate) {
+                try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, gate_t, &scratch.norm, &scratch.attn_out, 1, hidden_dim, n_tokens);
+            }
+        }
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+
+        {
+            const push = SwiGLUPush{ .n = shexp_inter_dim };
+            const bufs = [_]*const MetalBuffer{ &scratch.gate, &scratch.swiglu, &scratch.up };
+            cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (shexp_inter_dim + 63) / 64, n_tokens, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+        }
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, cmd, down_shexp, &scratch.swiglu, &scratch.moe_route_input, hidden_dim, shexp_inter_dim, n_tokens);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+        if (can_fuse_shared_residual) {
+            if (f32_shared_gate) {
+                dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+                    engine,
+                    cmd,
+                    &scratch.moe_routing,
+                    &scratch.moe_expert_down,
+                    &scratch.moe_route_input,
+                    &scratch.norm,
+                    lt.ffn_gate_inp_shexp.?,
+                    &scratch.hidden,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                );
+            } else {
+                dispatchMoeRouteScatterSharedResidualOnCmd(
+                    engine,
+                    cmd,
+                    &scratch.moe_routing,
+                    &scratch.moe_expert_down,
+                    &scratch.moe_route_input,
+                    &scratch.attn_out,
+                    &scratch.hidden,
+                    n_tokens,
+                    hidden_dim,
+                    cfg.n_experts,
+                    cfg.n_experts_used,
+                    lt.ffn_gate_inp_shexp != null,
+                );
+            }
+            profileBarrier(cmd, profile, .gpu_routed_moe);
+            return;
+        }
+        if (lt.ffn_gate_inp_shexp != null) {
+            dispatchSigmoidScaleAccBatchedOnCmd(engine, cmd, &scratch.down, &scratch.moe_route_input, &scratch.attn_out, n_tokens, hidden_dim);
+        } else {
+            const push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+            const bufs = [_]*const MetalBuffer{ &scratch.down, &scratch.moe_route_input };
+            cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 0);
+        }
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
+
+    const res_push = ScaleAccPush{ .n = total_hidden, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+    const res_bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down };
+    cmd.dispatchV2(&engine.scale_acc_pipe, .{ (total_hidden + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
+    profileBarrier(cmd, profile, .gpu_routed_moe);
 }
 
 fn dispatchSigmoidScaleAccOnCmd(
@@ -4184,6 +10719,24 @@ fn dispatchSigmoidScaleAccOnCmd(
     const push = ScaleAccPush{ .n = n, .scale_bits = 0 };
     const bufs = [_]*const MetalBuffer{ accum, src, gate };
     cmd.dispatchV2(&engine.sigmoid_scale_acc_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(ScaleAccPush), 3);
+}
+
+fn dispatchSigmoidScaleAccBatchedOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    accum: *const MetalBuffer,
+    src: *const MetalBuffer,
+    gate: *const MetalBuffer,
+    n_tokens: u32,
+    hidden_dim: u32,
+) void {
+    const push = SigmoidScaleAccBatchedPush{
+        .n_tokens = n_tokens,
+        .hidden_dim = hidden_dim,
+    };
+    const total = n_tokens * hidden_dim;
+    const bufs = [_]*const MetalBuffer{ accum, src, gate };
+    cmd.dispatchV2(&engine.sigmoid_scale_acc_batched_pipe, .{ (total + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SigmoidScaleAccBatchedPush), 3);
 }
 
 fn dispatchMoeWeightedAccOnCmd(
@@ -4203,6 +10756,27 @@ fn dispatchMoeWeightedAccOnCmd(
     };
     const bufs = [_]*const MetalBuffer{ accum, src, routing };
     cmd.dispatchV2(&engine.moe_weighted_acc_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccPush), 3);
+}
+
+fn dispatchMoeWeightedAccScaledOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    accum: *const MetalBuffer,
+    src: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    scales: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+) void {
+    const push = MoeWeightedAccScaledPush{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .scale_offset = @intCast(tensorPageOffset(engine.model, scales) / @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ accum, src, routing, &scales.gpu_buffer };
+    cmd.dispatchV2(&engine.moe_weighted_acc_scaled_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccScaledPush), 3);
 }
 
 /// Fused MoE weighted accumulate + shared expert: accum += sum(w_i * expert_i) + sh_weight * shared.
@@ -4232,6 +10806,117 @@ fn dispatchMoeWeightedAccSharedOnCmd(
     cmd.dispatchV2(&engine.moe_weighted_acc_shared_pipe, .{ (n + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedPush), 3);
 }
 
+fn dispatchMoeWeightedAccSharedGateF32OnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    accum: *const MetalBuffer,
+    src: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    norm_src: *const MetalBuffer,
+    gate_weight: *const metal_loader.LoadedTensor,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    norm_byte_offset: u32,
+    hidden_scale: f32,
+) void {
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
+        .norm_offset = norm_byte_offset,
+        .hidden_scale = hidden_scale,
+    };
+    const bufs = [_]*const MetalBuffer{ accum, src, routing, shared_src, norm_src, &gate_weight.gpu_buffer };
+    const use_qwen2048 =
+        n == 2048 and
+        n_used == 8 and
+        src_stride == 2048 and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        (readBoolEnv("ZINC_METAL_QWEN_F32_GATE_ACC_QWEN2048") orelse true) and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe.thread_execution_width == 32 and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe.max_threads_per_threadgroup >= 1024;
+    if (use_qwen2048) {
+        cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_qwen2048_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+        return;
+    }
+    const block_size: u32 = if (n >= 512 and engine.moe_weighted_acc_shared_gate_f32_pipe.max_threads_per_threadgroup >= 512) 512 else 256;
+    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_pipe, .{ (n + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+}
+
+fn canUseQwenMoeWeightedAccSharedGateF32NextNorm(
+    engine: *const InferenceEngine,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+) bool {
+    return n == 2048 and
+        n_used == 8 and
+        src_stride == 2048 and
+        engine.config.architecture == .qwen2_moe and
+        engine.config.ssm_d_inner == 4096 and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        (readBoolEnv("ZINC_METAL_QWEN_MOE_ACC_NEXT_NORM") orelse true) and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe.thread_execution_width == 32 and
+        engine.moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe.max_threads_per_threadgroup >= 1024;
+}
+
+fn qwenMoeNextAttnNormTarget(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    layer_count: usize,
+) ?*const MetalBuffer {
+    const next_layer_idx = layer_idx + 1;
+    if (next_layer_idx >= layer_count or next_layer_idx >= engine.attn_norm_bufs.len) return null;
+    if (engine.config.architecture != .qwen2_moe or engine.config.ssm_d_inner == 0) return null;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return null;
+    return &engine.attn_norm_bufs[next_layer_idx];
+}
+
+fn dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    accum: *const MetalBuffer,
+    src: *const MetalBuffer,
+    routing: *const MetalBuffer,
+    shared_src: *const MetalBuffer,
+    norm_src: *const MetalBuffer,
+    gate_weight: *const metal_loader.LoadedTensor,
+    next_norm: *const MetalBuffer,
+    next_norm_weight: *const MetalBuffer,
+    n: u32,
+    n_used: u32,
+    src_stride: u32,
+    norm_byte_offset: u32,
+    hidden_scale: f32,
+) void {
+    const push = MoeWeightedAccSharedGateF32NormPush{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = src_stride,
+        .gate_weight_offset = tensorPageOffset(engine.model, gate_weight),
+        .norm_offset = norm_byte_offset,
+        .eps = engine.config.rms_norm_eps,
+        .hidden_scale = hidden_scale,
+    };
+    const bufs = [_]*const MetalBuffer{
+        accum,
+        src,
+        routing,
+        shared_src,
+        norm_src,
+        &gate_weight.gpu_buffer,
+        next_norm,
+        next_norm_weight,
+    };
+    cmd.dispatchV2(&engine.moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32NormPush), 3);
+}
+
 /// Returns true if the attention gate (sigmoid gating) should be applied after flash attn.
 fn dispatchFullAttnPrepOnCmd(
     engine: *InferenceEngine,
@@ -4246,31 +10931,83 @@ fn dispatchFullAttnPrepOnCmd(
     const q_tensor = lt.attn_q orelse return error.MissingTensor;
     const k_tensor = lt.attn_k orelse return error.MissingTensor;
     const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
+    const q_weight_buf: *const MetalBuffer = if (engine.private_ssm_qkv_bufs) |bufs|
+        (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &q_tensor.gpu_buffer)
+    else
+        &q_tensor.gpu_buffer;
+    const q_weight_offset: u32 = if (q_weight_buf == &q_tensor.gpu_buffer) tensorPageOffset(engine.model, q_tensor) else 0;
+    const q_uses_private_repacked = q_weight_buf != &q_tensor.gpu_buffer and q_weight_buf.is_repacked_q8;
 
     // Detect packed Q+gate vs separate format (matches Vulkan reference forward.zig:1499-1505).
     // Packed: attn_q has q_dim*2 rows (interleaved [Q,gate] per head) — Qwen3Next style.
     // Separate: attn_q has q_dim rows, gate is in a separate attn_gate tensor — Qwen3.5 MoE style.
     const q_rows: u32 = @intCast(q_tensor.info.numElements() / hidden_dim);
     const gate_mode = classifyFullAttnGate(q_rows, attn.q_dim, lt.attn_gate != null);
+    const can_pair_attn_kv = !attn.use_k_as_v and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
+    const can_pair_attn_q_gate = gate_mode.separate_attn_gate and
+        !q_uses_private_repacked and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, q_tensor, lt.attn_gate.?, attn.q_dim, attn.q_dim, hidden_dim));
 
     if (gate_mode.packed_q_gate) {
         // Packed: project full Q+gate into attn_out_buf, then deinterleave.
         const q_full_dim = attn.q_dim * 2;
-        dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
-        dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
-        dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
-        profileBarrier(cmd, profile, .full_attn);
+        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.attn_out_buf, q_full_dim, hidden_dim, 0);
+        if (can_pair_attn_kv) {
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+        } else {
+            dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
+            dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+        }
+        profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.attn_out_buf, &engine.k_buf, &engine.v_buf });
         dispatchDeinterleaveOnCmd(engine, cmd, &engine.attn_out_buf, &engine.q_buf, &engine.gate_buf, attn.head_dim, cfg.n_heads);
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, true, false, false, true, engine);
     } else {
         // Separate: project Q directly to q_buf, gate (if present) to gate_buf.
-        dispatchDmmvOnCmd(engine, cmd, q_tensor, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
-        if (gate_mode.separate_attn_gate) {
-            dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
+        // Q+K Q4_K dual path: when there is no separate attn_gate and Q/K
+        // are both Q4_K (Gemma 31B dense full-attn layers), pair the two
+        // projections into a single dispatch via dmmv_q4k_qk_dual. V stays
+        // separate because Gemma 31B stores V as Q6_K. Saves one dispatch
+        // per qualifying dense full-attn layer with no wasted threadgroups.
+        const can_dual_qk = !gate_mode.separate_attn_gate and
+            !attn.use_k_as_v and
+            canUseDenseQ4KQKDual(engine, q_tensor, k_tensor, attn.q_dim, attn.kv_dim, hidden_dim);
+        if (can_dual_qk) {
+            dispatchDenseQ4KQKDualOnCmd(engine, cmd, q_tensor, k_tensor, &engine.norm_buf, &engine.q_buf, &engine.k_buf, attn.q_dim, attn.kv_dim, hidden_dim);
+            dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+        } else if (can_pair_attn_q_gate) {
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, q_tensor, lt.attn_gate.?, &engine.norm_buf, &engine.q_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
+            if (can_pair_attn_kv) {
+                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            } else {
+                dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
+                dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            }
+        } else {
+            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, q_tensor, q_weight_buf, q_weight_offset, &engine.norm_buf, &engine.q_buf, attn.q_dim, hidden_dim, 0);
+            if (gate_mode.separate_attn_gate) {
+                dispatchDmmvOnCmd(engine, cmd, lt.attn_gate.?, &engine.norm_buf, &engine.gate_buf, attn.q_dim, hidden_dim, 0);
+            }
+            if (can_pair_attn_kv) {
+                dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            } else {
+                dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
+                dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+            }
         }
-        dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
-        dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
-        profileBarrier(cmd, profile, .full_attn);
+        profileFullAttnQkvBarrier(cmd, profile, true, true, true, gate_mode.apply_attn_gate, engine);
+    }
+
+    // Apply Q/K/V biases if present (gpt-oss)
+    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        if (lt.attn_q_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.q_buf, b, attn.q_dim);
+        if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
+        if (!attn.use_k_as_v) {
+            if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
+        }
+        profileFullAttnQkvBarrier(cmd, profile, lt.attn_q_bias != null, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
     }
 
     if (engine.debug_validation_enabled and shouldDebugAttentionValidation(cfg, engine.position, layer_idx)) {
@@ -4281,33 +11018,205 @@ fn dispatchFullAttnPrepOnCmd(
         cmd.* = try beginProfiledCommand(engine, profile);
     }
 
-    // Apply Q/K/V biases if present (gpt-oss)
-    if (lt.attn_q_bias != null or lt.attn_k_bias != null or lt.attn_v_bias != null) {
-        cmd.commitAndWait();
-        if (lt.attn_q_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.q_buf.cpu_ptr.?)), b, attn.q_dim);
-        if (lt.attn_k_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.k_buf.cpu_ptr.?)), b, attn.kv_dim);
-        if (!attn.use_k_as_v) {
-            if (lt.attn_v_bias) |b| addBiasFromTensor(engine, @ptrCast(@alignCast(engine.v_buf.cpu_ptr.?)), b, attn.kv_dim);
+    // Fuse RoPE-K with the K/V cache write when:
+    //   - cache is f32 (kv_cache_q8 path keeps its own quantizing kernel),
+    //   - V is projected separately (use_k_as_v requires a copy this kernel
+    //     does not perform),
+    //   - rope_dim is even (the kernel processes pairs).
+    // Saves one barrier and one dispatch per dense full-attn layer (≈60/token
+    // on Gemma 31B). The rope→kv-write barrier can be skipped because the
+    // outer caller already issues a barrier before flash attention reads the
+    // cache and q_buf.
+    const can_fuse_rope_kv_write =
+        !engine.kv_cache_q8 and
+        !attn.use_k_as_v and
+        (attn.rope_dim % 2) == 0;
+    const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
+    // When the fused rope+kv-write kernel will fire, it can also fold the
+    // unit-weight V RMS norm into the same dispatch, eliminating the
+    // standalone v_buf normalize (≈60 dispatches/token on Gemma 31B).
+    const fuse_v_unit_norm_into_rope_kv = can_fuse_rope_kv_write and need_v_unit_norm;
+    // When the fused rope+kv-write kernel will fire and both per-head Q/K
+    // norm weights are present (Gemma 4 attn_q_norm + attn_k_norm), the
+    // kernel also folds in those two RMS-norm passes, eliminating two
+    // standalone DMMV-equivalent dispatches per dense full-attn layer
+    // (≈60+60/token on Gemma 31B). Adapted from llama.cpp's pattern of
+    // op-fusing rms_norm into the immediately-following producer.
+    const fuse_qk_norm_into_rope_kv =
+        can_fuse_rope_kv_write and
+        engine.attn_q_norm_present[layer_idx] and
+        engine.attn_k_norm_present[layer_idx];
+    // Q/K norms are independent — concurrent dispatch overlaps them when
+    // not fused into the rope+kv-write kernel.
+    const did_qk_norm_dispatch =
+        !fuse_qk_norm_into_rope_kv and
+        (engine.attn_q_norm_present[layer_idx] or engine.attn_k_norm_present[layer_idx]);
+    if (did_qk_norm_dispatch) {
+        if (engine.attn_q_norm_present[layer_idx]) {
+            dispatchRmsNormOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, &engine.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads);
         }
-        cmd.* = try metal_command.beginCommand(engine.device.ctx);
+        if (engine.attn_k_norm_present[layer_idx]) {
+            dispatchRmsNormOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads);
+        }
     }
-
-    // Q/K norms are independent — concurrent dispatch overlaps them.
-    if (engine.attn_q_norm_present[layer_idx]) {
-        dispatchRmsNormOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, &engine.attn_q_norm_bufs[layer_idx], attn.head_dim, cfg.n_heads);
-    }
-    if (engine.attn_k_norm_present[layer_idx]) {
-        dispatchRmsNormOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads);
-    }
-    if (cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0) {
+    const did_v_norm_dispatch = need_v_unit_norm and !fuse_v_unit_norm_into_rope_kv;
+    if (did_v_norm_dispatch) {
         dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
     }
-    profileBarrier(cmd, profile, .full_attn); // norm outputs visible before rope
+    // Adapted from llama.cpp's `ggml_metal_op_concurrency_check` (ggml-metal-ops.cpp:159):
+    // skip the post-norm barrier when no Q/K/V norm dispatch was issued — the
+    // preceding QKV-projection barrier (above) already orders writes to q_buf,
+    // k_buf, v_buf before the rope+kv-write kernel reads them. On Gemma 31B
+    // (Q/K norm + V unit norm both folded into the fused rope+kv-write), this
+    // drops 60 redundant barriers/token from the dense full-attn hot path.
+    if (did_qk_norm_dispatch or did_v_norm_dispatch) {
+        profileFullAttnQkvBarrier(
+            cmd,
+            profile,
+            did_qk_norm_dispatch and engine.attn_q_norm_present[layer_idx],
+            did_qk_norm_dispatch and engine.attn_k_norm_present[layer_idx],
+            did_v_norm_dispatch,
+            false,
+            engine,
+        ); // norm outputs visible before rope
+    }
 
-    // RoPE Q/K are independent — concurrent dispatch overlaps them.
-    dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
+    if (can_fuse_rope_kv_write) {
+        // Fused Q-rope + K-rope + KV cache write (with optional V unit norm
+        // and optional Q/K-norm) in a single dispatch. Grid = n_q_heads +
+        // n_kv_heads; the first n_q_heads slots normalize+rotate q_buf in
+        // place, the rest normalize+rotate K and write K/V into the layer's
+        // cache slot.
+        dispatchFusedRopeKvCacheWriteOnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            attn,
+            cfg.n_heads,
+            engine.position,
+            engine.position * attn.kv_dim,
+            fuse_v_unit_norm_into_rope_kv,
+            fuse_qk_norm_into_rope_kv,
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+    } else {
+        // Slow path: separate Q-rope, K-rope, and KV cache write dispatches.
+        dispatchRopeOnCmd(engine, cmd, &engine.q_buf, &engine.q_buf, attn.head_dim, attn.rope_dim, cfg.n_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
+        dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
+        profileFullAttnQkvBarrier(cmd, profile, true, true, false, false, engine); // rope outputs visible before KV cache write
+
+        dispatchKvCacheWriteOnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            attn.kv_dim,
+            engine.position * attn.kv_dim,
+            @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+    }
+    return gate_mode.apply_attn_gate;
+}
+
+fn dispatchFullAttnKvCacheOnlyOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    attn: LayerAttentionParams,
+    hidden_dim: u32,
+    fuse_attn_norm: bool,
+) !void {
+    const cfg = engine.config;
+    const k_tensor = lt.attn_k orelse return error.MissingTensor;
+    const v_tensor = if (attn.use_k_as_v) k_tensor else lt.attn_v orelse return error.MissingTensor;
+
+    const can_pair_attn_kv = !attn.use_k_as_v and
+        ((cfg.architecture == .gemma and canUsePairedQ8Dmmv(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim)) or
+            canUseQwen36FullAttnQ8Pair(engine, k_tensor, v_tensor, attn.kv_dim, attn.kv_dim, hidden_dim));
+    if (fuse_attn_norm and canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim)) {
+        // Adapt llama.cpp `kernel_mul_mv_q8_0_f32_impl` adjacent-row Q8
+        // matvec discipline to the output-only prompt tail: compute the
+        // final-layer K/V projections directly from hidden with inline
+        // attn_norm, avoiding a standalone RMSNorm dispatch and barrier for
+        // non-terminal prompt tokens.
+        dispatchFusedNormDualQ8DmmvOnCmd(
+            engine,
+            cmd,
+            k_tensor,
+            v_tensor,
+            &k_tensor.gpu_buffer,
+            &v_tensor.gpu_buffer,
+            tensorPageOffset(engine.model, k_tensor),
+            tensorPageOffset(engine.model, v_tensor),
+            &engine.hidden_buf,
+            &engine.attn_norm_bufs[layer_idx],
+            &engine.k_buf,
+            &engine.v_buf,
+            attn.kv_dim,
+            attn.kv_dim,
+            hidden_dim,
+        );
+    } else if (can_pair_attn_kv) {
+        dispatchPairedQ8DmmvOnCmd(engine, cmd, k_tensor, v_tensor, &engine.norm_buf, &engine.k_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+    } else {
+        dispatchDmmvOnCmd(engine, cmd, k_tensor, &engine.norm_buf, &engine.k_buf, attn.kv_dim, hidden_dim, 0);
+        dispatchDmmvOnCmd(engine, cmd, v_tensor, &engine.norm_buf, &engine.v_buf, attn.kv_dim, hidden_dim, 0);
+    }
+    profileFullAttnQkvBarrier(cmd, profile, false, true, true, false, engine);
+
+    if (lt.attn_k_bias != null or lt.attn_v_bias != null) {
+        if (lt.attn_k_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.k_buf, b, attn.kv_dim);
+        if (!attn.use_k_as_v) {
+            if (lt.attn_v_bias) |b| dispatchAddBiasOnCmd(engine, cmd, &engine.v_buf, b, attn.kv_dim);
+        }
+        profileFullAttnQkvBarrier(cmd, profile, false, lt.attn_k_bias != null, !attn.use_k_as_v and lt.attn_v_bias != null, false, engine);
+    }
+
+    const can_fuse_rope_kv_write =
+        !engine.kv_cache_q8 and
+        !attn.use_k_as_v and
+        (attn.rope_dim % 2) == 0;
+    const need_v_unit_norm = cfg.architecture == .gemma and cfg.rope_freq_base_swa > 0;
+    const fuse_v_unit_norm_into_rope_kv = can_fuse_rope_kv_write and need_v_unit_norm;
+    const fuse_qk_norm_into_rope_kv =
+        can_fuse_rope_kv_write and
+        engine.attn_q_norm_present[layer_idx] and
+        engine.attn_k_norm_present[layer_idx];
+    const did_qk_norm_dispatch =
+        !fuse_qk_norm_into_rope_kv and engine.attn_k_norm_present[layer_idx];
+    if (did_qk_norm_dispatch) {
+        dispatchRmsNormOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, &engine.attn_k_norm_bufs[layer_idx], attn.head_dim, attn.n_kv_heads);
+    }
+    const did_v_norm_dispatch = need_v_unit_norm and !fuse_v_unit_norm_into_rope_kv;
+    if (did_v_norm_dispatch) {
+        dispatchRmsNormOnCmd(engine, cmd, &engine.v_buf, &engine.v_buf, &engine.unit_rms_norm_weights, attn.head_dim, attn.n_kv_heads);
+    }
+    if (did_qk_norm_dispatch or did_v_norm_dispatch) {
+        profileFullAttnQkvBarrier(cmd, profile, false, did_qk_norm_dispatch, did_v_norm_dispatch, false, engine);
+    }
+
+    if (can_fuse_rope_kv_write) {
+        // K/V-only variant of the llama.cpp-style RoPE materialization path:
+        // final non-terminal prompt tokens write rotated K/V directly to cache.
+        dispatchFusedRopeKvCacheWriteOnCmd(
+            engine,
+            cmd,
+            layer_idx,
+            attn,
+            0,
+            engine.position,
+            engine.position * attn.kv_dim,
+            fuse_v_unit_norm_into_rope_kv,
+            fuse_qk_norm_into_rope_kv,
+        );
+        if (profile) |p| p.full_attn_kv_write_calls += 1;
+        return;
+    }
+
     dispatchRopeOnCmd(engine, cmd, &engine.k_buf, &engine.k_buf, attn.head_dim, attn.rope_dim, attn.n_kv_heads, engine.position, attn.rope_freq_base, attn.use_rope_freq_factors);
-    profileBarrier(cmd, profile, .full_attn); // rope outputs visible before KV cache write
+    profileFullAttnQkvBarrier(cmd, profile, false, true, false, false, engine);
 
     dispatchKvCacheWriteOnCmd(
         engine,
@@ -4317,7 +11226,62 @@ fn dispatchFullAttnPrepOnCmd(
         engine.position * attn.kv_dim,
         @intCast(@as(u64, engine.position) * attn.kv_cache_bytes_per_token),
     );
-    return gate_mode.apply_attn_gate;
+    if (profile) |p| p.full_attn_kv_write_calls += 1;
+}
+
+/// Adapted from llama.cpp `ggml_metal_op_rope_set_rows`: rotates the K vector
+/// for the current token and writes the result (plus an unrotated V copy)
+/// directly into the layer's KV cache slot. Extended to also rotate the Q
+/// vector in the same dispatch so the dense decode path collapses
+/// (Q-rope, K-rope+kv-write, V-norm+kv-write) into one kernel — one fewer
+/// dispatch per dense full-attn layer (≈60/token on Gemma 31B). Grid =
+/// n_q_heads + n_kv_heads. When `apply_v_norm` is true, the kernel also
+/// RMS-normalizes V (unit weights) per head before writing to v_cache,
+/// subsuming the standalone `dispatchRmsNormOnCmd` over v_buf for Gemma SWA.
+fn dispatchFusedRopeKvCacheWriteOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    layer_idx: usize,
+    attn: LayerAttentionParams,
+    n_q_heads: u32,
+    position: u32,
+    dst_offset: u32,
+    apply_v_norm: bool,
+    apply_qk_norm: bool,
+) void {
+    const freq_buf = selectRopeFreqBuffer(engine, attn.rope_dim, attn.rope_freq_base, attn.use_rope_freq_factors);
+    const push = RopeKvCacheWritePush{
+        .stride = attn.head_dim,
+        .rope_dim = attn.rope_dim,
+        .n_q_heads = n_q_heads,
+        .position = position,
+        .dst_offset = dst_offset,
+        .apply_v_norm = if (apply_v_norm) 1 else 0,
+        .apply_qk_norm = if (apply_qk_norm) 1 else 0,
+        .eps = engine.config.rms_norm_eps,
+    };
+    // q_norm_w / k_norm_w buffers are unused when apply_qk_norm == 0; bind a
+    // valid placeholder (unit_rms_norm_weights) to satisfy Metal buffer slot
+    // requirements without allocating new buffers.
+    const q_norm_buf: *const MetalBuffer = if (apply_qk_norm)
+        &engine.attn_q_norm_bufs[layer_idx]
+    else
+        &engine.unit_rms_norm_weights;
+    const k_norm_buf: *const MetalBuffer = if (apply_qk_norm)
+        &engine.attn_k_norm_bufs[layer_idx]
+    else
+        &engine.unit_rms_norm_weights;
+    const bufs = [_]*const MetalBuffer{
+        &engine.q_buf,
+        &engine.k_buf,
+        &engine.v_buf,
+        freq_buf,
+        &engine.kv_k_cache[layer_idx],
+        &engine.kv_v_cache[layer_idx],
+        q_norm_buf,
+        k_norm_buf,
+    };
+    cmd.dispatchV2(&engine.rope_kv_cache_write_pipe, .{ n_q_heads + attn.n_kv_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(RopeKvCacheWritePush), 0);
 }
 
 /// CPU fallback DMMV for K > shared memory limit (4096).
@@ -4334,6 +11298,13 @@ fn cpuDmmvFallback(
 ) !void {
     const off: usize = @intCast(data_offset + tensor.info.offset + extra_byte_offset);
     const raw = mmap[off..];
+    if (tensor.info.type_ == .q8_0) {
+        for (0..M) |row| {
+            output[row] = dotQ8_0Row(raw, @intCast(row), K, input);
+        }
+        return;
+    }
+
     const row_buf = try allocator.alloc(f32, K);
     defer allocator.free(row_buf);
     for (0..M) |row| {
@@ -4797,6 +11768,35 @@ pub fn dequantRow(raw_data: []const u8, row: u32, cols: u32, quant_type: GGMLTyp
     }
 }
 
+fn dotQ8_0Row(raw_data: []const u8, row: u32, cols: u32, input: [*]const f32) f32 {
+    const Vec8f = @Vector(8, f32);
+    const Vec8i8 = @Vector(8, i8);
+    const Vec8i32 = @Vector(8, i32);
+    const block_size: usize = 32;
+    const bpb: usize = 34;
+    const bpr = @as(usize, cols) / block_size;
+    const row_off = @as(usize, row) * bpr * bpb;
+    var acc: Vec8f = @splat(0.0);
+    var in_i: usize = 0;
+    for (0..bpr) |b| {
+        const bo = row_off + b * bpb;
+        const scale_bits = std.mem.readInt(u16, raw_data[bo..][0..2], .little);
+        const scale: f32 = @floatCast(@as(f16, @bitCast(scale_bits)));
+        const scale_vec: Vec8f = @splat(scale);
+        inline for (0..4) |chunk| {
+            const q_arr: [8]u8 = raw_data[bo + 2 + chunk * 8 ..][0..8].*;
+            const q_i8: Vec8i8 = @bitCast(q_arr);
+            const q_i32: Vec8i32 = @intCast(q_i8);
+            const q_f: Vec8f = @floatFromInt(q_i32);
+            const x_arr: [8]f32 = input[in_i + chunk * 8 ..][0..8].*;
+            const x: Vec8f = x_arr;
+            acc += (q_f * scale_vec) * x;
+        }
+        in_i += block_size;
+    }
+    return @reduce(.Add, acc);
+}
+
 fn readMmapFloats(mmap: []const u8, base_off: usize, tensor_type: GGMLType, output: []f32) void {
     switch (tensor_type) {
         .f32 => {
@@ -4898,17 +11898,101 @@ fn canUseBatchedQ4kMoe(engine: *const InferenceEngine, gate_quant: GGMLType, dow
     return engine.config.n_experts_used == 8 and gate_quant == .q4_k and down_quant == .q4_k;
 }
 
+fn canUseBatchedMxfp4GptOssMoe(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    gate_quant: GGMLType,
+    up_quant: GGMLType,
+    down_quant: GGMLType,
+    hidden_dim: u32,
+    inter_dim: u32,
+) bool {
+    const cfg = engine.config;
+    if (cfg.architecture != .gpt_oss) return false;
+    if (cfg.n_experts_used == 0 or cfg.n_experts_used > 8) return false;
+    if (hidden_dim > 4096 or inter_dim > 4096) return false;
+    if (gate_quant != .mxfp4 or up_quant != .mxfp4 or down_quant != .mxfp4) return false;
+    if (lt.ffn_gate_up_exps != null or lt.ffn_down_exps_scale != null) return false;
+    if (lt.ffn_gate_shexp != null or lt.ffn_up_shexp != null or lt.ffn_down_shexp != null) return false;
+
+    const gate_bias = lt.ffn_gate_exps_bias orelse return false;
+    const up_bias = lt.ffn_up_exps_bias orelse return false;
+    const down_bias = lt.ffn_down_exps_bias orelse return false;
+    if (gate_bias.info.type_ != .f32 or up_bias.info.type_ != .f32 or down_bias.info.type_ != .f32) return false;
+
+    return engine.dmmv_mxfp4_moe_pipe.handle != null and
+        engine.swiglu_oai_batched_bias_pipe.handle != null and
+        engine.moe_acc_batched_bias_pipe.handle != null;
+}
+
+fn canUseGpuRoutedGptOssMoe(
+    engine: *const InferenceEngine,
+    lt: LayerTensors,
+    layer_idx: usize,
+    hidden_dim: u32,
+    inter_dim: u32,
+) bool {
+    if (engine.post_ffn_norm_present[layer_idx]) return false;
+
+    const gate_up_layout = resolveMoeGateUpLayout(lt, inter_dim, hidden_dim) catch return false;
+    const down_exps = lt.ffn_down_exps orelse return false;
+    if (!canUseBatchedMxfp4GptOssMoe(engine, lt, gate_up_layout.gate_tensor.info.type_, gate_up_layout.up_tensor.info.type_, down_exps.info.type_, hidden_dim, inter_dim)) {
+        return false;
+    }
+
+    const router_bias = lt.ffn_gate_inp_bias orelse return false;
+    if (router_bias.info.type_ != .f32) return false;
+
+    return engine.softmax_topk_weight_bias_pipe.handle != null and
+        engine.moe_acc_batched_bias_routed_pipe.handle != null;
+}
+
 fn canUseGpuRoutedMoeDown(engine: *const InferenceEngine, down_quant: GGMLType) bool {
     return switch (down_quant) {
         .q4_k => true,
+        .q5_1 => engine.dmmv_q5_1_moe_pipe.handle != null,
         .q5_k => engine.dmmv_q5k_moe_pipe.handle != null,
         .q6_k => engine.dmmv_q6k_moe_pipe.handle != null,
         else => false,
     };
 }
 
+fn isF32Tensor(tensor: ?*const metal_loader.LoadedTensor) bool {
+    return if (tensor) |t| t.info.type_ == .f32 else false;
+}
+
 fn canUseGpuRoutedBatchedMoe(engine: *const InferenceEngine, lt: LayerTensors) bool {
-    if (engine.config.architecture == .gemma) return false;
+    if (engine.config.architecture == .gemma) {
+        const gate_up_exps = lt.ffn_gate_up_exps orelse return false;
+        const down_exps = lt.ffn_down_exps orelse return false;
+        const gate_shexp = lt.ffn_gate_shexp orelse return false;
+        const up_shexp = lt.ffn_up_shexp orelse return false;
+        const down_shexp = lt.ffn_down_shexp orelse return false;
+
+        if (engine.config.n_experts_used != 8) return false;
+        if (gate_up_exps.info.type_ != .q4_k) return false;
+        if (!canUseGpuRoutedMoeDown(engine, down_exps.info.type_)) return false;
+        if (engine.dmmvPipelineForType(gate_shexp, engine.config.shared_expert_intermediate_dim, engine.config.hidden_dim) == null) return false;
+        if (engine.dmmvPipelineForType(up_shexp, engine.config.shared_expert_intermediate_dim, engine.config.hidden_dim) == null) return false;
+        if (engine.dmmvPipelineForType(down_shexp, engine.config.hidden_dim, engine.config.shared_expert_intermediate_dim) == null) return false;
+        if (lt.ffn_gate_inp == null or lt.ffn_gate_inp_bias != null) return false;
+        if (lt.ffn_gate_exps_bias != null or lt.ffn_up_exps_bias != null or lt.ffn_down_exps_bias != null) return false;
+        if (!isF32Tensor(lt.ffn_gate_inp_scale) or !isF32Tensor(lt.pre_ffw_norm_2) or
+            !isF32Tensor(lt.post_ffw_norm_1) or !isF32Tensor(lt.post_ffw_norm_2) or
+            !isF32Tensor(lt.ffn_down_exps_scale))
+        {
+            return false;
+        }
+        if (lt.ffn_gate_inp_shexp) |gate| {
+            if (engine.dmmvPipelineForType(gate, 1, engine.config.hidden_dim) == null) return false;
+        }
+        return engine.softmax_topk_scaled_pipe.handle != null and
+            engine.geglu_batched_pipe.handle != null and
+            engine.geglu_pipe.handle != null and
+            engine.moe_weighted_acc_scaled_pipe.handle != null and
+            engine.sigmoid_scale_acc_pipe.handle != null and
+            engine.scale_acc_pipe.handle != null;
+    }
     if (lt.ffn_gate_up_exps != null) return false;
     const gate_exps = lt.ffn_gate_exps orelse return false;
     const up_exps = lt.ffn_up_exps orelse return false;
@@ -4923,6 +12007,1945 @@ fn canUseGpuRoutedBatchedMoe(engine: *const InferenceEngine, lt: LayerTensors) b
     if (has_shexp and engine.moe_weighted_acc_shared_pipe.handle == null) return false;
 
     return engine.softmax_topk_pipe.handle != null and engine.moe_weighted_acc_pipe.handle != null;
+}
+
+const SliceDiff = struct {
+    max_abs: f32,
+    max_idx: usize,
+    rms: f64,
+};
+
+fn diffF32Slices(expected: []const f32, actual: []const f32) SliceDiff {
+    const n = @min(expected.len, actual.len);
+    var max_abs: f32 = 0;
+    var max_idx: usize = 0;
+    var sum_sq: f64 = 0;
+    for (0..n) |i| {
+        const delta = actual[i] - expected[i];
+        const abs_delta = @abs(delta);
+        if (abs_delta > max_abs) {
+            max_abs = abs_delta;
+            max_idx = i;
+        }
+        sum_sq += @as(f64, delta) * @as(f64, delta);
+    }
+    const rms = if (n > 0) @sqrt(sum_sq / @as(f64, @floatFromInt(n))) else 0;
+    return .{ .max_abs = max_abs, .max_idx = max_idx, .rms = rms };
+}
+
+fn shouldValidateGemmaMoe(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.gemma_moe_validation_enabled and
+        engine.config.architecture == .gemma and
+        engine.position == 0 and
+        layer_idx == 0;
+}
+
+const QwenPrefillMoeValidationRef = struct {
+    hidden_before: []f32,
+    moe_delta_ref: []f32,
+    expert_ids: [16]u32,
+    expert_weights: [16]f32,
+    n_used: usize,
+    shared_gate: f32,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.hidden_before);
+        allocator.free(self.moe_delta_ref);
+        self.* = undefined;
+    }
+};
+
+fn canUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, prompt_len: usize) bool {
+    if (!engine.qwen_ssm_prefill_proj_enabled) return false;
+    // The layer-0 SSM precompute is a prompt-prefill optimization. Very short
+    // raw prompts are coherence-sensitive and do not amortize the extra graph
+    // anyway; keep them on the validated per-token path.
+    if (prompt_len < qwen_ssm_projection_prefill_min_tokens) return false;
+    if (prompt_len > queued_prefill_embed_tokens) return false;
+    if (engine.position != 0) return false;
+    if (!engine.private_decode_buffers) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled or engine.qwen_prefill_validation_enabled) return false;
+
+    const cfg = engine.config;
+    if (cfg.architecture != .qwen2_moe or cfg.n_experts == 0 or cfg.ssm_d_inner == 0) return false;
+    if (isFullAttentionLayer(cfg, 0)) return false;
+    if (engine.gemm_q8_0_pipe.handle == null) return false;
+    if (engine.layer_tensors.len == 0) return false;
+
+    const lt = engine.layer_tensors[0];
+    const wqkv_t = lt.attn_qkv orelse return false;
+    const z_t = lt.attn_gate orelse return false;
+    const alpha_t = lt.ssm_alpha orelse return false;
+    const beta_t = lt.ssm_beta orelse return false;
+    return wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        canUseQwenSsmProjectionTail(engine, alpha_t, cfg.ssm_dt_rank, cfg.hidden_dim) and
+        canUseQwenSsmProjectionTail(engine, beta_t, cfg.ssm_dt_rank, cfg.hidden_dim);
+}
+
+fn prepareQwenSsmPrefillProjectionChunk(engine: *InferenceEngine, prompt_len: usize, async_out: ?*MetalCommand) !bool {
+    engine.qwen_ssm_prefill_proj_active_tokens = 0;
+    engine.qwen_ssm_prefill_branch_active_tokens = 0;
+    engine.qwen_ssm_prefill_branch_norm_active_tokens = 0;
+    if (!canUseQwenSsmPrefillProjectionChunk(engine, prompt_len)) return false;
+
+    const cfg = engine.config;
+    const hidden_dim = cfg.hidden_dim;
+    const d_inner = cfg.ssm_d_inner;
+    const dt_rank = cfg.ssm_dt_rank;
+    const conv_channels = d_inner + 2 * cfg.ssm_n_group * cfg.ssm_d_state;
+    const n_tokens: u32 = @min(qwen_ssm_projection_prefill_max_tokens, @as(u32, @intCast(prompt_len)));
+    const lt = engine.layer_tensors[0];
+    const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
+    const z_t = lt.attn_gate orelse return error.MissingTensor;
+    const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
+    const beta_t = lt.ssm_beta orelse return error.MissingTensor;
+    const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
+    const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchRmsNormOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.attn_norm_bufs[0], hidden_dim, n_tokens);
+    profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_norm_buf});
+    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_qkv_buf, conv_channels, hidden_dim, n_tokens);
+    const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
+    const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+    profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_proj_qkv_buf});
+    const branch_batched =
+        alpha_batched and
+        beta_batched and
+        ssm_out_t.info.type_ == .q8_0 and
+        engine.ssm_conv1d_prefill_pipe.handle != null and
+        engine.ssm_delta_net_prefill_pipe.handle != null and
+        engine.ssm_gated_norm_pipe.handle != null and
+        engine.ssm_conv_kernel_bufs != null and
+        engine.ssm_conv_state_bufs != null and
+        engine.ssm_state_bufs != null and
+        engine.ssm_dt_bias_bufs != null and
+        engine.ssm_a_bufs != null and
+        engine.ssm_norm_weight_bufs != null and
+        engine.ssm_norm_per_head != null and
+        dt_rank > 0 and
+        d_inner > 0 and
+        cfg.ssm_d_state > 0 and
+        d_inner % dt_rank == 0;
+    var branch_norm_batched = false;
+    if (branch_batched) {
+        const d_conv = cfg.ssm_d_conv;
+        const d_state = cfg.ssm_d_state;
+        const n_group = cfg.ssm_n_group;
+        const head_v_dim = d_inner / dt_rank;
+        const conv_prefill_pipe = qwenSsmConvD4PrefillPipe(engine, conv_channels, d_conv);
+
+        dispatchSsmConv1dPrefillOnCmd(
+            &cmd,
+            conv_prefill_pipe,
+            &engine.ssm_conv_kernel_bufs.?[0],
+            &engine.ssm_conv_state_bufs.?[0],
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            conv_channels,
+            d_conv,
+            n_tokens,
+            conv_channels,
+            0,
+            0,
+        );
+        if (profile) |p| p.ssm_conv_calls += 1;
+
+        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`: conv only
+        // consumes QKV, and delta-net only needs QKV/alpha/beta. Keep the Z
+        // projection out of the delta dependency barrier so it can be recorded
+        // next to delta and join only at the gated-norm edge.
+        try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+            engine,
+            &cmd,
+            alpha_t,
+            beta_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+            dt_rank,
+            hidden_dim,
+            n_tokens,
+        );
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+        });
+
+        {
+            const push = SsmDeltaNetPrefillPush{
+                .d_inner = d_inner,
+                .dt_rank = dt_rank,
+                .head_v_dim = head_v_dim,
+                .d_state = d_state,
+                .n_group = n_group,
+                .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+                .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                .n_tokens = n_tokens,
+                .alpha_stride = dt_rank,
+                .beta_stride = dt_rank,
+                .conv_stride = conv_channels,
+                .output_stride = d_inner,
+                .alpha_offset = 0,
+                .beta_offset = 0,
+                .conv_offset = 0,
+                .output_offset = 0,
+            };
+            const bufs = [_]*const MetalBuffer{
+                &engine.qwen_ssm_prefill_proj_qkv_buf,
+                &engine.qwen_ssm_prefill_proj_alpha_buf,
+                &engine.ssm_dt_bias_bufs.?[0],
+                &engine.ssm_a_bufs.?[0],
+                &engine.qwen_ssm_prefill_proj_beta_buf,
+                &engine.ssm_state_bufs.?[0],
+                &engine.qwen_ssm_prefill_branch_buf,
+            };
+            const tg_size = ssmDeltaNetPrefillThreadgroupSize(&engine.ssm_delta_net_prefill_pipe, dt_rank, head_v_dim, d_state, n_group);
+            cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+            if (profile) |p| p.ssm_delta_calls += 1;
+        }
+        dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_branch_buf,
+            &engine.qwen_ssm_prefill_proj_z_buf,
+        });
+
+        dispatchSsmGatedNormBatchedOffsetsWithPipe(
+            &cmd,
+            &engine.ssm_gated_norm_pipe,
+            &engine.qwen_ssm_prefill_branch_buf,
+            &engine.ssm_norm_weight_bufs.?[0],
+            &engine.qwen_ssm_prefill_proj_z_buf,
+            &engine.qwen_ssm_prefill_branch_buf,
+            d_inner,
+            dt_rank,
+            head_v_dim,
+            d_state,
+            engine.ssm_norm_per_head.?[0],
+            0,
+            0,
+            0,
+            n_tokens,
+        );
+        if (profile) |p| p.ssm_gated_norm_calls += 1;
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{&engine.qwen_ssm_prefill_branch_buf});
+
+        dispatchGemmQ8_0OnCmd(engine, &cmd, ssm_out_t, &engine.qwen_ssm_prefill_branch_buf, &engine.qwen_ssm_prefill_proj_norm_buf, hidden_dim, d_inner, n_tokens);
+
+        // Adapt llama.cpp `ggml_metal_graph_compute` output materialization:
+        // while layer-0 SSM is already layer-major, also materialize the
+        // post-SSM hidden row and FFN norm that token-major MoE consumes.
+        // This keeps MoE routing on the validated per-token path but removes
+        // one residual+rms_norm dispatch from every prompt token.
+        dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.prefill_embed_buf, &engine.qwen_ssm_prefill_branch_buf, n_tokens * hidden_dim, 0, 0);
+        profileBarrierBuffers(&cmd, profile, .ssm, &.{
+            &engine.qwen_ssm_prefill_branch_buf,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+        });
+        {
+            const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
+            const bufs = [_]*const MetalBuffer{
+                &engine.qwen_ssm_prefill_branch_buf,
+                &engine.qwen_ssm_prefill_proj_norm_buf,
+                &engine.qwen_ssm_prefill_proj_norm_buf,
+                &engine.ffn_norm_bufs[0],
+            };
+            cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n_tokens, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+        }
+        branch_norm_batched = true;
+    } else {
+        dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.qwen_ssm_prefill_proj_z_buf, d_inner, hidden_dim, n_tokens);
+        try dispatchQwenSsmProjectionTailPairBatchedOnCmd(
+            engine,
+            &cmd,
+            alpha_t,
+            beta_t,
+            &engine.qwen_ssm_prefill_proj_norm_buf,
+            &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.qwen_ssm_prefill_proj_beta_buf,
+            dt_rank,
+            hidden_dim,
+            n_tokens,
+        );
+    }
+    if (async_out) |out| {
+        commitAsyncProfiled(&cmd, profile);
+        out.* = cmd;
+        cmd = .{
+            .handle = null,
+            .dispatch_count = 0,
+            .barrier_count = 0,
+            .barrier_enabled = false,
+        };
+    } else {
+        commitAndWaitProfiled(&cmd, profile);
+    }
+
+    engine.qwen_ssm_prefill_proj_active_tokens = n_tokens;
+    engine.qwen_ssm_prefill_branch_active_tokens = if (branch_batched) n_tokens else 0;
+    engine.qwen_ssm_prefill_branch_norm_active_tokens = if (branch_norm_batched) n_tokens else 0;
+    if (engine.profile_enabled) {
+        log.info("Metal profile: Qwen SSM prefill projection chunk active layer=0 tokens={d} async={} alpha_batched={} beta_batched={} branch_batched={} branch_norm_batched={}", .{ n_tokens, async_out != null, alpha_batched, beta_batched, branch_batched, branch_norm_batched });
+    }
+    return true;
+}
+
+fn shouldUseQwenSsmPrefillBranchChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.qwen_ssm_prefill_branch_active_tokens > engine.position and
+        engine.qwen_ssm_prefill_branch_norm_active_tokens <= engine.position and
+        layer_idx == 0;
+}
+
+fn shouldUseQwenSsmPrefillBranchNormChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.qwen_ssm_prefill_branch_norm_active_tokens > engine.position and layer_idx == 0;
+}
+
+fn shouldUseQwenSsmPrefillProjectionChunk(engine: *const InferenceEngine, layer_idx: usize) bool {
+    return engine.qwen_ssm_prefill_proj_active_tokens > engine.position and layer_idx == 0;
+}
+
+fn dispatchQwenSsmPrefillProjectionChunkCopies(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) void {
+    const token_idx = engine.position;
+    const lt = engine.layer_tensors[0];
+    const alpha_t = lt.ssm_alpha orelse return;
+    const beta_t = lt.ssm_beta orelse return;
+    const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
+    const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_qkv_buf, &engine.attn_out_buf, conv_channels, token_idx * conv_channels, 0);
+    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_z_buf, &engine.gate_buf, d_inner, token_idx * d_inner, 0);
+    if (!alpha_batched or !beta_batched) {
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, token_idx * hidden_dim, 0);
+    }
+    if (alpha_batched) {
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_alpha_buf, &engine.router_logits_buf, dt_rank, token_idx * dt_rank, 0);
+    }
+    if (beta_batched) {
+        dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_beta_buf, &engine.down_buf, dt_rank, token_idx * dt_rank, 0);
+    }
+}
+
+fn shouldValidateQwenPrefillMoe(engine: *const InferenceEngine, layer_idx: usize, use_standard_gpu_routed_moe: bool, using_local_cmd: bool) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        use_standard_gpu_routed_moe and
+        cfg.architecture != .gemma and
+        cfg.architecture != .gpt_oss and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < qwenMoeRoutePackValidateTokens(engine) and
+        layer_idx == qwenMoeRoutePackValidateLayer(engine);
+}
+
+fn shouldCaptureQwenRoutePackedLayerInput(engine: *const InferenceEngine, layer_idx: usize, using_local_cmd: bool) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        cfg.architecture == .qwen2_moe and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < qwenMoeRoutePackValidateTokens(engine) and
+        layer_idx == qwenMoeRoutePackValidateLayer(engine);
+}
+
+fn captureQwenRoutePackedLayerInput(engine: *InferenceEngine, hidden_dim: u32) !void {
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens(engine));
+    const h: usize = @intCast(hidden_dim);
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * h * @sizeOf(f32));
+
+    const token_idx: usize = @intCast(engine.position);
+    const src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_layer_input_ref_buf.cpu_ptr.?));
+    @memcpy(dst[token_idx * h .. token_idx * h + h], src[0..h]);
+}
+
+fn shouldValidateQwenSsmProjection(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    using_local_cmd: bool,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+) bool {
+    const cfg = engine.config;
+    return engine.qwen_prefill_validation_enabled and
+        using_local_cmd and
+        cfg.architecture == .qwen2_moe and
+        cfg.n_experts > 0 and
+        cfg.ssm_d_inner > 0 and
+        engine.position < qwen_ssm_projection_validate_tokens and
+        layer_idx == @as(usize, @intCast(engine.qwen_ssm_proj_validate_layer)) and
+        wqkv_t.info.type_ == .q8_0 and
+        z_t.info.type_ == .q8_0 and
+        alpha_t.info.type_ == .q8_0 and
+        beta_t.info.type_ == .q8_0 and
+        engine.gemm_q8_0_pipe.handle != null;
+}
+
+fn ensureValidationBuffer(engine: *InferenceEngine, buf: *MetalBuffer, required_bytes: usize) !void {
+    const size = @max(required_bytes, 4);
+    if (buf.handle != null and buf.cpu_ptr != null and buf.size >= size) return;
+    const next = try metal_buffer.createBuffer(engine.device.ctx, size);
+    metal_buffer.freeBuffer(buf);
+    buf.* = next;
+}
+
+fn ensureQwenSsmProjectionValidationBuffers(
+    engine: *InferenceEngine,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) !void {
+    const n: usize = @intCast(qwen_ssm_projection_validate_tokens);
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_norm_buf, n * @as(usize, hidden_dim) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_qkv_ref_buf, n * @as(usize, conv_channels) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_z_ref_buf, n * @as(usize, d_inner) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_alpha_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_ssm_proj_validate_beta_ref_buf, n * @as(usize, dt_rank) * @sizeOf(f32));
+}
+
+fn logQwenSsmProjectionChunkValidationDiff(
+    layer_idx: usize,
+    tensor_name: []const u8,
+    expected: []const f32,
+    actual: []const f32,
+    width: u32,
+    n_tokens: u32,
+    tol: f32,
+) void {
+    const diff = diffF32Slices(expected, actual);
+    const width_usize: usize = @intCast(@max(width, 1));
+    const worst_token = diff.max_idx / width_usize;
+    const worst_idx = diff.max_idx % width_usize;
+    const ref_value = if (expected.len > 0) expected[diff.max_idx] else 0;
+    const candidate_value = if (actual.len > 0) actual[diff.max_idx] else 0;
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: chunk_ssm_proj layer={d} tensor={s} tokens={d} token={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            layer_idx,
+            tensor_name,
+            n_tokens,
+            worst_token,
+            worst_idx,
+            diff.max_abs,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: chunk_ssm_proj layer={d} tensor={s} tokens={d} token={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            layer_idx,
+            tensor_name,
+            n_tokens,
+            worst_token,
+            worst_idx,
+            diff.max_abs,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+}
+
+fn validateQwenSsmProjectionBatchKernel(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    wqkv_t: *const metal_loader.LoadedTensor,
+    z_t: *const metal_loader.LoadedTensor,
+    alpha_t: *const metal_loader.LoadedTensor,
+    beta_t: *const metal_loader.LoadedTensor,
+    conv_channels: u32,
+    d_inner: u32,
+    dt_rank: u32,
+    hidden_dim: u32,
+) !void {
+    try ensureQwenSsmProjectionValidationBuffers(engine, conv_channels, d_inner, dt_rank, hidden_dim);
+
+    if (engine.position == 0) {
+        engine.qwen_ssm_proj_validate_captured_tokens = 0;
+    }
+    const token_idx = engine.position;
+    if (token_idx >= qwen_ssm_projection_validate_tokens) return;
+
+    const norm_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_norm_buf.cpu_ptr.?));
+    const hidden_src: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const norm_weight: [*]const f32 = @ptrCast(@alignCast(engine.attn_norm_bufs[layer_idx].cpu_ptr.?));
+    const norm_off = @as(usize, token_idx) * @as(usize, hidden_dim);
+    cpuRmsNormMul(hidden_src, norm_weight[0..hidden_dim], norm_dst + norm_off, hidden_dim, 1, engine.config.rms_norm_eps);
+
+    const qkv_src: [*]const f32 = @ptrCast(@alignCast(engine.attn_out_buf.cpu_ptr.?));
+    const z_src: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+    const alpha_src: [*]const f32 = @ptrCast(@alignCast(engine.router_logits_buf.cpu_ptr.?));
+    const beta_src: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+    const qkv_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_qkv_ref_buf.cpu_ptr.?));
+    const z_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_z_ref_buf.cpu_ptr.?));
+    const alpha_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_alpha_ref_buf.cpu_ptr.?));
+    const beta_ref: [*]f32 = @ptrCast(@alignCast(engine.qwen_ssm_proj_validate_beta_ref_buf.cpu_ptr.?));
+    const qkv_off = @as(usize, token_idx) * @as(usize, conv_channels);
+    const z_off = @as(usize, token_idx) * @as(usize, d_inner);
+    const ab_off = @as(usize, token_idx) * @as(usize, dt_rank);
+    @memcpy(qkv_ref[qkv_off .. qkv_off + @as(usize, conv_channels)], qkv_src[0..conv_channels]);
+    @memcpy(z_ref[z_off .. z_off + @as(usize, d_inner)], z_src[0..d_inner]);
+    @memcpy(alpha_ref[ab_off .. ab_off + @as(usize, dt_rank)], alpha_src[0..dt_rank]);
+    @memcpy(beta_ref[ab_off .. ab_off + @as(usize, dt_rank)], beta_src[0..dt_rank]);
+
+    engine.qwen_ssm_proj_validate_captured_tokens = @max(engine.qwen_ssm_proj_validate_captured_tokens, token_idx + 1);
+    if (engine.qwen_ssm_proj_validate_captured_tokens < qwen_ssm_projection_validate_tokens) return;
+
+    const qkv_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, conv_channels) * @sizeOf(f32);
+    const z_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, d_inner) * @sizeOf(f32);
+    const ab_bytes = @as(usize, qwen_ssm_projection_validate_tokens) * @as(usize, dt_rank) * @sizeOf(f32);
+    var qkv_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(qkv_bytes, 4));
+    defer metal_buffer.freeBuffer(&qkv_candidate);
+    var z_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(z_bytes, 4));
+    defer metal_buffer.freeBuffer(&z_candidate);
+    var alpha_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(ab_bytes, 4));
+    defer metal_buffer.freeBuffer(&alpha_candidate);
+    var beta_candidate = try metal_buffer.createBuffer(engine.device.ctx, @max(ab_bytes, 4));
+    defer metal_buffer.freeBuffer(&beta_candidate);
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, wqkv_t, &engine.qwen_ssm_proj_validate_norm_buf, &qkv_candidate, conv_channels, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, z_t, &engine.qwen_ssm_proj_validate_norm_buf, &z_candidate, d_inner, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, alpha_t, &engine.qwen_ssm_proj_validate_norm_buf, &alpha_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
+    dispatchGemmQ8_0OnCmd(engine, &cmd, beta_t, &engine.qwen_ssm_proj_validate_norm_buf, &beta_candidate, dt_rank, hidden_dim, qwen_ssm_projection_validate_tokens);
+    commitAndWaitProfiled(&cmd, profile);
+
+    const n = qwen_ssm_projection_validate_tokens;
+    const qkv_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(qkv_candidate.cpu_ptr.?));
+    const z_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(z_candidate.cpu_ptr.?));
+    const alpha_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(alpha_candidate.cpu_ptr.?));
+    const beta_candidate_ptr: [*]const f32 = @ptrCast(@alignCast(beta_candidate.cpu_ptr.?));
+
+    const n_usize: usize = @intCast(n);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_qkv_gemm_q8_0", qkv_ref[0 .. n_usize * @as(usize, conv_channels)], qkv_candidate_ptr[0 .. n_usize * @as(usize, conv_channels)], conv_channels, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_z_gemm_q8_0", z_ref[0 .. n_usize * @as(usize, d_inner)], z_candidate_ptr[0 .. n_usize * @as(usize, d_inner)], d_inner, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_alpha_gemm_q8_0", alpha_ref[0 .. n_usize * @as(usize, dt_rank)], alpha_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+    logQwenSsmProjectionChunkValidationDiff(layer_idx, "ssm_beta_gemm_q8_0", beta_ref[0 .. n_usize * @as(usize, dt_rank)], beta_candidate_ptr[0 .. n_usize * @as(usize, dt_rank)], dt_rank, n, 2.0);
+}
+
+fn supportsQwenMoeRoutePackCols(engine: *const InferenceEngine, quant_type: GGMLType) bool {
+    return switch (quant_type) {
+        .q4_k => engine.dmmv_q4k_moe_cols_pipe.handle != null,
+        .q5_1 => engine.dmmv_q5_1_moe_cols_pipe.handle != null,
+        .q5_k => engine.dmmv_q5k_moe_cols_pipe.handle != null,
+        .q6_k => engine.dmmv_q6k_moe_cols_pipe.handle != null,
+        else => false,
+    };
+}
+
+fn ensureQwenMoeRoutePackValidationBuffers(
+    engine: *InferenceEngine,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    k: u32,
+    validate_shared: bool,
+) !void {
+    const n: usize = @intCast(qwenMoeRoutePackValidateTokens(engine));
+    const h: usize = @intCast(hidden_dim);
+    const m: usize = @intCast(inter_dim);
+    const sh: usize = @intCast(shexp_inter_dim);
+    const k_usize: usize = @intCast(k);
+    const route_slots = n * k_usize;
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_layer_input_ref_buf, n * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_norm_buf, n * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_routing_buf, n * k_usize * 2 * @sizeOf(u32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_gate_ref_buf, route_slots * m * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_up_ref_buf, route_slots * m * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_down_ref_buf, route_slots * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_hidden_before_ref_buf, n * h * @sizeOf(f32));
+    try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_post_hidden_ref_buf, n * h * @sizeOf(f32));
+    if (validate_shared) {
+        try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_shared_gate_ref_buf, n * sh * @sizeOf(f32));
+        try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_shared_up_ref_buf, n * sh * @sizeOf(f32));
+        try ensureValidationBuffer(engine, &engine.qwen_moe_route_validate_shared_down_ref_buf, n * h * @sizeOf(f32));
+    }
+}
+
+fn logQwenMoeRoutePackValidationDiff(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    tensor_name: []const u8,
+    expected: []const f32,
+    actual: []const f32,
+    inter_dim: u32,
+    k: u32,
+    n_tokens: u32,
+    tol: f32,
+) void {
+    const diff = diffF32Slices(expected, actual);
+    const width_usize: usize = @intCast(@max(inter_dim, 1));
+    const k_usize: usize = @intCast(@max(k, 1));
+    const route = diff.max_idx / width_usize;
+    const worst_token = route / k_usize;
+    const worst_slot = route % k_usize;
+    const worst_idx = diff.max_idx % width_usize;
+    const ref_value = if (expected.len > 0) expected[diff.max_idx] else 0;
+    const candidate_value = if (actual.len > 0) actual[diff.max_idx] else 0;
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: moe_route_pack layer={d} tensor={s} tokens={d} route={d} token={d} slot={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            layer_idx,
+            tensor_name,
+            n_tokens,
+            route,
+            worst_token,
+            worst_slot,
+            worst_idx,
+            diff.max_abs,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        if (!engine.qwen_moe_route_validate_failure_hint_emitted) {
+            engine.qwen_moe_route_validate_failure_hint_emitted = true;
+            log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[first_failure]: moe_route_pack layer={d} tensor={s} tokens={d} route={d} token={d} slot={d} worst_idx={d} max_abs_diff={d:.6} rms_diff={d:.6} tol={d:.6} ref={d:.6} candidate={d:.6} flag_on=ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1 require_output=Paris", .{
+                layer_idx,
+                tensor_name,
+                n_tokens,
+                route,
+                worst_token,
+                worst_slot,
+                worst_idx,
+                diff.max_abs,
+                diff.rms,
+                tol,
+                ref_value,
+                candidate_value,
+            });
+        }
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: moe_route_pack layer={d} tensor={s} tokens={d} route={d} token={d} slot={d} worst_idx={d} max_abs_diff={d:.6} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            layer_idx,
+            tensor_name,
+            n_tokens,
+            route,
+            worst_token,
+            worst_slot,
+            worst_idx,
+            diff.max_abs,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+}
+
+/// Default-off safety rail for the vLLM/llama.cpp expert-grouped MoE shape.
+/// Captures a configured Qwen3.6 layer-0 prompt chunk from the current
+/// token-major path, then replays the grouped route-pack gate/up, activation,
+/// down projection, and weighted unpermute. This mirrors vLLM's
+/// `moe_permute`/`moe_unpermute` flow and llama.cpp's `mul_mm_id` split
+/// between ID map creation and expert-major matrix work, but stays validation
+/// only until a real layer-major Qwen prefill path can feed multiple tokens.
+fn validateQwenMoeRoutePackChunk(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    validation: *const QwenPrefillMoeValidationRef,
+    hidden_after: []const f32,
+    hidden_dim: u32,
+    inter_dim: u32,
+) !void {
+    const cfg = engine.config;
+    if (!engine.qwen_prefill_validation_enabled or
+        cfg.architecture != .qwen2_moe or
+        cfg.n_experts == 0 or
+        cfg.ssm_d_inner == 0 or
+        cfg.n_experts_used == 0 or
+        layer_idx != qwenMoeRoutePackValidateLayer(engine))
+    {
+        return;
+    }
+
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp;
+    const up_shexp = lt.ffn_up_shexp;
+    const down_shexp = lt.ffn_down_shexp;
+    const gate_inp_shexp = lt.ffn_gate_inp_shexp;
+    const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
+    const shexp_inter_dim: u32 = if (cfg.shared_expert_intermediate_dim > 0) cfg.shared_expert_intermediate_dim else inter_dim;
+    const can_validate_shared =
+        has_shexp and
+        canUseQwenSharedBatchedGemm(engine, gate_shexp.?.info.type_) and
+        canUseQwenSharedBatchedGemm(engine, up_shexp.?.info.type_) and
+        canUseQwenSharedBatchedGemm(engine, down_shexp.?.info.type_);
+    const f32_shared_gate =
+        gate_inp_shexp != null and
+        canUseQwenSharedGateInputF32(engine, gate_inp_shexp.?, hidden_dim);
+    const can_validate_shared_acc =
+        can_validate_shared and
+        (gate_inp_shexp == null or canUseQwenSharedGateInputBatched(engine, gate_inp_shexp.?, hidden_dim));
+    if (!supportsQwenMoeRoutePackCols(engine, gate_up_layout.gate_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, gate_up_layout.up_tensor.info.type_) or
+        !supportsQwenMoeRoutePackCols(engine, down_exps.info.type_) or
+        engine.moe_route_pack_pipe.handle == null or
+        engine.moe_route_gather_pipe.handle == null or
+        engine.moe_route_scatter_pipe.handle == null or
+        engine.swiglu_batched_pipe.handle == null)
+    {
+        return;
+    }
+
+    const token_idx_u32 = engine.position;
+    if (token_idx_u32 == 0) {
+        engine.qwen_moe_route_validate_captured_tokens = 0;
+    }
+    const validate_tokens = qwenMoeRoutePackValidateTokens(engine);
+    if (token_idx_u32 >= validate_tokens) return;
+
+    const k = cfg.n_experts_used;
+    try ensureQwenMoeRoutePackValidationBuffers(engine, hidden_dim, inter_dim, shexp_inter_dim, k, can_validate_shared);
+
+    const token_idx: usize = @intCast(token_idx_u32);
+    const hidden_n: usize = @intCast(hidden_dim);
+    const inter_n: usize = @intCast(inter_dim);
+    const shexp_inter_n: usize = @intCast(shexp_inter_dim);
+    const k_usize: usize = @intCast(k);
+    const route_slots_per_token = k_usize;
+
+    const norm_src: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
+    const norm_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_norm_buf.cpu_ptr.?));
+    @memcpy(
+        norm_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+        norm_src[0..hidden_n],
+    );
+
+    const routing_src: [*]const u32 = @ptrCast(@alignCast(engine.router_output_buf.cpu_ptr.?));
+    const routing_dst: [*]u32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_routing_buf.cpu_ptr.?));
+    @memcpy(
+        routing_dst[token_idx * k_usize * 2 .. token_idx * k_usize * 2 + k_usize * 2],
+        routing_src[0 .. k_usize * 2],
+    );
+
+    const gate_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_gate_batch_buf.cpu_ptr.?));
+    const up_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_up_batch_buf.cpu_ptr.?));
+    const down_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.expert_down_batch_buf.cpu_ptr.?));
+    const gate_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
+    const up_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
+    const down_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
+    const hidden_before_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+    const post_hidden_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr.?));
+    const route_ref_offset = token_idx * route_slots_per_token * inter_n;
+    const route_ref_len = route_slots_per_token * inter_n;
+    @memcpy(gate_ref_dst[route_ref_offset .. route_ref_offset + route_ref_len], gate_ref_src[0..route_ref_len]);
+    @memcpy(up_ref_dst[route_ref_offset .. route_ref_offset + route_ref_len], up_ref_src[0..route_ref_len]);
+    const down_ref_offset = token_idx * route_slots_per_token * hidden_n;
+    const down_ref_len = route_slots_per_token * hidden_n;
+    @memcpy(down_ref_dst[down_ref_offset .. down_ref_offset + down_ref_len], down_ref_src[0..down_ref_len]);
+    @memcpy(
+        hidden_before_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+        validation.hidden_before[0..hidden_n],
+    );
+    @memcpy(
+        post_hidden_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+        hidden_after[0..hidden_n],
+    );
+
+    if (can_validate_shared) {
+        const shared_gate_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.gate_buf.cpu_ptr.?));
+        const shared_up_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.up_buf.cpu_ptr.?));
+        const shared_down_ref_src: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+        const shared_gate_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_gate_ref_buf.cpu_ptr.?));
+        const shared_up_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_up_ref_buf.cpu_ptr.?));
+        const shared_down_ref_dst: [*]f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_down_ref_buf.cpu_ptr.?));
+        @memcpy(
+            shared_gate_ref_dst[token_idx * shexp_inter_n .. token_idx * shexp_inter_n + shexp_inter_n],
+            shared_gate_ref_src[0..shexp_inter_n],
+        );
+        @memcpy(
+            shared_up_ref_dst[token_idx * shexp_inter_n .. token_idx * shexp_inter_n + shexp_inter_n],
+            shared_up_ref_src[0..shexp_inter_n],
+        );
+        @memcpy(
+            shared_down_ref_dst[token_idx * hidden_n .. token_idx * hidden_n + hidden_n],
+            shared_down_ref_src[0..hidden_n],
+        );
+    }
+
+    engine.qwen_moe_route_validate_captured_tokens = @max(engine.qwen_moe_route_validate_captured_tokens, token_idx_u32 + 1);
+    if (engine.qwen_moe_route_validate_captured_tokens < validate_tokens) return;
+
+    const n = validate_tokens;
+    const n_usize: usize = @intCast(n);
+    const route_slots_u32 = n * k;
+    const route_slots: usize = @intCast(route_slots_u32);
+    const can_validate_active_blocks = engine.moe_route_pack_blocks_pipe.handle != null;
+    const active_block_upper_bound = if (can_validate_active_blocks)
+        maxPackedMoeRouteBlocks(route_slots_u32, cfg.n_experts)
+    else
+        0;
+    const active_block_upper_bound_usize: usize = @intCast(active_block_upper_bound);
+
+    var counts_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * @sizeOf(u32), 4));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var packed_ids_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * n_usize * @sizeOf(u32), 4));
+    defer metal_buffer.freeBuffer(&packed_ids_buf);
+    var active_counts_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_counts_buf);
+    var active_packed_ids_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_packed_ids_buf);
+    var active_block_count_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_block_count_buf);
+    var active_blocks_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_blocks_buf);
+    var gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&gate_candidate_buf);
+    var active_gate_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_gate_candidate_buf);
+    var active_up_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_up_candidate_buf);
+    var active_swiglu_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_swiglu_candidate_buf);
+    var active_down_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_down_candidate_buf);
+    var active_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_delta_candidate_buf);
+    var up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&up_candidate_buf);
+    var swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&swiglu_candidate_buf);
+    var down_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * hidden_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&down_candidate_buf);
+    var delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+    defer metal_buffer.freeBuffer(&delta_candidate_buf);
+    var shared_gate_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&shared_gate_candidate_buf);
+    var shared_up_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&shared_up_candidate_buf);
+    var shared_swiglu_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&shared_swiglu_candidate_buf);
+    var shared_down_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&shared_down_candidate_buf);
+    var shared_acc_gate_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&shared_acc_gate_candidate_buf);
+    var combined_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&combined_delta_candidate_buf);
+    var active_combined_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&active_combined_delta_candidate_buf);
+    var materialized_combined_delta_candidate_buf = MetalBuffer{ .handle = null, .size = 0, .cpu_ptr = null, .is_mmap_wrapped = false };
+    defer metal_buffer.freeBuffer(&materialized_combined_delta_candidate_buf);
+    if (can_validate_active_blocks) {
+        active_counts_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * @sizeOf(u32), 4));
+        active_packed_ids_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(@as(usize, cfg.n_experts) * n_usize * @sizeOf(u32), 4));
+        active_block_count_buf = try metal_buffer.createBuffer(engine.device.ctx, @sizeOf(u32));
+        active_blocks_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(active_block_upper_bound_usize * @sizeOf(u32), 4));
+        active_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * inter_n * @sizeOf(f32), 4));
+        active_down_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(route_slots * hidden_n * @sizeOf(f32), 4));
+        active_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+    }
+    if (can_validate_shared) {
+        shared_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * shexp_inter_n * @sizeOf(f32), 4));
+        shared_up_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * shexp_inter_n * @sizeOf(f32), 4));
+        shared_swiglu_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * shexp_inter_n * @sizeOf(f32), 4));
+        shared_down_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+    }
+    if (can_validate_shared_acc) {
+        combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+        if (gate_inp_shexp != null) {
+            shared_acc_gate_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * @sizeOf(f32), 4));
+        }
+        if (f32_shared_gate) {
+            materialized_combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+        }
+        if (can_validate_active_blocks and f32_shared_gate) {
+            active_combined_delta_candidate_buf = try metal_buffer.createBuffer(engine.device.ctx, @max(n_usize * hidden_n * @sizeOf(f32), 4));
+        }
+    }
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchMoeRoutePackOnCmd(
+        engine,
+        &cmd,
+        &engine.qwen_moe_route_validate_routing_buf,
+        &counts_buf,
+        &packed_ids_buf,
+        n,
+        cfg.n_experts,
+        k,
+    );
+    if (can_validate_active_blocks) {
+        dispatchMoeRoutePackBlocksOnCmd(
+            engine,
+            &cmd,
+            &engine.qwen_moe_route_validate_routing_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_block_count_buf,
+            &active_blocks_buf,
+            n,
+            cfg.n_experts,
+            k,
+        );
+    }
+    cmd.barrier();
+    try dispatchDmmvMoeColsOnCmd(
+        engine,
+        &cmd,
+        gate_up_layout.gate_tensor,
+        &engine.qwen_moe_route_validate_norm_buf,
+        &gate_candidate_buf,
+        &counts_buf,
+        &packed_ids_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.gate_expert_stride,
+        gate_up_layout.gate_base_offset,
+        0,
+        0,
+        n,
+        k,
+        cfg.n_experts,
+        n,
+    );
+    if (can_validate_active_blocks) {
+        // Validation-only check for the vLLM aligned-block/llama.cpp
+        // `mul_mm_id_map0` schedule used by production route-packed MoE.
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            &cmd,
+            gate_up_layout.gate_tensor,
+            &engine.qwen_moe_route_validate_norm_buf,
+            &active_gate_candidate_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_blocks_buf,
+            &active_block_count_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            0,
+            0,
+            n,
+            k,
+            active_block_upper_bound,
+        );
+    }
+    try dispatchDmmvMoeColsOnCmd(
+        engine,
+        &cmd,
+        gate_up_layout.up_tensor,
+        &engine.qwen_moe_route_validate_norm_buf,
+        &up_candidate_buf,
+        &counts_buf,
+        &packed_ids_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.up_expert_stride,
+        gate_up_layout.up_base_offset,
+        0,
+        0,
+        n,
+        k,
+        cfg.n_experts,
+        n,
+    );
+    if (can_validate_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            &cmd,
+            gate_up_layout.up_tensor,
+            &engine.qwen_moe_route_validate_norm_buf,
+            &active_up_candidate_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_blocks_buf,
+            &active_block_count_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+            n,
+            k,
+            active_block_upper_bound,
+        );
+    }
+    cmd.barrier();
+    {
+        const swiglu_push = SwiGLUPush{ .n = inter_dim };
+        const sw_bufs = [_]*const MetalBuffer{ &gate_candidate_buf, &swiglu_candidate_buf, &up_candidate_buf };
+        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots_u32, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+    }
+    if (can_validate_active_blocks) {
+        const swiglu_push = SwiGLUPush{ .n = inter_dim };
+        const sw_bufs = [_]*const MetalBuffer{ &active_gate_candidate_buf, &active_swiglu_candidate_buf, &active_up_candidate_buf };
+        cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, route_slots_u32, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+    }
+    cmd.barrier();
+    try dispatchDmmvMoeColsOnCmd(
+        engine,
+        &cmd,
+        down_exps,
+        &swiglu_candidate_buf,
+        &down_candidate_buf,
+        &counts_buf,
+        &packed_ids_buf,
+        hidden_dim,
+        inter_dim,
+        expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+        0,
+        0,
+        0,
+        n,
+        1,
+        cfg.n_experts,
+        n,
+    );
+    if (can_validate_active_blocks) {
+        try dispatchDmmvMoeColsActiveBlocksOnCmd(
+            engine,
+            &cmd,
+            down_exps,
+            &active_swiglu_candidate_buf,
+            &active_down_candidate_buf,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &active_blocks_buf,
+            &active_block_count_buf,
+            hidden_dim,
+            inter_dim,
+            expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim),
+            0,
+            0,
+            0,
+            n,
+            1,
+            active_block_upper_bound,
+        );
+    }
+    cmd.barrier();
+    dispatchZeroF32OnCmd(engine, &cmd, &delta_candidate_buf, n * hidden_dim);
+    if (can_validate_active_blocks) {
+        dispatchZeroF32OnCmd(engine, &cmd, &active_delta_candidate_buf, n * hidden_dim);
+    }
+    cmd.barrier();
+    dispatchMoeRouteScatterOnCmd(
+        engine,
+        &cmd,
+        &counts_buf,
+        &packed_ids_buf,
+        &engine.qwen_moe_route_validate_routing_buf,
+        &down_candidate_buf,
+        &delta_candidate_buf,
+        n,
+        hidden_dim,
+        cfg.n_experts,
+        k,
+        false,
+    );
+    if (can_validate_active_blocks) {
+        dispatchMoeRouteScatterOnCmd(
+            engine,
+            &cmd,
+            &active_counts_buf,
+            &active_packed_ids_buf,
+            &engine.qwen_moe_route_validate_routing_buf,
+            &active_down_candidate_buf,
+            &active_delta_candidate_buf,
+            n,
+            hidden_dim,
+            cfg.n_experts,
+            k,
+            false,
+        );
+    }
+    if (can_validate_shared) {
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_gate_candidate_buf, shexp_inter_dim, hidden_dim, n);
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, up_shexp.?, &engine.qwen_moe_route_validate_norm_buf, &shared_up_candidate_buf, shexp_inter_dim, hidden_dim, n);
+        if (can_validate_shared_acc) {
+            if (gate_inp_shexp) |gate_t| {
+                if (f32_shared_gate) {
+                    dispatchGemmF32SmallOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
+                } else {
+                    try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, gate_t, &engine.qwen_moe_route_validate_norm_buf, &shared_acc_gate_candidate_buf, 1, hidden_dim, n);
+                }
+            }
+        }
+        cmd.barrier();
+        {
+            const swiglu_push = SwiGLUPush{ .n = shexp_inter_dim };
+            const sw_bufs = [_]*const MetalBuffer{ &shared_gate_candidate_buf, &shared_swiglu_candidate_buf, &shared_up_candidate_buf };
+            cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (shexp_inter_dim + 63) / 64, n, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+        }
+        cmd.barrier();
+        try dispatchQwenSharedBatchedGemmOnCmd(engine, &cmd, down_shexp.?, &shared_swiglu_candidate_buf, &shared_down_candidate_buf, hidden_dim, shexp_inter_dim, n);
+        cmd.barrier();
+        if (can_validate_shared_acc) {
+            // Mirrors vLLM's topk_weight_and_reduce final unpermute/reduce:
+            // start from routed expert delta, then fold in the batched shared
+            // expert contribution with the optional Qwen shared gate.
+            if (gate_inp_shexp != null) {
+                if (f32_shared_gate) {
+                    dispatchZeroF32OnCmd(engine, &cmd, &combined_delta_candidate_buf, n * hidden_dim);
+                    cmd.barrier();
+                    dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+                        engine,
+                        &cmd,
+                        &engine.qwen_moe_route_validate_routing_buf,
+                        &down_candidate_buf,
+                        &shared_down_candidate_buf,
+                        &engine.qwen_moe_route_validate_norm_buf,
+                        gate_inp_shexp.?,
+                        &combined_delta_candidate_buf,
+                        n,
+                        hidden_dim,
+                        cfg.n_experts,
+                        k,
+                    );
+                    if (can_validate_active_blocks) {
+                        dispatchZeroF32OnCmd(engine, &cmd, &active_combined_delta_candidate_buf, n * hidden_dim);
+                        cmd.barrier();
+                        dispatchMoeRouteScatterSharedResidualGateF32OnCmd(
+                            engine,
+                            &cmd,
+                            &engine.qwen_moe_route_validate_routing_buf,
+                            &active_down_candidate_buf,
+                            &shared_down_candidate_buf,
+                            &engine.qwen_moe_route_validate_norm_buf,
+                            gate_inp_shexp.?,
+                            &active_combined_delta_candidate_buf,
+                            n,
+                            hidden_dim,
+                            cfg.n_experts,
+                            k,
+                        );
+                    }
+                    dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &materialized_combined_delta_candidate_buf, n * hidden_dim);
+                    cmd.barrier();
+                    dispatchSigmoidScaleAccBatchedOnCmd(engine, &cmd, &materialized_combined_delta_candidate_buf, &shared_down_candidate_buf, &shared_acc_gate_candidate_buf, n, hidden_dim);
+                } else {
+                    dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
+                    cmd.barrier();
+                    dispatchSigmoidScaleAccBatchedOnCmd(engine, &cmd, &combined_delta_candidate_buf, &shared_down_candidate_buf, &shared_acc_gate_candidate_buf, n, hidden_dim);
+                }
+            } else {
+                dispatchCopyF32OnCmd(engine, &cmd, &delta_candidate_buf, &combined_delta_candidate_buf, n * hidden_dim);
+                cmd.barrier();
+                const acc_push = ScaleAccPush{ .n = n * hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+                const acc_bufs = [_]*const MetalBuffer{ &combined_delta_candidate_buf, &shared_down_candidate_buf };
+                cmd.dispatchV2(&engine.scale_acc_pipe, .{ (n * hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+            }
+            cmd.barrier();
+        }
+    }
+    commitAndWaitProfiled(&cmd, profile);
+
+    const total = route_slots * inter_n;
+    const down_total = route_slots * hidden_n;
+    const delta_total = n_usize * hidden_n;
+    const gate_candidate: [*]const f32 = @ptrCast(@alignCast(gate_candidate_buf.cpu_ptr.?));
+    const up_candidate: [*]const f32 = @ptrCast(@alignCast(up_candidate_buf.cpu_ptr.?));
+    const swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(swiglu_candidate_buf.cpu_ptr.?));
+    const down_candidate: [*]const f32 = @ptrCast(@alignCast(down_candidate_buf.cpu_ptr.?));
+    const delta_candidate: [*]const f32 = @ptrCast(@alignCast(delta_candidate_buf.cpu_ptr.?));
+    const gate_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_gate_ref_buf.cpu_ptr.?));
+    const up_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_up_ref_buf.cpu_ptr.?));
+    const down_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_down_ref_buf.cpu_ptr.?));
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_gate_grouped_cols", gate_ref[0..total], gate_candidate[0..total], inter_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_gate_candidate: [*]const f32 = @ptrCast(@alignCast(active_gate_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_gate_active_blocks", gate_candidate[0..total], active_gate_candidate[0..total], inter_dim, k, n, 5e-2);
+
+        const grouped_counts: [*]const u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+        const active_counts: [*]const u32 = @ptrCast(@alignCast(active_counts_buf.cpu_ptr.?));
+        var count_mismatches: u32 = 0;
+        var first_mismatch_expert: u32 = 0;
+        var max_count_delta: u32 = 0;
+        var expected_active_blocks: u32 = 0;
+        var expert: u32 = 0;
+        while (expert < cfg.n_experts) : (expert += 1) {
+            const grouped_count = grouped_counts[expert];
+            const active_count = active_counts[expert];
+            expected_active_blocks += (active_count + 7) / 8;
+            if (grouped_count != active_count) {
+                if (count_mismatches == 0) first_mismatch_expert = expert;
+                count_mismatches += 1;
+                const count_delta = if (grouped_count > active_count)
+                    grouped_count - active_count
+                else
+                    active_count - grouped_count;
+                max_count_delta = @max(max_count_delta, count_delta);
+            }
+        }
+
+        const active_block_count: [*]const u32 = @ptrCast(@alignCast(active_block_count_buf.cpu_ptr.?));
+        const actual_active_blocks = active_block_count[0];
+        const active_schedule_ok = count_mismatches == 0 and actual_active_blocks == expected_active_blocks;
+        const verdict: []const u8 = if (active_schedule_ok) "ok" else "failed";
+        if (active_schedule_ok) {
+            log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: layer={d} tensor=moe_active_block_schedule count_mismatches={d} first_mismatch_expert={d} expected_blocks={d} active_blocks={d} max_count_delta={d} upper_bound={d}", .{
+                verdict,
+                layer_idx,
+                count_mismatches,
+                first_mismatch_expert,
+                expected_active_blocks,
+                actual_active_blocks,
+                max_count_delta,
+                active_block_upper_bound,
+            });
+        } else {
+            log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: layer={d} tensor=moe_active_block_schedule count_mismatches={d} first_mismatch_expert={d} expected_blocks={d} active_blocks={d} max_count_delta={d} upper_bound={d}", .{
+                verdict,
+                layer_idx,
+                count_mismatches,
+                first_mismatch_expert,
+                expected_active_blocks,
+                actual_active_blocks,
+                max_count_delta,
+                active_block_upper_bound,
+            });
+        }
+    }
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_up_grouped_cols", up_ref[0..total], up_candidate[0..total], inter_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_up_candidate: [*]const f32 = @ptrCast(@alignCast(active_up_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_up_active_blocks", up_candidate[0..total], active_up_candidate[0..total], inter_dim, k, n, 5e-2);
+    }
+
+    const allocator = engine.allocator;
+    const swiglu_ref = try allocator.alloc(f32, total);
+    defer allocator.free(swiglu_ref);
+    var route: usize = 0;
+    while (route < route_slots) : (route += 1) {
+        const off = route * inter_n;
+        cpuSwiGLU(gate_ref + off, up_ref + off, swiglu_ref.ptr + off, inter_dim);
+    }
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_swiglu_grouped_cols", swiglu_ref[0..total], swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(active_swiglu_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_swiglu_active_blocks", swiglu_candidate[0..total], active_swiglu_candidate[0..total], inter_dim, k, n, 5e-2);
+    }
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_down_grouped_cols", down_ref[0..down_total], down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_down_candidate: [*]const f32 = @ptrCast(@alignCast(active_down_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_down_active_blocks", down_candidate[0..down_total], active_down_candidate[0..down_total], hidden_dim, k, n, 5e-2);
+    }
+
+    const delta_ref = try allocator.alloc(f32, delta_total);
+    defer allocator.free(delta_ref);
+    @memset(delta_ref, 0);
+    const routing: [*]const u32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_routing_buf.cpu_ptr.?));
+    for (0..n_usize) |token| {
+        const row = routing[token * k_usize * 2 .. token * k_usize * 2 + k_usize * 2];
+        for (0..k_usize) |slot| {
+            const weight: f32 = @bitCast(row[k_usize + slot]);
+            const route_id = token * k_usize + slot;
+            const src = down_ref[route_id * hidden_n .. route_id * hidden_n + hidden_n];
+            const dst = delta_ref[token * hidden_n .. token * hidden_n + hidden_n];
+            for (0..hidden_n) |dim| {
+                dst[dim] += weight * src[dim];
+            }
+        }
+    }
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_grouped_scatter", delta_ref[0..delta_total], delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+    if (can_validate_active_blocks) {
+        const active_delta_candidate: [*]const f32 = @ptrCast(@alignCast(active_delta_candidate_buf.cpu_ptr.?));
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_active_blocks", delta_candidate[0..delta_total], active_delta_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+    }
+
+    if (can_validate_shared) {
+        const shared_total = n_usize * shexp_inter_n;
+        const shared_down_total = n_usize * hidden_n;
+        const shared_gate_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_gate_ref_buf.cpu_ptr.?));
+        const shared_up_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_up_ref_buf.cpu_ptr.?));
+        const shared_down_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_shared_down_ref_buf.cpu_ptr.?));
+        const shared_gate_candidate: [*]const f32 = @ptrCast(@alignCast(shared_gate_candidate_buf.cpu_ptr.?));
+        const shared_up_candidate: [*]const f32 = @ptrCast(@alignCast(shared_up_candidate_buf.cpu_ptr.?));
+        const shared_swiglu_candidate: [*]const f32 = @ptrCast(@alignCast(shared_swiglu_candidate_buf.cpu_ptr.?));
+        const shared_down_candidate: [*]const f32 = @ptrCast(@alignCast(shared_down_candidate_buf.cpu_ptr.?));
+
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_gate_batched", shared_gate_ref[0..shared_total], shared_gate_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_up_batched", shared_up_ref[0..shared_total], shared_up_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+
+        const shared_swiglu_ref = try allocator.alloc(f32, shared_total);
+        defer allocator.free(shared_swiglu_ref);
+        var token: usize = 0;
+        while (token < n_usize) : (token += 1) {
+            const off = token * shexp_inter_n;
+            cpuSwiGLU(shared_gate_ref + off, shared_up_ref + off, shared_swiglu_ref.ptr + off, shexp_inter_dim);
+        }
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_swiglu_batched", shared_swiglu_ref[0..shared_total], shared_swiglu_candidate[0..shared_total], shexp_inter_dim, 1, n, 5e-2);
+        logQwenMoeRoutePackValidationDiff(engine, layer_idx, "shared_down_batched", shared_down_ref[0..shared_down_total], shared_down_candidate[0..shared_down_total], hidden_dim, 1, n, 5e-2);
+
+        if (can_validate_shared_acc) {
+            if (gate_inp_shexp) |gate_t| {
+                const shared_gate_scalar_ref = try allocator.alloc(f32, n_usize);
+                defer allocator.free(shared_gate_scalar_ref);
+                const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+                const tdo = engine.model.gguf_file.tensor_data_offset;
+                for (0..n_usize) |t| {
+                    const norm_token = norm_dst + t * hidden_n;
+                    try cpuDmmvFallback(mmap, gate_t, tdo, norm_token, shared_gate_scalar_ref.ptr + t, 1, hidden_dim, 0, allocator);
+                }
+                const shared_gate_scalar_candidate: [*]const f32 = @ptrCast(@alignCast(shared_acc_gate_candidate_buf.cpu_ptr.?));
+                const scalar_tensor_name: []const u8 = if (f32_shared_gate)
+                    "shared_gate_f32_batched"
+                else
+                    "shared_gate_batched_acc";
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, scalar_tensor_name, shared_gate_scalar_ref[0..n_usize], shared_gate_scalar_candidate[0..n_usize], 1, 1, n, 5e-2);
+            }
+
+            const combined_ref = try allocator.alloc(f32, delta_total);
+            defer allocator.free(combined_ref);
+            @memcpy(combined_ref, delta_ref);
+
+            if (gate_inp_shexp) |gate_t| {
+                const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+                const tdo = engine.model.gguf_file.tensor_data_offset;
+                var gate_value: [1]f32 = undefined;
+                for (0..n_usize) |t| {
+                    const norm_token = norm_dst + t * hidden_n;
+                    try cpuDmmvFallback(mmap, gate_t, tdo, norm_token, gate_value[0..].ptr, 1, hidden_dim, 0, allocator);
+                    const gate_scale = 1.0 / (1.0 + @exp(-gate_value[0]));
+                    const shared_src = shared_down_ref[t * hidden_n .. t * hidden_n + hidden_n];
+                    const combined_dst = combined_ref[t * hidden_n .. t * hidden_n + hidden_n];
+                    for (0..hidden_n) |dim| {
+                        combined_dst[dim] += gate_scale * shared_src[dim];
+                    }
+                }
+            } else {
+                for (0..n_usize) |t| {
+                    const shared_src = shared_down_ref[t * hidden_n .. t * hidden_n + hidden_n];
+                    const combined_dst = combined_ref[t * hidden_n .. t * hidden_n + hidden_n];
+                    for (0..hidden_n) |dim| {
+                        combined_dst[dim] += shared_src[dim];
+                    }
+                }
+            }
+
+            const combined_candidate: [*]const f32 = @ptrCast(@alignCast(combined_delta_candidate_buf.cpu_ptr.?));
+            const combined_tensor_name: []const u8 = if (f32_shared_gate)
+                "moe_delta_grouped_shared_gate_f32"
+            else
+                "moe_delta_grouped_shared";
+            logQwenMoeRoutePackValidationDiff(engine, layer_idx, combined_tensor_name, combined_ref[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+
+            const materialized_combined_candidate: ?[*]const f32 = if (materialized_combined_delta_candidate_buf.cpu_ptr) |ptr|
+                @ptrCast(@alignCast(ptr))
+            else
+                null;
+            if (materialized_combined_candidate) |materialized_combined| {
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_materialized_shared_gate_f32", combined_ref[0..delta_total], materialized_combined[0..delta_total], hidden_dim, 1, n, 5e-2);
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_fused_vs_materialized_shared_gate_f32", materialized_combined[0..delta_total], combined_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
+
+            const active_combined_candidate: ?[*]const f32 = if (can_validate_active_blocks and f32_shared_gate)
+                @ptrCast(@alignCast(active_combined_delta_candidate_buf.cpu_ptr.?))
+            else
+                null;
+            if (active_combined_candidate) |active_combined| {
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "moe_delta_active_shared_gate_f32", combined_ref[0..delta_total], active_combined[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
+
+            const post_candidate = try allocator.alloc(f32, delta_total);
+            defer allocator.free(post_candidate);
+            const hidden_before_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+            const post_hidden_ref: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_post_hidden_ref_buf.cpu_ptr.?));
+            for (0..delta_total) |i| {
+                post_candidate[i] = hidden_before_ref[i] + combined_candidate[i];
+            }
+            const post_tensor_name: []const u8 = if (f32_shared_gate)
+                "post_hidden_grouped_shared_gate_f32"
+            else
+                "post_hidden_grouped_shared";
+            logQwenMoeRoutePackValidationDiff(engine, layer_idx, post_tensor_name, post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+
+            if (materialized_combined_candidate) |materialized_combined| {
+                for (0..delta_total) |i| {
+                    post_candidate[i] = hidden_before_ref[i] + materialized_combined[i];
+                }
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "post_hidden_materialized_shared_gate_f32", post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
+
+            if (active_combined_candidate) |active_combined| {
+                for (0..delta_total) |i| {
+                    post_candidate[i] = hidden_before_ref[i] + active_combined[i];
+                }
+                logQwenMoeRoutePackValidationDiff(engine, layer_idx, "post_hidden_active_shared_gate_f32", post_hidden_ref[0..delta_total], post_candidate[0..delta_total], hidden_dim, 1, n, 5e-2);
+            }
+        }
+    }
+
+    try validateQwenRoutePackedSsmPrefix(engine, profile, layer_idx, hidden_dim, inter_dim);
+}
+
+fn validateQwenRoutePackedSsmPrefix(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    hidden_dim: u32,
+    inter_dim: u32,
+) !void {
+    const cfg = engine.config;
+    if (!engine.qwen_prefill_validation_enabled or layer_idx != qwenMoeRoutePackValidateLayer(engine)) return;
+    if (cfg.architecture != .qwen2_moe or cfg.ssm_d_inner == 0) return;
+    if (!canUseQwenSsmBatchedProjectionLayer(engine, layer_idx)) return;
+    if (engine.qwen_moe_route_validate_layer_input_ref_buf.handle == null or
+        engine.qwen_moe_route_validate_layer_input_ref_buf.cpu_ptr == null)
+    {
+        return;
+    }
+    if (engine.ssm_conv1d_prefill_pipe.handle == null or
+        engine.ssm_delta_net_prefill_pipe.handle == null or
+        engine.ssm_gated_norm_pipe.handle == null)
+    {
+        return;
+    }
+
+    const n = qwenMoeRoutePackValidateTokens(engine);
+    const n_usize: usize = @intCast(n);
+    const hidden_n: usize = @intCast(hidden_dim);
+    const d_inner = cfg.ssm_d_inner;
+    const d_state = cfg.ssm_d_state;
+    const n_group = cfg.ssm_n_group;
+    const dt_rank = cfg.ssm_dt_rank;
+    const d_conv = cfg.ssm_d_conv;
+    if (dt_rank == 0 or d_inner == 0 or d_state == 0) return;
+    const head_v_dim = d_inner / dt_rank;
+    if (head_v_dim == 0) return;
+    const conv_channels = d_inner + 2 * n_group * d_state;
+
+    const lt = engine.layer_tensors[layer_idx];
+    const ssm_out_t = lt.ssm_out orelse return;
+    if (ssm_out_t.info.type_ != .q8_0) return;
+    const alpha_t = lt.ssm_alpha orelse return;
+    const beta_t = lt.ssm_beta orelse return;
+    const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
+    const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+
+    const first_attn_dims = qwenFirstPrefixAttentionDims(engine) orelse BatchedPrefillAttentionDims{ .max_q_dim = 1, .max_kv_dim = 1 };
+    var scratch = try BatchedPrefillScratch.init(engine, n, first_attn_dims.max_q_dim, first_attn_dims.max_kv_dim, inter_dim);
+    defer scratch.deinit();
+
+    const conv_state_src = &engine.ssm_conv_state_bufs.?[layer_idx];
+    const ssm_state_src = &engine.ssm_state_bufs.?[layer_idx];
+    var conv_state_tmp = try metal_buffer.createBuffer(engine.device.ctx, @max(conv_state_src.size, 4));
+    defer metal_buffer.freeBuffer(&conv_state_tmp);
+    var ssm_state_tmp = try metal_buffer.createBuffer(engine.device.ctx, @max(ssm_state_src.size, 4));
+    defer metal_buffer.freeBuffer(&ssm_state_tmp);
+    @memset(conv_state_tmp.cpu_ptr.?[0..conv_state_tmp.size], 0);
+    @memset(ssm_state_tmp.cpu_ptr.?[0..ssm_state_tmp.size], 0);
+
+    var cmd = try beginProfiledCommand(engine, profile);
+    dispatchCopyF32OffsetOnCmd(engine, &cmd, &engine.qwen_moe_route_validate_layer_input_ref_buf, &scratch.hidden, n * hidden_dim, 0, 0);
+    profileBarrier(&cmd, profile, .embed);
+
+    // Validation-only replay of llama.cpp/vLLM's grouped prompt shape: keep
+    // SSM state in token order, but validate the layer-major prefix result
+    // before the route-packed MoE consumes it.
+    try recordQwenSsmProjectionChunkOnCmd(engine, &cmd, profile, layer_idx, &scratch.hidden, hidden_dim, d_inner, dt_rank, conv_channels, n);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        &engine.ssm_conv1d_prefill_pipe,
+        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+        &conv_state_tmp,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        &engine.qwen_ssm_prefill_proj_qkv_buf,
+        conv_channels,
+        d_conv,
+        n,
+        conv_channels,
+        0,
+        0,
+    );
+    profileBarrier(&cmd, profile, .ssm);
+
+    if (!alpha_batched or !beta_batched) {
+        const dt_rank_usize: usize = @intCast(dt_rank);
+        for (0..n_usize) |i| {
+            const token_hidden_offset_bytes: u32 = @intCast(i * hidden_n * @sizeOf(f32));
+            const token_dt_offset_bytes: u32 = @intCast(i * dt_rank_usize * @sizeOf(f32));
+            if (!alpha_batched) {
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    &cmd,
+                    alpha_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_alpha_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
+            }
+            if (!beta_batched) {
+                dispatchDmmvOnCmdWithInputOutputOffset(
+                    engine,
+                    &cmd,
+                    beta_t,
+                    &engine.qwen_ssm_prefill_proj_norm_buf,
+                    &engine.qwen_ssm_prefill_proj_beta_buf,
+                    dt_rank,
+                    hidden_dim,
+                    0,
+                    token_hidden_offset_bytes,
+                    token_dt_offset_bytes,
+                );
+            }
+        }
+        profileBarrier(&cmd, profile, .ssm);
+    }
+
+    {
+        const push = SsmDeltaNetPrefillPush{
+            .d_inner = d_inner,
+            .dt_rank = dt_rank,
+            .head_v_dim = head_v_dim,
+            .d_state = d_state,
+            .n_group = n_group,
+            .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+            .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            .n_tokens = n,
+            .alpha_stride = dt_rank,
+            .beta_stride = dt_rank,
+            .conv_stride = conv_channels,
+            .output_stride = d_inner,
+            .alpha_offset = 0,
+            .beta_offset = 0,
+            .conv_offset = 0,
+            .output_offset = 0,
+        };
+        const bufs = [_]*const MetalBuffer{
+            &engine.qwen_ssm_prefill_proj_qkv_buf,  &engine.qwen_ssm_prefill_proj_alpha_buf,
+            &engine.ssm_dt_bias_bufs.?[layer_idx],  &engine.ssm_a_bufs.?[layer_idx],
+            &engine.qwen_ssm_prefill_proj_beta_buf, &ssm_state_tmp,
+            &scratch.attn_out,
+        };
+        cmd.dispatchV2(&engine.ssm_delta_net_prefill_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+    }
+    profileBarrier(&cmd, profile, .ssm);
+
+    dispatchSsmGatedNormBatchedOffsetsWithPipe(
+        &cmd,
+        &engine.ssm_gated_norm_pipe,
+        &scratch.attn_out,
+        &engine.ssm_norm_weight_bufs.?[layer_idx],
+        &engine.qwen_ssm_prefill_proj_z_buf,
+        &scratch.swiglu,
+        d_inner,
+        dt_rank,
+        head_v_dim,
+        d_state,
+        engine.ssm_norm_per_head.?[layer_idx],
+        0,
+        0,
+        0,
+        n,
+    );
+    profileBarrier(&cmd, profile, .ssm);
+
+    const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+        (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
+    else
+        &ssm_out_t.gpu_buffer;
+    const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
+    dispatchGemmQ8_0OnCmdWithWeightBuf(engine, &cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &scratch.swiglu, &scratch.down, hidden_dim, d_inner, n);
+    profileBarrier(&cmd, profile, .ssm);
+
+    {
+        const push = ResidualRmsNormPush{ .n = hidden_dim, .eps = cfg.rms_norm_eps, .scale = 1.0, .residual_offset = 0 };
+        const bufs = [_]*const MetalBuffer{ &scratch.hidden, &scratch.down, &scratch.norm, &engine.ffn_norm_bufs[layer_idx] };
+        cmd.dispatchV2(&engine.residual_rms_norm_pipe, .{ n, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormPush), 0);
+    }
+    profileBarrier(&cmd, profile, .router);
+    commitAndWaitProfiled(&cmd, profile);
+
+    const candidate_hidden: [*]const f32 = @ptrCast(@alignCast(scratch.hidden.cpu_ptr.?));
+    const candidate_norm: [*]const f32 = @ptrCast(@alignCast(scratch.norm.cpu_ptr.?));
+    const ref_hidden: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_hidden_before_ref_buf.cpu_ptr.?));
+    const ref_norm: [*]const f32 = @ptrCast(@alignCast(engine.qwen_moe_route_validate_norm_buf.cpu_ptr.?));
+    const total = n_usize * hidden_n;
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "ssm_prefix_hidden_before_moe", ref_hidden[0..total], candidate_hidden[0..total], hidden_dim, 1, n, 5e-2);
+    logQwenMoeRoutePackValidationDiff(engine, layer_idx, "ssm_prefix_ffn_norm", ref_norm[0..total], candidate_norm[0..total], hidden_dim, 1, n, 5e-2);
+}
+
+fn logQwenPrefillValidationDiff(
+    engine: *const InferenceEngine,
+    layer_idx: usize,
+    tensor_name: []const u8,
+    diff: SliceDiff,
+    ref_value: f32,
+    candidate_value: f32,
+    tol: f32,
+) void {
+    const verdict: []const u8 = if (diff.max_abs <= tol) "ok" else "failed";
+    if (diff.max_abs <= tol) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor={s} max_abs_diff={d:.6} worst_idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            verdict,
+            engine.position,
+            layer_idx,
+            tensor_name,
+            diff.max_abs,
+            diff.max_idx,
+            ref_value,
+            candidate_value,
+            diff.rms,
+            tol,
+        });
+    }
+}
+
+fn prepareQwenPrefillMoeValidation(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+) !QwenPrefillMoeValidationRef {
+    const cfg = engine.config;
+    if (cfg.n_experts_used > 16) return error.TooManyExpertsForValidation;
+
+    const allocator = engine.allocator;
+    const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+    const tdo = engine.model.gguf_file.tensor_data_offset;
+    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp;
+    const up_shexp = lt.ffn_up_shexp;
+    const down_shexp = lt.ffn_down_shexp;
+    const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
+
+    var validation = QwenPrefillMoeValidationRef{
+        .hidden_before = try allocator.alloc(f32, hidden_dim),
+        .moe_delta_ref = try allocator.alloc(f32, hidden_dim),
+        .expert_ids = undefined,
+        .expert_weights = undefined,
+        .n_used = @intCast(cfg.n_experts_used),
+        .shared_gate = 1.0,
+    };
+    errdefer validation.deinit(allocator);
+    @memset(validation.moe_delta_ref, 0);
+
+    const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
+    const router_ptr: [*]const f32 = @ptrCast(@alignCast(engine.router_logits_buf.cpu_ptr.?));
+    @memcpy(validation.hidden_before, hidden_ptr[0..hidden_dim]);
+
+    const norm_ref = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(norm_ref);
+    const ffn_norm_weight: [*]const f32 = @ptrCast(@alignCast(engine.ffn_norm_bufs[layer_idx].cpu_ptr.?));
+    cpuRmsNormMul(hidden_ptr, ffn_norm_weight[0..hidden_dim], norm_ref.ptr, hidden_dim, 1, cfg.rms_norm_eps);
+    const norm_diff = diffF32Slices(norm_ref, norm_ptr[0..hidden_dim]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "ffn_norm",
+        norm_diff,
+        norm_ref[norm_diff.max_idx],
+        norm_ptr[norm_diff.max_idx],
+        1e-3,
+    );
+
+    const router_ref = try allocator.alloc(f32, cfg.n_experts);
+    defer allocator.free(router_ref);
+    try cpuDmmvFallback(mmap, router_t, tdo, norm_ptr, router_ref.ptr, cfg.n_experts, hidden_dim, 0, allocator);
+    const router_diff = diffF32Slices(router_ref, router_ptr[0..cfg.n_experts]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "router_logits",
+        router_diff,
+        router_ref[router_diff.max_idx],
+        router_ptr[router_diff.max_idx],
+        2e-2,
+    );
+
+    topKSoftmax(router_ref, cfg.n_experts_used, validation.expert_ids[0..validation.n_used], validation.expert_weights[0..validation.n_used]);
+
+    const gate_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(gate_tmp);
+    const up_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(up_tmp);
+    const act_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(act_tmp);
+    const down_tmp = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(down_tmp);
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    for (validation.expert_ids[0..validation.n_used], validation.expert_weights[0..validation.n_used]) |eid, weight| {
+        try cpuDmmvFallback(mmap, gate_exps, tdo, norm_ptr, gate_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.gateOffset(eid), allocator);
+        try cpuDmmvFallback(mmap, up_exps, tdo, norm_ptr, up_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.upOffset(eid), allocator);
+        cpuSwiGLU(gate_tmp.ptr, up_tmp.ptr, act_tmp.ptr, inter_dim);
+        try cpuDmmvFallback(mmap, down_exps, tdo, act_tmp.ptr, down_tmp.ptr, hidden_dim, inter_dim, eid * expert_down_bytes, allocator);
+        for (0..hidden_dim) |i| validation.moe_delta_ref[i] += weight * down_tmp[i];
+    }
+
+    if (has_shexp) {
+        const gate_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(gate_sh);
+        const up_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(up_sh);
+        const act_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(act_sh);
+        const down_sh = try allocator.alloc(f32, hidden_dim);
+        defer allocator.free(down_sh);
+        try cpuDmmvFallback(mmap, gate_shexp.?, tdo, norm_ptr, gate_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        try cpuDmmvFallback(mmap, up_shexp.?, tdo, norm_ptr, up_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        cpuSwiGLU(gate_sh.ptr, up_sh.ptr, act_sh.ptr, shexp_inter_dim);
+        try cpuDmmvFallback(mmap, down_shexp.?, tdo, act_sh.ptr, down_sh.ptr, hidden_dim, shexp_inter_dim, 0, allocator);
+        if (lt.ffn_gate_inp_shexp) |gate_t| {
+            var gate_value: [1]f32 = undefined;
+            try cpuDmmvFallback(mmap, gate_t, tdo, norm_ptr, gate_value[0..].ptr, 1, hidden_dim, 0, allocator);
+            validation.shared_gate = 1.0 / (1.0 + @exp(-gate_value[0]));
+        }
+        for (0..hidden_dim) |i| validation.moe_delta_ref[i] += validation.shared_gate * down_sh[i];
+    }
+
+    return validation;
+}
+
+fn finishQwenPrefillMoeValidation(
+    engine: *InferenceEngine,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    validation: *const QwenPrefillMoeValidationRef,
+    hidden_dim: u32,
+    inter_dim: u32,
+) !void {
+    const allocator = engine.allocator;
+    const hidden_after: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+    const routing: [*]const u32 = @ptrCast(@alignCast(engine.router_output_buf.cpu_ptr.?));
+
+    var first_id_mismatch_slot: usize = 0;
+    var id_mismatches: u32 = 0;
+    var max_weight_diff: f32 = 0;
+    var max_weight_slot: usize = 0;
+    for (0..validation.n_used) |slot| {
+        const gpu_id = routing[slot];
+        if (gpu_id != validation.expert_ids[slot]) {
+            if (id_mismatches == 0) first_id_mismatch_slot = slot;
+            id_mismatches += 1;
+        }
+        const gpu_weight: f32 = @bitCast(routing[validation.n_used + slot]);
+        const weight_diff = @abs(gpu_weight - validation.expert_weights[slot]);
+        if (weight_diff > max_weight_diff) {
+            max_weight_diff = weight_diff;
+            max_weight_slot = slot;
+        }
+    }
+    const route_ok = id_mismatches == 0 and max_weight_diff <= 1e-4;
+    const route_verdict: []const u8 = if (route_ok) "ok" else "failed";
+    const mismatch_ref = validation.expert_ids[first_id_mismatch_slot];
+    const mismatch_gpu = routing[first_id_mismatch_slot];
+    if (route_ok) {
+        log.info("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor=router_topk id_mismatches={d} first_mismatch_slot={d} ref_id={d} candidate_id={d} max_weight_abs_diff={d:.6} weight_slot={d} shared_gate={d:.6}", .{
+            route_verdict,
+            engine.position,
+            layer_idx,
+            id_mismatches,
+            first_id_mismatch_slot,
+            mismatch_ref,
+            mismatch_gpu,
+            max_weight_diff,
+            max_weight_slot,
+            validation.shared_gate,
+        });
+    } else {
+        log.warn("ZINC_QWEN36_35B_PREFILL_VALIDATE[{s}]: token={d} layer={d} tensor=router_topk id_mismatches={d} first_mismatch_slot={d} ref_id={d} candidate_id={d} max_weight_abs_diff={d:.6} weight_slot={d} shared_gate={d:.6}", .{
+            route_verdict,
+            engine.position,
+            layer_idx,
+            id_mismatches,
+            first_id_mismatch_slot,
+            mismatch_ref,
+            mismatch_gpu,
+            max_weight_diff,
+            max_weight_slot,
+            validation.shared_gate,
+        });
+    }
+
+    const actual_delta = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(actual_delta);
+    const expected_hidden = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(expected_hidden);
+    for (0..hidden_dim) |i| {
+        actual_delta[i] = hidden_after[i] - validation.hidden_before[i];
+        expected_hidden[i] = validation.hidden_before[i] + validation.moe_delta_ref[i];
+    }
+
+    const delta_diff = diffF32Slices(validation.moe_delta_ref, actual_delta);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "moe_delta",
+        delta_diff,
+        validation.moe_delta_ref[delta_diff.max_idx],
+        actual_delta[delta_diff.max_idx],
+        5e-2,
+    );
+
+    const hidden_diff = diffF32Slices(expected_hidden, hidden_after[0..hidden_dim]);
+    logQwenPrefillValidationDiff(
+        engine,
+        layer_idx,
+        "post_layer_hidden",
+        hidden_diff,
+        expected_hidden[hidden_diff.max_idx],
+        hidden_after[hidden_diff.max_idx],
+        5e-2,
+    );
+
+    try validateQwenMoeRoutePackChunk(engine, profile, layer_idx, lt, validation, hidden_after[0..hidden_dim], hidden_dim, inter_dim);
+}
+
+fn validateGemmaMoePostVector(
+    engine: *InferenceEngine,
+    layer_idx: usize,
+    lt: LayerTensors,
+    gate_up_layout: MoeGateUpLayout,
+    expert_ids: []const u32,
+    adjusted_expert_weights: []const f32,
+    shexp_gate_weight: f32,
+    expert_input_ptr: [*]const f32,
+    shared_input_ptr: [*]const f32,
+    actual_post_moe: []const f32,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+) !void {
+    const cfg = engine.config;
+    const allocator = engine.allocator;
+    const mmap = engine.model.mmap_data orelse return error.NoMmapData;
+    const tdo = engine.model.gguf_file.tensor_data_offset;
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp orelse lt.ffn_gate;
+    const up_shexp = lt.ffn_up_shexp orelse lt.ffn_up;
+    const down_shexp = lt.ffn_down_shexp orelse lt.ffn_down;
+    const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    const expected_expert = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(expected_expert);
+    const expected_shared = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(expected_shared);
+    const expected_total = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(expected_total);
+    @memset(expected_expert, 0);
+    @memset(expected_shared, 0);
+
+    const gate_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(gate_tmp);
+    const up_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(up_tmp);
+    const act_tmp = try allocator.alloc(f32, inter_dim);
+    defer allocator.free(act_tmp);
+    const down_tmp = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(down_tmp);
+
+    for (expert_ids, adjusted_expert_weights) |eid, weight| {
+        try cpuDmmvFallback(mmap, gate_exps, tdo, expert_input_ptr, gate_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.gateOffset(eid), allocator);
+        try cpuDmmvFallback(mmap, up_exps, tdo, expert_input_ptr, up_tmp.ptr, inter_dim, hidden_dim, gate_up_layout.upOffset(eid), allocator);
+        cpuGeGLU(gate_tmp.ptr, up_tmp.ptr, act_tmp.ptr, inter_dim);
+        try cpuDmmvFallback(mmap, down_exps, tdo, act_tmp.ptr, down_tmp.ptr, hidden_dim, inter_dim, eid * expert_down_bytes, allocator);
+        if (lt.ffn_down_exps_bias) |bias| {
+            addBiasFromTensorSlice(engine, down_tmp.ptr, bias, eid, hidden_dim);
+        }
+        for (0..hidden_dim) |i| expected_expert[i] += weight * down_tmp[i];
+    }
+    if (lt.post_ffw_norm_2) |post_norm_2_t| {
+        const post_norm_2 = try tensorF32Slice(engine, post_norm_2_t, hidden_dim);
+        cpuRmsNormMul(expected_expert.ptr, post_norm_2, expected_expert.ptr, hidden_dim, 1, cfg.rms_norm_eps);
+    }
+
+    if (has_shexp) {
+        const gate_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(gate_sh);
+        const up_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(up_sh);
+        const act_sh = try allocator.alloc(f32, shexp_inter_dim);
+        defer allocator.free(act_sh);
+        try cpuDmmvFallback(mmap, gate_shexp.?, tdo, shared_input_ptr, gate_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        try cpuDmmvFallback(mmap, up_shexp.?, tdo, shared_input_ptr, up_sh.ptr, shexp_inter_dim, hidden_dim, 0, allocator);
+        cpuGeGLU(gate_sh.ptr, up_sh.ptr, act_sh.ptr, shexp_inter_dim);
+        try cpuDmmvFallback(mmap, down_shexp.?, tdo, act_sh.ptr, expected_shared.ptr, hidden_dim, shexp_inter_dim, 0, allocator);
+        if (lt.post_ffw_norm_1) |post_norm_1_t| {
+            const post_norm_1 = try tensorF32Slice(engine, post_norm_1_t, hidden_dim);
+            cpuRmsNormMul(expected_shared.ptr, post_norm_1, expected_shared.ptr, hidden_dim, 1, cfg.rms_norm_eps);
+        }
+        for (0..hidden_dim) |i| expected_shared[i] *= shexp_gate_weight;
+    }
+
+    for (0..hidden_dim) |i| expected_total[i] = expected_expert[i] + expected_shared[i];
+    if (engine.post_ffn_norm_present[layer_idx]) {
+        const post_norm_ptr: [*]const f32 = @ptrCast(@alignCast(engine.post_ffn_norm_bufs[layer_idx].cpu_ptr.?));
+        cpuRmsNormMul(expected_total.ptr, post_norm_ptr[0..hidden_dim], expected_total.ptr, hidden_dim, 1, cfg.rms_norm_eps);
+    }
+
+    const diff = diffF32Slices(expected_total[0..hidden_dim], actual_post_moe);
+    const tol: f32 = 1e-3;
+    if (diff.max_abs > tol) {
+        log.err("Gemma MoE validate[failed]: pos={d} layer={d} post_moe max_abs_diff={d:.6} idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+            engine.position,
+            layer_idx,
+            diff.max_abs,
+            diff.max_idx,
+            expected_total[diff.max_idx],
+            actual_post_moe[diff.max_idx],
+            diff.rms,
+            tol,
+        });
+        return error.GemmaMoeValidationFailed;
+    }
+    log.info("Gemma MoE validate[ok]: pos={d} layer={d} post_moe max_abs_diff={d:.6} idx={d} ref={d:.6} candidate={d:.6} rms_diff={d:.6} tol={d:.6}", .{
+        engine.position,
+        layer_idx,
+        diff.max_abs,
+        diff.max_idx,
+        expected_total[diff.max_idx],
+        actual_post_moe[diff.max_idx],
+        diff.rms,
+        tol,
+    });
 }
 
 fn runGemmaExplicitMoeFallback(
@@ -4947,6 +13970,7 @@ fn runGemmaExplicitMoeFallback(
     const down_shexp = lt.ffn_down_shexp orelse lt.ffn_down;
     const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
     const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+    const folded_layer_output_scale: f32 = if (engine.debug_validation_enabled) 1.0 else engine.layer_output_scales[layer_idx];
 
     const hidden_ptr: [*]const f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
     const norm_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
@@ -5092,31 +14116,47 @@ fn runGemmaExplicitMoeFallback(
     profileBarrier(&cmd, profile, .fallback_moe);
 
     const down_supported = engine.dmmvPipelineForType(down_exps, hidden_dim, inter_dim) != null;
-    // Per-expert down path. Benchmarking on M4 showed the batched Q5_1 MoE
-    // dispatch was slightly slower than 8 per-expert dispatches (3057 vs 3000
-    // ms/tok, profile kept commits=1472 in both cases). Kept the Q5_1 MoE
-    // shader in the tree for future reuse but don't enable it here.
-    const use_batched_down = false;
-    _ = use_batched_down;
+    const use_batched_down =
+        use_batched_moe_dispatch and
+        down_supported and
+        down_exps.info.type_ == .q5_1 and
+        cfg.n_experts_used == 8 and
+        lt.ffn_down_exps_bias == null;
     if (down_supported) {
         const input_stride_bytes: u32 = inter_dim * @sizeOf(f32);
-        for (0..cfg.n_experts_used) |ei| {
-            const eid = expert_ids[ei];
-            if (use_batched_moe_dispatch) {
-                const x_off_bytes: u32 = @as(u32, @intCast(ei)) * input_stride_bytes;
-                dispatchDmmvOnCmdWithInputOffset(
-                    engine,
-                    &cmd,
-                    down_exps,
-                    &engine.expert_swiglu_batch_buf,
-                    &engine.expert_down_bufs[ei],
-                    hidden_dim,
-                    inter_dim,
-                    eid * expert_down_bytes,
-                    x_off_bytes,
-                );
-            } else {
-                dispatchDmmvOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_bufs[ei], &engine.expert_down_bufs[ei], hidden_dim, inter_dim, eid * expert_down_bytes);
+        if (use_batched_down) {
+            try dispatchDmmvMoeOnCmd(
+                engine,
+                &cmd,
+                down_exps,
+                &engine.expert_swiglu_batch_buf,
+                &engine.expert_down_batch_buf,
+                &engine.router_output_buf,
+                hidden_dim,
+                inter_dim,
+                expert_down_bytes,
+                inter_dim,
+                0,
+            );
+        } else {
+            for (0..cfg.n_experts_used) |ei| {
+                const eid = expert_ids[ei];
+                if (use_batched_moe_dispatch) {
+                    const x_off_bytes: u32 = @as(u32, @intCast(ei)) * input_stride_bytes;
+                    dispatchDmmvOnCmdWithInputOffset(
+                        engine,
+                        &cmd,
+                        down_exps,
+                        &engine.expert_swiglu_batch_buf,
+                        &engine.expert_down_bufs[ei],
+                        hidden_dim,
+                        inter_dim,
+                        eid * expert_down_bytes,
+                        x_off_bytes,
+                    );
+                } else {
+                    dispatchDmmvOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_bufs[ei], &engine.expert_down_bufs[ei], hidden_dim, inter_dim, eid * expert_down_bytes);
+                }
             }
         }
     }
@@ -5213,31 +14253,53 @@ fn runGemmaExplicitMoeFallback(
     dispatchZeroF32OnCmd(engine, &cmd, &engine.moe_out_buf, hidden_dim);
     profileBarrier(&cmd, profile, .fallback_moe);
     if (cfg.n_experts_used == 8) {
-        const moe_push = MoeAccPush{
-            .n = hidden_dim,
-            .w0 = adjusted_expert_weights[0],
-            .w1 = adjusted_expert_weights[1],
-            .w2 = adjusted_expert_weights[2],
-            .w3 = adjusted_expert_weights[3],
-            .w4 = adjusted_expert_weights[4],
-            .w5 = adjusted_expert_weights[5],
-            .w6 = adjusted_expert_weights[6],
-            .w7 = adjusted_expert_weights[7],
-            .w_sh = 0.0,
-        };
-        const moe_bufs = [_]*const MetalBuffer{
-            &engine.moe_out_buf,
-            &engine.expert_down_bufs[0],
-            &engine.expert_down_bufs[1],
-            &engine.expert_down_bufs[2],
-            &engine.expert_down_bufs[3],
-            &engine.expert_down_bufs[4],
-            &engine.expert_down_bufs[5],
-            &engine.expert_down_bufs[6],
-            &engine.expert_down_bufs[7],
-            &engine.down_buf,
-        };
-        cmd.dispatchV2(&engine.moe_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &moe_bufs, &moe_push, @sizeOf(MoeAccPush), 10);
+        if (use_batched_down) {
+            const moe_push = MoeAccBatchedPush{
+                .n = hidden_dim,
+                .expert_stride = hidden_dim,
+                .w0 = adjusted_expert_weights[0],
+                .w1 = adjusted_expert_weights[1],
+                .w2 = adjusted_expert_weights[2],
+                .w3 = adjusted_expert_weights[3],
+                .w4 = adjusted_expert_weights[4],
+                .w5 = adjusted_expert_weights[5],
+                .w6 = adjusted_expert_weights[6],
+                .w7 = adjusted_expert_weights[7],
+                .w_sh = 0.0,
+            };
+            const moe_bufs = [_]*const MetalBuffer{
+                &engine.moe_out_buf,
+                &engine.expert_down_batch_buf,
+                &engine.down_buf,
+            };
+            cmd.dispatchV2(&engine.moe_acc_batched_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &moe_bufs, &moe_push, @sizeOf(MoeAccBatchedPush), 3);
+        } else {
+            const moe_push = MoeAccPush{
+                .n = hidden_dim,
+                .w0 = adjusted_expert_weights[0],
+                .w1 = adjusted_expert_weights[1],
+                .w2 = adjusted_expert_weights[2],
+                .w3 = adjusted_expert_weights[3],
+                .w4 = adjusted_expert_weights[4],
+                .w5 = adjusted_expert_weights[5],
+                .w6 = adjusted_expert_weights[6],
+                .w7 = adjusted_expert_weights[7],
+                .w_sh = 0.0,
+            };
+            const moe_bufs = [_]*const MetalBuffer{
+                &engine.moe_out_buf,
+                &engine.expert_down_bufs[0],
+                &engine.expert_down_bufs[1],
+                &engine.expert_down_bufs[2],
+                &engine.expert_down_bufs[3],
+                &engine.expert_down_bufs[4],
+                &engine.expert_down_bufs[5],
+                &engine.expert_down_bufs[6],
+                &engine.expert_down_bufs[7],
+                &engine.down_buf,
+            };
+            cmd.dispatchV2(&engine.moe_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &moe_bufs, &moe_push, @sizeOf(MoeAccPush), 10);
+        }
     } else {
         for (0..cfg.n_experts_used) |ei| {
             const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(adjusted_expert_weights[ei])) };
@@ -5265,9 +14327,32 @@ fn runGemmaExplicitMoeFallback(
         const post_norm_ptr: [*]const f32 = @ptrCast(@alignCast(engine.post_ffn_norm_bufs[layer_idx].cpu_ptr.?));
         cpuRmsNormMul(expert_accum_ptr, post_norm_ptr[0..hidden_dim], expert_accum_ptr, hidden_dim, 1, cfg.rms_norm_eps);
     }
+    if (shouldValidateGemmaMoe(engine, layer_idx)) {
+        const validation_start = profileStart(profile != null);
+        try validateGemmaMoePostVector(
+            engine,
+            layer_idx,
+            lt,
+            gate_up_layout,
+            expert_ids[0..cfg.n_experts_used],
+            adjusted_expert_weights[0..cfg.n_experts_used],
+            shexp_gate_weight,
+            expert_input_ptr,
+            norm_ptr,
+            expert_accum_ptr[0..hidden_dim],
+            hidden_dim,
+            inter_dim,
+            shexp_inter_dim,
+        );
+        if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+    }
     {
         const hidden_out: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
-        for (0..hidden_dim) |i| hidden_out[i] += expert_accum_ptr[i];
+        if (folded_layer_output_scale != 1.0) {
+            for (0..hidden_dim) |i| hidden_out[i] = (hidden_out[i] + expert_accum_ptr[i]) * folded_layer_output_scale;
+        } else {
+            for (0..hidden_dim) |i| hidden_out[i] += expert_accum_ptr[i];
+        }
     }
     if (hidden_before_snapshot) |hidden_before| {
         const expected_expert = try engine.allocator.alloc(f32, hidden_dim);
@@ -5341,16 +14426,245 @@ fn runGemmaExplicitMoeFallback(
     if (profile) |p| p.fallback_moe_record_ns += profileElapsedNs(moe_record_start);
 }
 
-fn recordGpuRoutedBatchedMoeOnCmd(
+fn recordGemmaGpuRoutedMoeOnCmd(
     engine: *InferenceEngine,
     cmd: *MetalCommand,
     profile: ?*RuntimeProfile,
+    layer_idx: usize,
     lt: LayerTensors,
     hidden_dim: u32,
     inter_dim: u32,
     shexp_inter_dim: u32,
 ) !void {
     const cfg = engine.config;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const down_scales = lt.ffn_down_exps_scale orelse return error.MissingTensor;
+    const pre_ffw_norm_2 = lt.pre_ffw_norm_2 orelse return error.MissingTensor;
+    const post_ffw_norm_1 = lt.post_ffw_norm_1 orelse return error.MissingTensor;
+    const post_ffw_norm_2 = lt.post_ffw_norm_2 orelse return error.MissingTensor;
+    const gate_shexp = lt.ffn_gate_shexp orelse return error.MissingTensor;
+    const up_shexp = lt.ffn_up_shexp orelse return error.MissingTensor;
+    const down_shexp = lt.ffn_down_shexp orelse return error.MissingTensor;
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    const router_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_dim)));
+    dispatchSoftmaxTopkScaledOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, router_scale);
+
+    // llama.cpp's build_moe_ffn keeps selected_experts on device and feeds it
+    // into mul_mat_id. For Gemma decode N=1, router_output_buf is that compact
+    // selected_experts+weights row; the DMMV MoE kernels consume the expert ids
+    // directly and the accumulate kernel consumes the weights.
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, pre_ffw_norm_2, hidden_dim, 1);
+    profileBarrier(cmd, profile, .gpu_routed_moe); // routes and expert input visible
+
+    const use_fused_gate_up =
+        gate_exps == up_exps and
+        gate_exps.info.type_ == .q4_k and
+        gate_up_layout.gate_expert_stride == gate_up_layout.up_expert_stride and
+        engine.dmmv_q4k_moe_gate_up_pipe.handle != null;
+    if (use_fused_gate_up) {
+        try dispatchDmmvMoeGateUpQ4kOnCmd(
+            engine,
+            cmd,
+            gate_exps,
+            &engine.residual_buf,
+            &engine.expert_gate_batch_buf,
+            &engine.expert_up_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            gate_up_layout.gate_base_offset,
+            gate_up_layout.up_base_offset,
+            0,
+            0,
+        );
+    } else {
+        try dispatchDmmvMoeOnCmd(
+            engine,
+            cmd,
+            gate_exps,
+            &engine.residual_buf,
+            &engine.expert_gate_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.gate_expert_stride,
+            0,
+            gate_up_layout.gate_base_offset,
+        );
+        try dispatchDmmvMoeOnCmd(
+            engine,
+            cmd,
+            up_exps,
+            &engine.residual_buf,
+            &engine.expert_up_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            gate_up_layout.up_expert_stride,
+            0,
+            gate_up_layout.up_base_offset,
+        );
+    }
+    if (canUsePairedQ8Dmmv(engine, gate_shexp, up_shexp, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
+        dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp, up_shexp, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+    } else {
+        dispatchDmmvOnCmd(engine, cmd, gate_shexp, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
+        dispatchDmmvOnCmd(engine, cmd, up_shexp, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+    }
+    if (lt.ffn_gate_inp_shexp) |gate_tensor| {
+        dispatchDmmvOnCmd(engine, cmd, gate_tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up/shared projections visible before GeGLU
+
+    {
+        const push = SwiGLUPush{ .n = inter_dim };
+        const bufs = [_]*const MetalBuffer{ &engine.expert_gate_batch_buf, &engine.expert_swiglu_batch_buf, &engine.expert_up_batch_buf };
+        cmd.dispatchV2(&engine.geglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SwiGLUPush), 0);
+    }
+    dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, shexp_inter_dim);
+    profileBarrier(cmd, profile, .gpu_routed_moe); // activations visible before down projections
+
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        down_exps,
+        &engine.expert_swiglu_batch_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        hidden_dim,
+        inter_dim,
+        expert_down_bytes,
+        inter_dim,
+        0,
+    );
+    dispatchDmmvOnCmd(engine, cmd, down_shexp, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
+    profileBarrier(cmd, profile, .gpu_routed_moe); // down outputs visible before accumulate
+
+    const validate_moe = shouldValidateGemmaMoe(engine, layer_idx);
+    dispatchMoeWeightedAccScaledOnCmd(
+        engine,
+        cmd,
+        &engine.moe_out_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        down_scales,
+        hidden_dim,
+        cfg.n_experts_used,
+        hidden_dim,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe); // expert contribution visible before post expert norm
+
+    const use_fused_post_norm_residual =
+        !validate_moe and
+        hidden_dim <= 16 * 1024 and
+        engine.gemma_moe_post_norm_residual_pipe.handle != null;
+    if (use_fused_post_norm_residual) {
+        dispatchGemmaMoePostNormResidualOnCmd(
+            engine,
+            cmd,
+            &engine.moe_out_buf,
+            &engine.down_buf,
+            &engine.hidden_buf,
+            post_ffw_norm_2,
+            post_ffw_norm_1,
+            &engine.post_ffn_norm_bufs[layer_idx],
+            &engine.router_logits_buf,
+            hidden_dim,
+            lt.ffn_gate_inp_shexp != null,
+            engine.post_ffn_norm_present[layer_idx],
+        );
+        profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+        return;
+    }
+
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, post_ffw_norm_2, hidden_dim, 1);
+    dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.down_buf, &engine.down_buf, post_ffw_norm_1, hidden_dim, 1);
+    profileBarrier(cmd, profile, .gpu_routed_moe); // post expert/shared norms visible before shared add
+
+    if (lt.ffn_gate_inp_shexp != null) {
+        dispatchSigmoidScaleAccOnCmd(engine, cmd, &engine.moe_out_buf, &engine.down_buf, &engine.router_logits_buf, hidden_dim);
+    } else {
+        const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+        const acc_bufs = [_]*const MetalBuffer{ &engine.moe_out_buf, &engine.down_buf };
+        cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+    }
+    profileBarrier(cmd, profile, .gpu_routed_moe); // combined MoE contribution visible before final post-FFN norm
+
+    if (engine.post_ffn_norm_present[layer_idx]) {
+        dispatchRmsNormOnCmd(engine, cmd, &engine.moe_out_buf, &engine.moe_out_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
+
+    if (validate_moe) {
+        commitAndWaitProfiled(cmd, profile);
+
+        const routing: [*]const u32 = @ptrCast(@alignCast(engine.router_output_buf.cpu_ptr.?));
+        const scales = try tensorF32Slice(engine, down_scales, cfg.n_experts);
+        var expert_ids: [16]u32 = undefined;
+        var adjusted_weights: [16]f32 = undefined;
+        const n_used: usize = @intCast(cfg.n_experts_used);
+        for (0..n_used) |slot| {
+            const expert_id = routing[slot];
+            expert_ids[slot] = expert_id;
+            adjusted_weights[slot] = @as(f32, @bitCast(routing[n_used + slot])) * scales[@intCast(expert_id)];
+        }
+
+        const gate_value: f32 = if (lt.ffn_gate_inp_shexp != null) blk: {
+            const gate_ptr: [*]const f32 = @ptrCast(@alignCast(engine.router_logits_buf.cpu_ptr.?));
+            break :blk 1.0 / (1.0 + @exp(-gate_ptr[0]));
+        } else 1.0;
+        const expert_input_ptr: [*]const f32 = @ptrCast(@alignCast(engine.residual_buf.cpu_ptr.?));
+        const shared_input_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
+        const actual_post_moe: [*]const f32 = @ptrCast(@alignCast(engine.moe_out_buf.cpu_ptr.?));
+        try validateGemmaMoePostVector(
+            engine,
+            layer_idx,
+            lt,
+            gate_up_layout,
+            expert_ids[0..n_used],
+            adjusted_weights[0..n_used],
+            gate_value,
+            expert_input_ptr,
+            shared_input_ptr,
+            actual_post_moe[0..hidden_dim],
+            hidden_dim,
+            inter_dim,
+            shexp_inter_dim,
+        );
+        cmd.* = try beginProfiledCommand(engine, profile);
+    }
+
+    const res_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+    const res_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.moe_out_buf };
+    cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &res_bufs, &res_push, @sizeOf(ScaleAccPush), 0);
+    profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer
+}
+
+fn recordGpuRoutedBatchedMoeOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    layer_idx: usize,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    shexp_inter_dim: u32,
+    router_output_ready: bool,
+    norm_input_buf: *const MetalBuffer,
+    norm_input_byte_offset: u32,
+    next_attn_norm: ?*const MetalBuffer,
+    hidden_scale: f32,
+) !bool {
+    const cfg = engine.config;
+    if (cfg.architecture == .gemma) {
+        try recordGemmaGpuRoutedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+        return false;
+    }
     const gate_exps = lt.ffn_gate_exps orelse return error.MissingTensor;
     const up_exps = lt.ffn_up_exps orelse return error.MissingTensor;
     const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
@@ -5360,51 +14674,302 @@ fn recordGpuRoutedBatchedMoeOnCmd(
     const gate_inp_shexp = lt.ffn_gate_inp_shexp;
     const has_shexp = gate_shexp != null and up_shexp != null and down_shexp != null;
     const expert_gate_bytes = expertSliceBytes(gate_exps.info.type_, inter_dim, hidden_dim);
+    const expert_up_bytes = expertSliceBytes(up_exps.info.type_, inter_dim, hidden_dim);
     const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+    const use_dual_q4k_gate_up =
+        gate_exps.info.type_ == .q4_k and
+        up_exps.info.type_ == .q4_k and
+        engine.dmmv_q4k_moe_gate_up_dual_pipe.handle != null;
+    const use_fused_q4k_gate_up_swiglu =
+        use_dual_q4k_gate_up and
+        cfg.architecture == .qwen2_moe and
+        cfg.ssm_d_inner != 0 and
+        cfg.n_experts_used == 8 and
+        hidden_dim == 2048 and
+        inter_dim == 512 and
+        !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        engine.dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle != null;
+    const use_f32_shared_gate_acc =
+        gate_inp_shexp != null and
+        canUseQwenTokenSharedGateF32Acc(engine, gate_inp_shexp.?, hidden_dim);
+    const use_fused_shared_q8_swiglu =
+        has_shexp and
+        canUseQwenSharedQ8SwiGLU(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, hidden_dim);
 
-    dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
-    profileBarrier(cmd, profile, .gpu_routed_moe); // router_output_buf visible before expert DMMVs
+    if (!router_output_ready) {
+        dispatchSoftmaxTopkOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used);
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.router_output_buf}); // router_output_buf visible before expert DMMVs
+    }
 
     // Phase B: gate+up expert DMMVs + shared expert DMMVs — all independent, overlap in concurrent mode.
-    try dispatchDmmvMoeOnCmd(engine, cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
-    try dispatchDmmvMoeOnCmd(engine, cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+    if (use_fused_q4k_gate_up_swiglu) {
+        // Qwen3.6's token-major path consumes the routed Q4_K gate/up pair
+        // only through SwiGLU. Fold the activation into the exact-shape
+        // gate/up kernel while validation modes keep the materialized buffers.
+        try dispatchDmmvMoeGateUpSwiGLUQ4kOnCmd(
+            engine,
+            cmd,
+            gate_exps,
+            up_exps,
+            norm_input_buf,
+            &engine.expert_swiglu_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            expert_gate_bytes,
+            expert_up_bytes,
+            0,
+            norm_input_byte_offset,
+        );
+    } else if (use_dual_q4k_gate_up) {
+        // Adapted from llama.cpp's small-token `kernel_mul_mv_id` shape:
+        // cache the selected route input once per expert slot, then compute
+        // separate gate/up Q4_K rows in one launch. vLLM-style route packing
+        // is deliberately avoided here because token-major prefill still has
+        // only one token per MoE record.
+        try dispatchDmmvMoeGateUpDualQ4kOnCmd(
+            engine,
+            cmd,
+            gate_exps,
+            up_exps,
+            norm_input_buf,
+            &engine.expert_gate_batch_buf,
+            &engine.expert_up_batch_buf,
+            &engine.router_output_buf,
+            inter_dim,
+            hidden_dim,
+            expert_gate_bytes,
+            expert_up_bytes,
+            0,
+            norm_input_byte_offset,
+        );
+    } else {
+        try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, gate_exps, norm_input_buf, &engine.expert_gate_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, norm_input_byte_offset);
+        try dispatchDmmvMoeOnCmdWithInputOffset(engine, cmd, up_exps, norm_input_buf, &engine.expert_up_batch_buf, &engine.router_output_buf, inter_dim, hidden_dim, expert_up_bytes, 0, 0, norm_input_byte_offset);
+    }
     if (has_shexp) {
-        dispatchDmmvOnCmd(engine, cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
-        dispatchDmmvOnCmd(engine, cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
+        // Qwen3.6 shared expert gate/up are equal-shape Q8_0 projections. Use
+        // the paired Q8 row kernel (llama.cpp-style rowwise mul_mv with shared
+        // X-vector loads) for the production path now that the Qwen shared
+        // batched validator covers gate/up/down diffs.
+        if (use_fused_shared_q8_swiglu) {
+            dispatchPairedQ8SwiGLUOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, norm_input_buf, &engine.swiglu_buf, shexp_inter_dim, hidden_dim, norm_input_byte_offset);
+        } else if (canUsePairedQ8Dmmv(engine, gate_shexp.?, up_shexp.?, shexp_inter_dim, shexp_inter_dim, hidden_dim)) {
+            dispatchPairedQ8DmmvOnCmd(engine, cmd, gate_shexp.?, up_shexp.?, norm_input_buf, &engine.gate_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, norm_input_byte_offset);
+        } else {
+            dispatchDmmvOnCmdWithInputOffset(engine, cmd, gate_shexp.?, norm_input_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0, norm_input_byte_offset);
+            dispatchDmmvOnCmdWithInputOffset(engine, cmd, up_shexp.?, norm_input_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0, norm_input_byte_offset);
+        }
         if (gate_inp_shexp) |tensor| {
-            dispatchDmmvOnCmd(engine, cmd, tensor, &engine.norm_buf, &engine.router_logits_buf, 1, hidden_dim, 0);
+            if (!use_f32_shared_gate_acc) {
+                dispatchDmmvOnCmdWithInputOffset(engine, cmd, tensor, norm_input_buf, &engine.router_logits_buf, 1, hidden_dim, 0, norm_input_byte_offset);
+            }
         }
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // gate/up outputs visible before SwiGLU
+    {
+        // llama.cpp's `ggml_metal_op_concurrency_check/reset` places barriers at
+        // dependency edges. In Qwen's token-major routed MoE, Phase B only hands
+        // activation buffers to Phase C/D, so scope the barrier to those resources
+        // instead of flushing every buffer touched by independent DMMVs.
+        var barrier_bufs: [6]*const MetalBuffer = undefined;
+        var barrier_count: usize = 0;
+        if (use_fused_q4k_gate_up_swiglu) {
+            barrier_bufs[barrier_count] = &engine.expert_swiglu_batch_buf;
+            barrier_count += 1;
+        } else {
+            barrier_bufs[barrier_count] = &engine.expert_gate_batch_buf;
+            barrier_count += 1;
+            barrier_bufs[barrier_count] = &engine.expert_up_batch_buf;
+            barrier_count += 1;
+        }
+        if (has_shexp) {
+            if (use_fused_shared_q8_swiglu) {
+                barrier_bufs[barrier_count] = &engine.swiglu_buf;
+                barrier_count += 1;
+            } else {
+                barrier_bufs[barrier_count] = &engine.gate_buf;
+                barrier_count += 1;
+                barrier_bufs[barrier_count] = &engine.up_buf;
+                barrier_count += 1;
+            }
+            if (gate_inp_shexp != null and !use_f32_shared_gate_acc) {
+                barrier_bufs[barrier_count] = &engine.router_logits_buf;
+                barrier_count += 1;
+            }
+        }
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, barrier_bufs[0..barrier_count]); // gate/up outputs visible before SwiGLU/down
+    }
 
     // Phase C: SwiGLU — batched experts + shared expert overlap.
-    {
+    var phase_c_dispatched = false;
+    if (!use_fused_q4k_gate_up_swiglu) {
         const swiglu_push = SwiGLUPush{ .n = inter_dim };
         const sw_bufs = [_]*const MetalBuffer{ &engine.expert_gate_batch_buf, &engine.expert_swiglu_batch_buf, &engine.expert_up_batch_buf };
         cmd.dispatchV2(&engine.swiglu_batched_pipe, .{ (inter_dim + 63) / 64, cfg.n_experts_used, 1 }, .{ 64, 1, 1 }, &sw_bufs, &swiglu_push, @sizeOf(SwiGLUPush), 0);
+        phase_c_dispatched = true;
     }
     if (has_shexp) {
-        const sw_push = SwiGLUPush{ .n = shexp_inter_dim };
-        const sw_bufs = [_]*const MetalBuffer{ &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf };
-        cmd.dispatchV2(&engine.swiglu_pipe, .{ (shexp_inter_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &sw_bufs, &sw_push, @sizeOf(SwiGLUPush), 0);
+        if (!use_fused_shared_q8_swiglu) {
+            const sw_push = SwiGLUPush{ .n = shexp_inter_dim };
+            const sw_bufs = [_]*const MetalBuffer{ &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf };
+            cmd.dispatchV2(&engine.swiglu_pipe, .{ (shexp_inter_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &sw_bufs, &sw_push, @sizeOf(SwiGLUPush), 0);
+            phase_c_dispatched = true;
+        }
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // SwiGLU outputs visible before down DMMVs
+    if (phase_c_dispatched) {
+        var barrier_bufs: [2]*const MetalBuffer = undefined;
+        var barrier_count: usize = 0;
+        if (!use_fused_q4k_gate_up_swiglu) {
+            barrier_bufs[barrier_count] = &engine.expert_swiglu_batch_buf;
+            barrier_count += 1;
+        }
+        if (has_shexp and !use_fused_shared_q8_swiglu) {
+            barrier_bufs[barrier_count] = &engine.swiglu_buf;
+            barrier_count += 1;
+        }
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, barrier_bufs[0..barrier_count]); // SwiGLU outputs visible before down DMMVs
+    }
 
     // Phase D: down expert DMMVs + shared down — overlap.
     try dispatchDmmvMoeOnCmd(engine, cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
     if (has_shexp) {
         dispatchDmmvOnCmd(engine, cmd, down_shexp.?, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // down outputs visible before accumulate
+    if (has_shexp) {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{ &engine.expert_down_batch_buf, &engine.down_buf }); // down outputs visible before accumulate
+    } else {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.expert_down_batch_buf}); // down outputs visible before accumulate
+    }
 
     // Phase E: weighted accumulate + shared expert into hidden_buf (fused — saves one barrier per layer).
+    var wrote_next_attn_norm = false;
     if (has_shexp) {
-        const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
-        dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
+        if (use_f32_shared_gate_acc and
+            next_attn_norm != null and
+            canUseQwenMoeWeightedAccSharedGateF32NextNorm(engine, hidden_dim, cfg.n_experts_used, hidden_dim))
+        {
+            // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset` graph-tail
+            // fusion: the MoE finalizer already has the new hidden row in
+            // registers, so also emit the next layer's attn/SSM norm row and
+            // let the next layer skip its standalone RMSNorm dispatch.
+            dispatchMoeWeightedAccSharedGateF32NextNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, &engine.norm_buf, next_attn_norm.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset, hidden_scale);
+            wrote_next_attn_norm = true;
+        } else if (use_f32_shared_gate_acc) {
+            // Adapt vLLM's top-k weight+reduce finalization and llama.cpp's
+            // Metal fusion discipline: for Qwen3.6's one-row F32 shared gate,
+            // fold the gate dot product and any layer output scale into the MoE
+            // combine kernel instead of launching separate tail kernels.
+            dispatchMoeWeightedAccSharedGateF32OnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, norm_input_buf, gate_inp_shexp.?, hidden_dim, cfg.n_experts_used, hidden_dim, norm_input_byte_offset, hidden_scale);
+        } else {
+            const gate_buf = if (gate_inp_shexp != null) &engine.router_logits_buf else &engine.down_buf;
+            dispatchMoeWeightedAccSharedOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, &engine.down_buf, gate_buf, hidden_dim, cfg.n_experts_used, hidden_dim, gate_inp_shexp != null);
+        }
     } else {
         dispatchMoeWeightedAccOnCmd(engine, cmd, &engine.hidden_buf, &engine.expert_down_batch_buf, &engine.router_output_buf, hidden_dim, cfg.n_experts_used, hidden_dim);
     }
-    profileBarrier(cmd, profile, .gpu_routed_moe); // hidden_buf visible to next layer's RMS norm
+    if (wrote_next_attn_norm) {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{ &engine.hidden_buf, &engine.norm_buf }); // hidden/norm visible to next layer
+    } else {
+        profileBarrierBuffers(cmd, profile, .gpu_routed_moe, &.{&engine.hidden_buf}); // hidden_buf visible to next layer's RMS norm
+    }
+    return wrote_next_attn_norm;
+}
+
+fn recordGpuRoutedGptOssMoeOnCmd(
+    engine: *InferenceEngine,
+    cmd: *MetalCommand,
+    profile: ?*RuntimeProfile,
+    lt: LayerTensors,
+    hidden_dim: u32,
+    inter_dim: u32,
+    router_output_ready: bool,
+) !void {
+    const cfg = engine.config;
+    const gate_up_layout = try resolveMoeGateUpLayout(lt, inter_dim, hidden_dim);
+    const gate_exps = gate_up_layout.gate_tensor;
+    const up_exps = gate_up_layout.up_tensor;
+    const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
+    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+    const gate_bias = lt.ffn_gate_exps_bias orelse return error.MissingTensor;
+    const up_bias = lt.ffn_up_exps_bias orelse return error.MissingTensor;
+    const down_bias = lt.ffn_down_exps_bias orelse return error.MissingTensor;
+    const expert_down_bytes = expertSliceBytes(down_exps.info.type_, hidden_dim, inter_dim);
+
+    if (!router_output_ready) {
+        dispatchSoftmaxTopkWeightBiasOnCmd(engine, cmd, &engine.router_logits_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used);
+        profileBarrier(cmd, profile, .gpu_routed_moe);
+    }
+
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        gate_exps,
+        &engine.norm_buf,
+        &engine.expert_gate_batch_buf,
+        &engine.router_output_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.gate_expert_stride,
+        0,
+        gate_up_layout.gate_base_offset,
+    );
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        up_exps,
+        &engine.norm_buf,
+        &engine.expert_up_batch_buf,
+        &engine.router_output_buf,
+        inter_dim,
+        hidden_dim,
+        gate_up_layout.up_expert_stride,
+        0,
+        gate_up_layout.up_base_offset,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    dispatchOaiSwiGLUBatchedBiasOnCmd(
+        engine,
+        cmd,
+        &engine.expert_gate_batch_buf,
+        &engine.expert_swiglu_batch_buf,
+        &engine.expert_up_batch_buf,
+        &engine.router_output_buf,
+        gate_bias,
+        up_bias,
+        inter_dim,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    try dispatchDmmvMoeOnCmd(
+        engine,
+        cmd,
+        down_exps,
+        &engine.expert_swiglu_batch_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        hidden_dim,
+        inter_dim,
+        expert_down_bytes,
+        inter_dim,
+        0,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
+
+    dispatchMoeAccBatchedBiasRoutedOnCmd(
+        engine,
+        cmd,
+        &engine.hidden_buf,
+        &engine.expert_down_batch_buf,
+        &engine.router_output_buf,
+        down_bias,
+        hidden_dim,
+        cfg.n_experts_used,
+        hidden_dim,
+    );
+    profileBarrier(cmd, profile, .gpu_routed_moe);
 }
 
 fn acquireLayerCommand(
@@ -5422,6 +14987,25 @@ fn acquireLayerCommand(
     local_cmd_storage.* = try beginProfiledCommand(engine, profile);
     using_local_cmd.* = true;
     return local_cmd_storage;
+}
+
+fn canUseDenseSharedDecodeCommand(engine: *const InferenceEngine) bool {
+    const cfg = engine.config;
+    switch (cfg.architecture) {
+        .gemma, .qwen2 => {},
+        else => return false,
+    }
+    if (cfg.n_experts != 0) return false;
+    if (cfg.ssm_d_inner != 0) return false;
+    if (engine.debug_validation_enabled or engine.gemma_moe_validation_enabled) return false;
+
+    for (engine.layer_tensors) |lt| {
+        if (lt.attn_gate != null) return false;
+        if (lt.attn_q_bias != null or lt.attn_k_bias != null or
+            lt.attn_v_bias != null or lt.attn_output_bias != null) return false;
+    }
+
+    return true;
 }
 
 fn beginProfiledCommand(engine: *InferenceEngine, profile: ?*RuntimeProfile) !MetalCommand {
@@ -5444,11 +15028,81 @@ fn commitAndWaitProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
     }
 }
 
+fn commitAsyncProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    if (profile) |p| {
+        p.dispatch_calls += cmd.dispatch_count;
+        p.barrier_calls += cmd.barrier_count;
+    }
+    cmd.commitAsync();
+}
+
+fn waitCommandProfiled(cmd: *MetalCommand, profile: ?*RuntimeProfile) void {
+    const wait_start = profileStart(profile != null);
+    cmd.wait();
+    if (profile) |p| {
+        p.commit_waits += 1;
+        p.gpu_completion_wait_ns += profileElapsedNs(wait_start);
+    }
+}
+
+fn releaseCommands(cmds: []MetalCommand) void {
+    for (cmds) |*cmd| {
+        if (cmd.handle != null) cmd.wait();
+    }
+}
+
+fn waitPendingDenseCommands(cmds: []MetalCommand, count: *usize, profile: ?*RuntimeProfile) void {
+    const n = count.*;
+    if (n == 0) return;
+
+    // Metal command queues execute command buffers in commit order. Mirroring
+    // llama.cpp's graph submission pattern, wait on the last dense chunk to
+    // synchronize the token, then release the already-completed earlier chunks.
+    waitCommandProfiled(&cmds[n - 1], profile);
+    releaseCommands(cmds[0 .. n - 1]);
+    count.* = 0;
+}
+
+fn releasePendingDenseCommands(cmds: []MetalCommand, count: *usize) void {
+    releaseCommands(cmds[0..count.*]);
+    count.* = 0;
+}
+
+fn submitPendingDenseCommand(
+    cmd: *MetalCommand,
+    pending_cmds: []MetalCommand,
+    pending_count: *usize,
+    profile: ?*RuntimeProfile,
+) void {
+    if (cmd.handle == null) return;
+    if (pending_count.* == pending_cmds.len) {
+        waitPendingDenseCommands(pending_cmds, pending_count, profile);
+    }
+
+    commitAsyncProfiled(cmd, profile);
+    pending_cmds[pending_count.*] = cmd.*;
+    pending_count.* += 1;
+    cmd.* = .{
+        .handle = null,
+        .dispatch_count = 0,
+        .barrier_count = 0,
+        .barrier_enabled = false,
+    };
+}
+
 // ---------------------------------------------------------------------------
-// Decode step — runs all layers + final norm + LM head
+// Decode step — runs all layers plus optional final norm + LM head.
 // ---------------------------------------------------------------------------
 
-fn runDecodeStep(engine: *InferenceEngine) !void {
+fn runDecodeStep(
+    engine: *InferenceEngine,
+    emit_logits: bool,
+    embed_src_override: ?*const MetalBuffer,
+    embed_src_offset: u32,
+    async_out: ?*MetalCommand,
+    external_shared_cmd: ?*MetalCommand,
+    start_layer: usize,
+) !void {
     const step_start = profileStart(engine.profile_enabled);
     defer if (engine.profile_enabled) {
         engine.request_profile.total_step_ns += profileElapsedNs(step_start);
@@ -5469,18 +15123,54 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
     const n_group: u32 = cfg.ssm_n_group;
     const dt_rank: u32 = cfg.ssm_dt_rank;
     const conv_channels: u32 = if (d_inner > 0) d_inner + 2 * n_group * d_state else 0;
+    if (external_shared_cmd != null and async_out != null) return error.InvalidPrefillCommandMode;
 
     const head_v_dim: u32 = if (d_inner > 0) d_inner / @max(dt_rank, 1) else 0;
     const d_conv: u32 = cfg.ssm_d_conv;
-    const use_single_gpu_cmd = !engine.debug_validation_enabled and is_moe and blk: {
-        for (engine.layer_tensors) |lt| {
-            if (!canUseGpuRoutedBatchedMoe(engine, lt)) break :blk false;
+    const use_dense_layer_cmd = canUseDenseSharedDecodeCommand(engine);
+    const allow_prefill_f32_router_fusion = external_shared_cmd != null or !emit_logits;
+    // Dense Gemma follows llama.cpp's graph submission pattern: enqueue larger
+    // ordered chunks asynchronously and wait once at the token boundary.
+    // llama.cpp's `ggml-metal-context.m::ggml_metal_set_n_cb` warns "optimal
+    // values for n_cb are 1 or 2" and that >2 "can degrade the performance",
+    // because each extra command buffer adds queue scheduling latency and a
+    // GPU clock-ramp window between submissions. Cycle 51 confirmed neither
+    // barrier cost nor lack of concurrency explains the 65× kernel-vs-wall
+    // gap on Gemma 31B (Serial and Concurrent encoders measured the same
+    // 0.25 tok/s with 9 cmd buffers/token), leaving cmd-buffer-boundary
+    // scheduling and GPU clock throttling between small chunks as the
+    // dominant remaining cost. Cut the dense chunks from 8 to 2 by raising
+    // the per-chunk layer count from 8 to 30 — the older single-chunk (60)
+    // attempt broke correctness, so 30 is a conservative step toward
+    // llama.cpp's n_cb=2 target while staying clear of the prior cliff.
+    //
+    // For Qwen3-8B (36 dense layers, qwen2 arch) tried bumping to 36 so all
+    // dense layers fit in ONE chunk. Profile confirmed cmds/step dropped 2.89
+    // → 1.89 and greedy output stayed byte-identical, so the prior
+    // "single-chunk broke correctness" cliff (observed at 60 layers on Gemma
+    // 31B) is safely above 36. But measured 3-run median decode was 43.87
+    // tok/s vs 44.32 baseline — flat within noise, no win. The
+    // inter-chunk clock-ramp hypothesis the comment above identifies as the
+    // remaining cost does not appear to fire on M1 Max for this 36-layer model
+    // with 30+6 chunks already tightly back-to-back. Reverted; do not
+    // re-attempt for Qwen3-8B without a different lever (e.g. holding GPU
+    // clocks via residency-set warm-loop) — see EFFORT_14_NOTES.md.
+    const dense_cmd_group_layers: usize = 30;
+    const use_single_gpu_cmd = !engine.debug_validation_enabled and
+        !engine.gemma_moe_validation_enabled and
+        !engine.qwen_prefill_validation_enabled and
+        is_moe and blk: {
+        for (engine.layer_tensors, 0..) |lt, layer_idx| {
+            if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
+            break :blk false;
         }
         break :blk true;
     };
     if (engine.profile_enabled and engine.position == 0 and is_moe and !use_single_gpu_cmd) {
         for (engine.layer_tensors, 0..) |lt, layer_idx| {
             if (canUseGpuRoutedBatchedMoe(engine, lt)) continue;
+            if (canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim)) continue;
             log.info("Metal profile: shared token command disabled by layer {d} (gate_exps={s} up_exps={s} down_exps={s})", .{
                 layer_idx,
                 if (lt.ffn_gate_exps) |t| @tagName(t.info.type_) else "-",
@@ -5493,37 +15183,110 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
     const profile: ?*RuntimeProfile = if (engine.profile_enabled) &engine.request_profile else null;
     if (profile) |p| {
         p.decode_steps += 1;
-        if (use_single_gpu_cmd) p.shared_cmd_steps += 1;
+        if (use_single_gpu_cmd or external_shared_cmd != null) p.shared_cmd_steps += 1;
     }
     var shared_cmd_storage: MetalCommand = undefined;
-    const shared_cmd: ?*MetalCommand = if (use_single_gpu_cmd) blk: {
+    const using_external_shared_cmd = external_shared_cmd != null;
+    const shared_cmd: ?*MetalCommand = if (external_shared_cmd) |cmd|
+        cmd
+    else if (use_single_gpu_cmd) blk: {
         shared_cmd_storage = try beginProfiledCommand(engine, profile);
         break :blk &shared_cmd_storage;
     } else null;
     if (engine.private_decode_buffers) {
         const cmd = shared_cmd orelse return error.PrivateDecodeFastPathRequiresSharedCommand;
-        dispatchCopyF32OnCmd(engine, cmd, &engine.embed_staging, &engine.hidden_buf, hidden_dim);
+        const embed_src = embed_src_override orelse &engine.embed_staging;
+        dispatchCopyF32OffsetOnCmd(engine, cmd, embed_src, &engine.hidden_buf, hidden_dim, embed_src_offset, 0);
         profileBarrier(cmd, profile, .embed);
     }
 
-    for (0..cfg.n_layers) |layer_idx| {
+    var dense_group_cmd_storage = MetalCommand{
+        .handle = null,
+        .dispatch_count = 0,
+        .barrier_count = 0,
+        .barrier_enabled = false,
+    };
+    var dense_pending_cmds: [64]MetalCommand = undefined;
+    var dense_pending_count: usize = 0;
+    errdefer waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
+    const layer_count: usize = @intCast(cfg.n_layers);
+
+    // Fusion across the dense-FFN/next-attn boundary: when the previous dense
+    // layer ended with a fused residual_rms_norm that already wrote norm_buf
+    // using the next layer's attn_norm weights, skip the redundant attn_norm
+    // dispatch + barrier at the start of this layer.
+    var prev_fused_attn_norm: bool = false;
+
+    for (start_layer..cfg.n_layers) |layer_idx| {
         const layer: u32 = @intCast(layer_idx);
         const lt = engine.layer_tensors[layer_idx];
         const is_full_attn = ((layer + 1) % full_attn_interval == 0);
-        const use_gpu_routed_moe = is_moe and canUseGpuRoutedBatchedMoe(engine, lt);
+        const use_standard_gpu_routed_moe = is_moe and canUseGpuRoutedBatchedMoe(engine, lt);
+        const use_gpt_oss_gpu_routed_moe = is_moe and !use_standard_gpu_routed_moe and canUseGpuRoutedGptOssMoe(engine, lt, layer_idx, hidden_dim, inter_dim);
+        const use_gpu_routed_moe = use_standard_gpu_routed_moe or use_gpt_oss_gpu_routed_moe;
+        const skip_pre_ffn_router = is_moe and !use_gpu_routed_moe and hasExplicitGemmaMoeTensors(cfg, lt);
         const layer_output_scale = engine.layer_output_scales[layer_idx];
+        // Set true when the per-layer `layer_output_scale` is folded into the
+        // FFN-side fused `post_norm_residual_rms_norm` kernel below — the
+        // standalone scale_in_place dispatch + barrier at the layer tail can
+        // then be skipped (≈60 dispatches/60 barriers per token on Gemma 31B).
+        var layer_output_scale_fused_into_post_norm: bool = false;
+        const layer_shared_cmd: ?*MetalCommand = if (shared_cmd) |cmd|
+            cmd
+        else if (use_dense_layer_cmd) blk: {
+            if (dense_group_cmd_storage.handle == null) {
+                dense_group_cmd_storage = try beginProfiledCommand(engine, profile);
+            }
+            break :blk &dense_group_cmd_storage;
+        } else null;
 
         if (is_full_attn) {
             if (profile) |p| p.full_attn_layers += 1;
             const attn = try resolveLayerAttentionParams(cfg, lt, hidden_dim, engine.kv_cache_q8);
             var local_cmd_storage: MetalCommand = undefined;
             var using_local_cmd = false;
-            var cmd = try acquireLayerCommand(engine, shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
+            var cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
             const layer_record_start = profileStart(profile != null);
-            dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
-            profileBarrier(cmd, profile, .full_attn); // norm_buf visible before attn prep reads it
+            var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
+            defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
+            const skip_final_prompt_tail = using_external_shared_cmd and
+                !emit_logits and
+                layer_idx + 1 == layer_count and
+                cfg.architecture == .qwen2_moe and
+                cfg.ssm_d_inner != 0;
+            const fuse_final_tail_attn_norm =
+                skip_final_prompt_tail and
+                !prev_fused_attn_norm and
+                canUseQwen36FinalTailKvFusedNorm(engine, lt, attn, hidden_dim);
+            if (prev_fused_attn_norm) {
+                // Previous layer's residual_rms_norm already wrote norm_buf using
+                // attn_norm_bufs[layer_idx]; its trailing barrier (or the implicit
+                // cross-command-buffer ordering at chunk boundaries) makes it
+                // visible before the QKV dispatches read norm_buf.
+                prev_fused_attn_norm = false;
+            } else if (!fuse_final_tail_attn_norm) {
+                dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
+                profileBarrier(cmd, profile, .full_attn); // norm_buf visible before attn prep reads it
+            }
+            if (skip_final_prompt_tail) {
+                // Non-terminal prompt tokens only need the final layer's K/V
+                // state for future tokens. Adapt llama.cpp's Metal graph
+                // materialization discipline (`ggml_metal_graph_compute`
+                // encodes only requested graph outputs): skip Q/gate and
+                // flash/output/MoE materialization for this prompt token.
+                try dispatchFullAttnKvCacheOnlyOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim, fuse_final_tail_attn_norm);
+                // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                // this tail write has no immediate in-encoder consumer. The
+                // later layer-local flash-attention read is ordered by the next
+                // real barrier on that path, or by command-buffer ordering
+                // across the early/tail prompt split.
+                if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
+                releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
+                engine.position += 1;
+                return;
+            }
             const apply_attn_gate = try dispatchFullAttnPrepOnCmd(engine, cmd, profile, layer_idx, lt, attn, hidden_dim);
-            profileBarrier(cmd, profile, .full_attn); // KV cache + q_buf visible before flash attn
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{ &engine.q_buf, &engine.kv_k_cache[layer_idx], &engine.kv_v_cache[layer_idx] }); // KV cache + q_buf visible before flash attn
             dispatchFlashAttnOnCmd(
                 engine,
                 cmd,
@@ -5536,27 +15299,37 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 attn.kv_cache_head_stride_bytes,
                 attn.kv_cache_bytes_per_token,
             );
+            if (profile) |p| p.full_attn_flash_calls += 1;
             if (apply_attn_gate) {
-                profileBarrier(cmd, profile, .full_attn); // attn_out_buf visible before sigmoid_mul
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before sigmoid_mul
                 dispatchSigmoidMulOnCmd(engine, cmd, &engine.gate_buf, &engine.attn_out_buf, attn.q_dim);
             }
-            profileBarrier(cmd, profile, .full_attn); // attn_out_buf visible before output DMMV
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.attn_out_buf}); // attn_out_buf visible before output DMMV
             const o_tensor = lt.attn_output orelse return error.MissingTensor;
-            dispatchDmmvOnCmd(engine, cmd, o_tensor, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
-            profileBarrier(cmd, profile, .full_attn);
+            const o_weight_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+                (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &o_tensor.gpu_buffer)
+            else
+                &o_tensor.gpu_buffer;
+            const o_weight_offset: u32 = if (o_weight_buf == &o_tensor.gpu_buffer) tensorPageOffset(engine.model, o_tensor) else 0;
+            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, o_tensor, o_weight_buf, o_weight_offset, &engine.attn_out_buf, &engine.down_buf, hidden_dim, attn.q_dim, 0);
+            profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             // Apply O projection bias if present (gpt-oss)
             if (lt.attn_output_bias) |b| {
-                commitAndWaitProfiled(cmd, profile);
-                addBiasFromTensor(engine, @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?)), b, hidden_dim);
-                local_cmd_storage = try beginProfiledCommand(engine, profile);
-                cmd = &local_cmd_storage;
-            }
-            if (engine.post_attn_norm_present[layer_idx]) {
-                dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_attn_norm_bufs[layer_idx], hidden_dim, 1);
-                profileBarrier(cmd, profile, .full_attn);
+                dispatchAddBiasOnCmd(engine, cmd, &engine.down_buf, b, hidden_dim);
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
             }
             const should_debug_attn_compare = engine.debug_validation_enabled and using_local_cmd and
                 shouldDebugAttentionValidation(cfg, engine.position, layer_idx);
+            // Three-way fusion on the attn-side: post_attn_norm + residual_add +
+            // ffn_norm collapses two dispatches and one barrier into one. Reuses
+            // the post_norm_residual_rms_norm.metal kernel introduced for the
+            // FFN-side fusion (cycle 44). Saves ≈60 dispatches and ≈60 barriers
+            // per token on Gemma 31B's 60 dense full-attn layers.
+            const can_fuse_post_attn_norm = engine.post_attn_norm_present[layer_idx] and !should_debug_attn_compare;
+            if (engine.post_attn_norm_present[layer_idx] and !can_fuse_post_attn_norm) {
+                dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_attn_norm_bufs[layer_idx], hidden_dim, 1);
+                profileBarrierBuffers(cmd, profile, .full_attn, &.{&engine.down_buf});
+            }
             if (should_debug_attn_compare) {
                 commitAndWaitProfiled(cmd, profile);
                 const debug_start = profileStart(profile != null);
@@ -5565,30 +15338,162 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 local_cmd_storage = try beginProfiledCommand(engine, profile);
                 cmd = &local_cmd_storage;
             }
-            // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
-            // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
-            dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
-            if (!is_moe) {
-                // dense FFN: norm_buf is ready (no barrier needed between fused dispatch and FFN)
+            var residual_router_output_ready = false;
+            if (can_fuse_post_attn_norm) {
+                dispatchPostNormResidualRmsNormOnCmd(
+                    engine,
+                    cmd,
+                    &engine.hidden_buf,
+                    &engine.down_buf,
+                    &engine.post_attn_norm_bufs[layer_idx],
+                    &engine.norm_buf,
+                    &engine.ffn_norm_bufs[layer_idx],
+                    hidden_dim,
+                    1.0,
+                );
+            } else if (is_moe and !skip_pre_ffn_router and use_standard_gpu_routed_moe) {
+                const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+                if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, 0)) {
+                    const router_ref = routerWeightRef(engine, layer_idx, router_t);
+                    // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                    // routed matvec shape at the attention MoE boundary too:
+                    // hidden += attn_out, materialize the exact ffn_norm row,
+                    // and produce compact top-k ids/weights in one dispatch.
+                    dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+                        engine,
+                        cmd,
+                        &engine.hidden_buf,
+                        &engine.down_buf,
+                        &engine.norm_buf,
+                        &engine.ffn_norm_bufs[layer_idx],
+                        router_t,
+                        router_ref.buffer,
+                        router_ref.offset,
+                        &engine.router_output_buf,
+                        hidden_dim,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        1.0,
+                        0,
+                    );
+                    residual_router_output_ready = true;
+                } else if (allow_prefill_f32_router_fusion and canUseQwenResidualRmsNormRouterF32Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used)) {
+                    // Same boundary fusion for Qwen3.6's F32 routers: keep the
+                    // normalized row for MoE inputs and produce compact top-k
+                    // routing without a separate router dispatch.
+                    dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+                        engine,
+                        cmd,
+                        &engine.hidden_buf,
+                        &engine.down_buf,
+                        &engine.norm_buf,
+                        &engine.ffn_norm_bufs[layer_idx],
+                        router_t,
+                        &engine.router_output_buf,
+                        hidden_dim,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        1.0,
+                        0,
+                    );
+                    residual_router_output_ready = true;
+                } else {
+                    dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
+                }
+            } else {
+                // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
+                // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
+                dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
             }
-            if (is_moe) {
-                profileBarrier(cmd, profile, .router); // norm_buf visible before router DMMV
+            if (!is_moe and layer_shared_cmd != null) {
+                profileBarrier(cmd, profile, .dense_ffn);
+            }
+            if (is_moe and !skip_pre_ffn_router) {
+                if (!residual_router_output_ready) {
+                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        &engine.norm_buf;
+                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
+                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
-                        dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, &engine.unit_rms_norm_weights, hidden_dim, 1);
-                        profileBarrier(cmd, profile, .router);
+                        const gate_scale = lt.ffn_gate_inp_scale orelse return error.MissingTensor;
+                        dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, gate_scale, hidden_dim, 1);
+                        profileBarrierBuffers(cmd, profile, .router, &.{&engine.residual_buf});
                         break :blk &engine.residual_buf;
                     }
                     break :blk &engine.norm_buf;
                 };
-                dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
-                profileBarrier(cmd, profile, .router); // router_logits_buf visible before MoE
+                const use_fused_gptoss_router = blk: {
+                    if (!use_gpt_oss_gpu_routed_moe) break :blk false;
+                    const router_bias = lt.ffn_gate_inp_bias orelse break :blk false;
+                    break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                };
+                const use_fused_q8_router =
+                    !residual_router_output_ready and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const use_fused_f32_router =
+                    allow_prefill_f32_router_fusion and
+                    !residual_router_output_ready and
+                    !use_fused_q8_router and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterF32TopkBatched(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const router_ref = routerWeightRef(engine, layer_idx, router_t);
+                if (use_fused_gptoss_router) {
+                    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+                    dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else if (residual_router_output_ready) {
+                    // Fused residual+router dispatch already wrote router_output_buf.
+                } else if (use_fused_q8_router) {
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 0);
+                } else if (use_fused_f32_router) {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // and vLLM top-k finalization: collapse Qwen's F32 router
+                    // matvec + top-k into one command for the token-major path.
+                    dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, 0);
+                } else {
+                    dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
+                }
+                {
+                    var router_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_barrier_count: usize = 1;
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
+                        &engine.router_output_buf
+                    else
+                        &engine.router_logits_buf;
+                    if (residual_router_output_ready) {
+                        router_barrier_bufs[router_barrier_count] = &engine.norm_buf;
+                        router_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
+                }
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
-                    try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
+                        commitAndWaitProfiled(cmd, profile);
+                        qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                        local_cmd_storage = try beginProfiledCommand(engine, profile);
+                        cmd = &local_cmd_storage;
+                    }
+                    if (use_standard_gpu_routed_moe) {
+                        const fold_moe_layer_scale = layer_output_scale != 1.0 and
+                            canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
+                        const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const next_attn_norm = if (layer_output_scale == 1.0 or fold_moe_layer_scale)
+                            qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
+                        else
+                            null;
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router or use_fused_f32_router, &engine.norm_buf, 0, next_attn_norm, moe_hidden_scale);
+                        if (wrote_next_norm) prev_fused_attn_norm = true;
+                        if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
+                    } else {
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
+                    }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
                     p.layer_record_ns += profileElapsedNs(layer_record_start);
@@ -5597,13 +15502,20 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
             if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (qwen_moe_validation_ref) |*validation| {
+                const validation_start = profileStart(profile != null);
+                try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+            }
         } else {
             if (profile) |p| p.ssm_layers += 1;
             // ===== SSM: fused batch 1 + recurrent body + batch 2 =====
             var local_cmd_storage: MetalCommand = undefined;
             var using_local_cmd = false;
-            var cmd = try acquireLayerCommand(engine, shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
+            var cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
             const layer_record_start = profileStart(profile != null);
+            var qwen_moe_validation_ref: ?QwenPrefillMoeValidationRef = null;
+            defer if (qwen_moe_validation_ref) |*validation| validation.deinit(engine.allocator);
             const wqkv_t = lt.attn_qkv orelse return error.MissingTensor;
             const z_t = lt.attn_gate orelse return error.MissingTensor;
             const alpha_t = lt.ssm_alpha orelse return error.MissingTensor;
@@ -5619,171 +15531,514 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
             const wqkv_offset: u32 = if (wqkv_buf == &wqkv_t.gpu_buffer) tensorPageOffset(engine.model, wqkv_t) else 0;
             const z_offset: u32 = if (z_buf == &z_t.gpu_buffer) tensorPageOffset(engine.model, z_t) else 0;
 
-            // Fused RMSNorm + DMMV path: all consumers compute norm inline from L1-cached
-            // hidden state, eliminating the separate RMSNorm dispatch and barrier.
-            const use_fused_norm = false;
+            if (shouldCaptureQwenRoutePackedLayerInput(engine, layer_idx, using_local_cmd)) {
+                try captureQwenRoutePackedLayerInput(engine, hidden_dim);
+            }
 
-            if (use_fused_norm) {
-                dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
-                dispatchFusedNormQ8DmmvOnCmd(engine, cmd, alpha_t, &alpha_t.gpu_buffer, tensorPageOffset(engine.model, alpha_t), &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.router_logits_buf, dt_rank, hidden_dim);
-                dispatchFusedNormQ8DmmvOnCmd(engine, cmd, beta_t, &beta_t.gpu_buffer, tensorPageOffset(engine.model, beta_t), &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.down_buf, dt_rank, hidden_dim);
-            } else {
-                // Fallback: separate RMSNorm + barrier + DMMVs
-                dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
-                profileBarrier(cmd, profile, .ssm);
-                if (false and canUseDualQ8Dmmv(engine, wqkv_t, z_t, conv_channels, d_inner, hidden_dim)) {
-                    dispatchDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.norm_buf, &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+            const use_prefill_branch_norm = shouldUseQwenSsmPrefillBranchNormChunk(engine, layer_idx);
+            const use_direct_prefill_branch_norm =
+                use_prefill_branch_norm and
+                !engine.debug_validation_enabled and
+                !engine.qwen_prefill_validation_enabled;
+            var ffn_norm_input_buf: *const MetalBuffer = &engine.norm_buf;
+            var ffn_norm_input_byte_offset: u32 = 0;
+            var ssm_residual_buf: *const MetalBuffer = &engine.down_buf;
+            var ssm_residual_offset: u32 = 0;
+            if (use_prefill_branch_norm) {
+                // `prepareQwenSsmPrefillProjectionChunk` already materialized
+                // hidden += layer0_ssm_out and the FFN norm for this token.
+                // In production, consume the precomputed norm row directly through
+                // input offsets, matching llama.cpp/vLLM's avoid-materializing
+                // discipline for intermediate MoE inputs. Validation/debug keeps
+                // the older single-token buffer so CPU-side comparators see the
+                // same state as before.
+                if (use_direct_prefill_branch_norm) {
+                    ffn_norm_input_buf = &engine.qwen_ssm_prefill_proj_norm_buf;
+                    ffn_norm_input_byte_offset = @intCast(engine.position * hidden_dim * @sizeOf(f32));
                 } else {
-                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
-                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
+                    dispatchCopyF32OffsetOnCmd(engine, cmd, &engine.qwen_ssm_prefill_proj_norm_buf, &engine.norm_buf, hidden_dim, engine.position * hidden_dim, 0);
                 }
-                dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
-                dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
-            }
-            profileBarrier(cmd, profile, .ssm);
-
-            // Conv1d: attn_out_buf → swiglu_buf
-            {
-                dispatchSsmConv1dWithPipe(
-                    cmd,
-                    &engine.ssm_conv1d_pipe,
-                    &engine.ssm_conv_kernel_bufs.?[layer_idx],
-                    &engine.ssm_conv_state_bufs.?[layer_idx],
-                    &engine.attn_out_buf,
-                    &engine.swiglu_buf,
-                    conv_channels,
-                    d_conv,
-                    false,
-                );
-            }
-            profileBarrier(cmd, profile, .ssm);
-
-            // Delta-net: swiglu_buf → attn_out_buf
-            {
-                const push = SsmDeltaNetPush{
-                    .d_inner = d_inner,
-                    .dt_rank = dt_rank,
-                    .head_v_dim = head_v_dim,
-                    .d_state = d_state,
-                    .n_group = n_group,
-                    .ssm_a_is_f16 = 0,
-                    .dt_bias_is_f16 = 0,
-                    .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
-                    .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+            } else if (shouldUseQwenSsmPrefillBranchChunk(engine, layer_idx)) {
+                // Adapt llama.cpp's `ggml_metal_op_concurrency_check` discipline:
+                // the layer-0 precompute command buffer already materialized this
+                // branch output, so read the token slice directly instead of
+                // inserting a copy dispatch plus in-encoder memory barrier.
+                ssm_residual_buf = &engine.qwen_ssm_prefill_proj_norm_buf;
+                ssm_residual_offset = @intCast(engine.position * hidden_dim);
+            } else {
+                const use_prefill_projection_chunk = shouldUseQwenSsmPrefillProjectionChunk(engine, layer_idx);
+                var use_direct_prefill_projection_chunk = false;
+                const TailProjectionMode = enum {
+                    none,
+                    z_alpha_beta_from_norm,
+                    alpha_beta_fused_norm,
                 };
-                const dn_bufs = [_]*const MetalBuffer{
-                    &engine.swiglu_buf,                    &engine.router_logits_buf,
-                    &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
-                    &engine.down_buf,                      &engine.ssm_state_bufs.?[layer_idx],
-                    &engine.attn_out_buf,
-                };
-                // SPIRV-Cross Metal shader loops over all head_v_dim rows internally
-                // (stride-64), unlike the GLSL original which uses gl_WorkGroupID.y
-                // for row tiling. grid.y must be 1 to avoid duplicate workgroups
-                // racing on the same SSM state memory. (All unit tests already use y=1.)
-                cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
-            }
-            profileBarrier(cmd, profile, .ssm);
-            const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
-            if (should_debug_ssm_compare) {
-                commitAndWaitProfiled(cmd, profile);
-                const debug_start = profileStart(profile != null);
-                try debugCompareSsmPreGatedNorm(
+                var tail_projection_mode: TailProjectionMode = .none;
+                if (use_prefill_projection_chunk) {
+                    const alpha_batched = canBatchQwenSsmProjectionTail(engine, alpha_t, dt_rank, hidden_dim);
+                    const beta_batched = canBatchQwenSsmProjectionTail(engine, beta_t, dt_rank, hidden_dim);
+                    use_direct_prefill_projection_chunk = alpha_batched and beta_batched;
+                    if (!use_direct_prefill_projection_chunk) {
+                        dispatchQwenSsmPrefillProjectionChunkCopies(engine, cmd, conv_channels, d_inner, dt_rank, hidden_dim);
+                        profileBarrier(cmd, profile, .ssm);
+                        if (!alpha_batched) {
+                            dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
+                        }
+                        if (!beta_batched) {
+                            dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        }
+                    }
+                } else if (prev_fused_attn_norm) {
+                    // The previous MoE finalizer materialized norm_buf with
+                    // this layer's attn_norm weights. Reuse it here, mirroring
+                    // llama.cpp's graph-tail fusion, and skip the standalone
+                    // RMSNorm dispatch/barrier before the SSM projections.
+                    prev_fused_attn_norm = false;
+                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
+                    tail_projection_mode = .z_alpha_beta_from_norm;
+                } else if (canUseQwenSsmFusedNormProjections(
                     engine,
-                    layer,
-                    layer_idx,
                     wqkv_t,
                     z_t,
                     alpha_t,
                     beta_t,
-                    hidden_dim,
                     conv_channels,
                     d_inner,
-                    d_conv,
-                    d_state,
-                    n_group,
                     dt_rank,
-                    head_v_dim,
-                );
-                if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
-                local_cmd_storage = try beginProfiledCommand(engine, profile);
-                cmd = &local_cmd_storage;
-            }
-
-            // Gated norm: attn_out_buf → swiglu_buf
-            {
-                dispatchSsmGatedNormWithPipe(
-                    cmd,
-                    &engine.ssm_gated_norm_pipe,
-                    &engine.attn_out_buf,
-                    &engine.ssm_norm_weight_bufs.?[layer_idx],
-                    &engine.gate_buf,
-                    &engine.swiglu_buf,
-                    d_inner,
-                    dt_rank,
-                    head_v_dim,
-                    d_state,
-                    engine.ssm_norm_per_head.?[layer_idx],
-                );
-            }
-            profileBarrier(cmd, profile, .ssm);
-
-            // SSM out DMMV: swiglu_buf → down_buf
-            const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
-            const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
-                (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
-            else
-                &ssm_out_t.gpu_buffer;
-            const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
-            dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, &engine.swiglu_buf, &engine.down_buf, hidden_dim, d_inner, 0);
-            profileBarrier(cmd, profile, .ssm);
-            if (should_debug_ssm_compare) {
-                commitAndWaitProfiled(cmd, profile);
-                const debug_start = profileStart(profile != null);
-                try debugCompareSsmPostProjection(
-                    engine,
-                    layer,
-                    layer_idx,
-                    wqkv_t,
-                    z_t,
-                    alpha_t,
-                    beta_t,
-                    ssm_out_t,
                     hidden_dim,
-                    conv_channels,
-                    d_inner,
-                    d_conv,
-                    d_state,
-                    n_group,
-                    dt_rank,
-                    head_v_dim,
-                );
-                if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
-                local_cmd_storage = try beginProfiledCommand(engine, profile);
-                cmd = &local_cmd_storage;
+                )) {
+                    // Fused RMSNorm + DMMV path: all SSM pre-projection consumers
+                    // compute norm inline from L1-cached hidden state, eliminating the
+                    // separate RMSNorm dispatch/barrier while preserving token-serial
+                    // conv/delta recurrence.
+                    dispatchFusedNormDualQ8DmmvOnCmd(engine, cmd, wqkv_t, z_t, wqkv_buf, z_buf, wqkv_offset, z_offset, &engine.hidden_buf, &engine.attn_norm_bufs[layer_idx], &engine.attn_out_buf, &engine.gate_buf, conv_channels, d_inner, hidden_dim);
+                    tail_projection_mode = .alpha_beta_fused_norm;
+                } else {
+                    // Fallback: separate RMSNorm + barrier + DMMVs
+                    dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.attn_norm_bufs[layer_idx], hidden_dim, 1);
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.norm_buf});
+                    dispatchDmmvOnCmdWithWeightBuf(engine, cmd, wqkv_t, wqkv_buf, wqkv_offset, &engine.norm_buf, &engine.attn_out_buf, conv_channels, hidden_dim, 0);
+                    tail_projection_mode = .z_alpha_beta_from_norm;
+                }
+                if (!use_direct_prefill_projection_chunk) {
+                    switch (tail_projection_mode) {
+                        .none => profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.attn_out_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        }),
+                        else => profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf}),
+                    }
+                }
+
+                // Conv1d: attn_out_buf → swiglu_buf
+                {
+                    const conv_input_buf = if (use_direct_prefill_projection_chunk)
+                        &engine.qwen_ssm_prefill_proj_qkv_buf
+                    else
+                        &engine.attn_out_buf;
+                    const conv_input_offset = if (use_direct_prefill_projection_chunk)
+                        engine.position * conv_channels
+                    else
+                        0;
+                    const conv_pipe = if (canUseQwenSsmConvD4FastPath(engine, conv_channels, d_conv, false))
+                        &engine.ssm_conv1d_qwen_d4_pipe
+                    else
+                        &engine.ssm_conv1d_pipe;
+                    dispatchSsmConv1dOffsetWithPipe(
+                        cmd,
+                        conv_pipe,
+                        &engine.ssm_conv_kernel_bufs.?[layer_idx],
+                        &engine.ssm_conv_state_bufs.?[layer_idx],
+                        conv_input_buf,
+                        &engine.swiglu_buf,
+                        conv_channels,
+                        d_conv,
+                        false,
+                        conv_input_offset,
+                    );
+                    if (profile) |p| p.ssm_conv_calls += 1;
+                }
+                switch (tail_projection_mode) {
+                    .none => profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf}),
+                    .z_alpha_beta_from_norm => {
+                        // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`:
+                        // conv only depends on qkv, so record the z/alpha/beta
+                        // tail after conv and let the concurrent encoder overlap
+                        // it with the recurrent conv dispatch.
+                        dispatchDmmvOnCmdWithWeightBuf(engine, cmd, z_t, z_buf, z_offset, &engine.norm_buf, &engine.gate_buf, d_inner, hidden_dim, 0);
+                        if (canUseQwenSsmF32AlphaBetaDual(engine, alpha_t, beta_t, dt_rank, hidden_dim)) {
+                            dispatchQwenSsmF32AlphaBetaDualOnCmd(engine, cmd, alpha_t, beta_t, &engine.norm_buf, &engine.router_logits_buf, &engine.down_buf, dt_rank, hidden_dim, 1, 0);
+                        } else {
+                            dispatchDmmvOnCmd(engine, cmd, alpha_t, &engine.norm_buf, &engine.router_logits_buf, dt_rank, hidden_dim, 0);
+                            dispatchDmmvOnCmd(engine, cmd, beta_t, &engine.norm_buf, &engine.down_buf, dt_rank, hidden_dim, 0);
+                        }
+                        profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.swiglu_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        });
+                    },
+                    .alpha_beta_fused_norm => {
+                        dispatchFusedNormDualQ8DmmvOnCmd(
+                            engine,
+                            cmd,
+                            alpha_t,
+                            beta_t,
+                            &alpha_t.gpu_buffer,
+                            &beta_t.gpu_buffer,
+                            tensorPageOffset(engine.model, alpha_t),
+                            tensorPageOffset(engine.model, beta_t),
+                            &engine.hidden_buf,
+                            &engine.attn_norm_bufs[layer_idx],
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                            dt_rank,
+                            dt_rank,
+                            hidden_dim,
+                        );
+                        profileBarrierBuffers(cmd, profile, .ssm, &.{
+                            &engine.swiglu_buf,
+                            &engine.gate_buf,
+                            &engine.router_logits_buf,
+                            &engine.down_buf,
+                        });
+                    },
+                }
+                if (shouldValidateQwenSsmProjection(engine, layer_idx, using_local_cmd, wqkv_t, z_t, alpha_t, beta_t)) {
+                    commitAndWaitProfiled(cmd, profile);
+                    const validation_start = profileStart(profile != null);
+                    try validateQwenSsmProjectionBatchKernel(engine, profile, layer_idx, wqkv_t, z_t, alpha_t, beta_t, conv_channels, d_inner, dt_rank, hidden_dim);
+                    if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+                    local_cmd_storage = try beginProfiledCommand(engine, profile);
+                    cmd = &local_cmd_storage;
+                }
+
+                const should_debug_ssm_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6 and using_local_cmd;
+                const alpha_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_alpha_buf
+                else
+                    &engine.router_logits_buf;
+                const beta_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_beta_buf
+                else
+                    &engine.down_buf;
+                const z_gate_buf = if (use_direct_prefill_projection_chunk)
+                    &engine.qwen_ssm_prefill_proj_z_buf
+                else
+                    &engine.gate_buf;
+                const alpha_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0;
+                const beta_offset = if (use_direct_prefill_projection_chunk) engine.position * dt_rank else 0;
+                const z_gate_offset = if (use_direct_prefill_projection_chunk) engine.position * d_inner else 0;
+                const use_fused_delta_gated_norm = fusedSsmDeltaGatedNormEnabled(engine, head_v_dim, d_state) and !should_debug_ssm_compare;
+                if (use_fused_delta_gated_norm) {
+                    const delta_gated_norm_pipe =
+                        if (canUseQwenSsmDeltaGatedNormExact(engine, dt_rank, head_v_dim, d_state, n_group, lt.ssm_dt_bias != null, lt.ssm_a != null))
+                            &engine.ssm_delta_net_gated_norm_qwen_pipe
+                        else
+                            &engine.ssm_delta_net_gated_norm_pipe;
+                    dispatchSsmDeltaNetGatedNormOnCmd(
+                        cmd,
+                        delta_gated_norm_pipe,
+                        &engine.swiglu_buf,
+                        alpha_buf,
+                        &engine.ssm_dt_bias_bufs.?[layer_idx],
+                        &engine.ssm_a_bufs.?[layer_idx],
+                        beta_buf,
+                        &engine.ssm_state_bufs.?[layer_idx],
+                        z_gate_buf,
+                        &engine.ssm_norm_weight_bufs.?[layer_idx],
+                        &engine.attn_out_buf,
+                        d_inner,
+                        dt_rank,
+                        head_v_dim,
+                        d_state,
+                        n_group,
+                        lt.ssm_dt_bias != null,
+                        lt.ssm_a != null,
+                        alpha_offset,
+                        beta_offset,
+                        z_gate_offset,
+                        0,
+                        engine.ssm_norm_per_head.?[layer_idx],
+                    );
+                    if (profile) |p| {
+                        p.ssm_delta_calls += 1;
+                        p.ssm_gated_norm_calls += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf});
+                } else {
+                    // Delta-net: swiglu_buf → attn_out_buf
+                    {
+                        const push = SsmDeltaNetPush{
+                            .d_inner = d_inner,
+                            .dt_rank = dt_rank,
+                            .head_v_dim = head_v_dim,
+                            .d_state = d_state,
+                            .n_group = n_group,
+                            .ssm_a_is_f16 = 0,
+                            .dt_bias_is_f16 = 0,
+                            .has_dt_bias = if (lt.ssm_dt_bias != null) @as(u32, 1) else 0,
+                            .has_ssm_a = if (lt.ssm_a != null) @as(u32, 1) else 0,
+                            .alpha_offset = alpha_offset,
+                            .beta_offset = beta_offset,
+                            .output_offset = 0,
+                        };
+                        const dn_bufs = [_]*const MetalBuffer{
+                            &engine.swiglu_buf,                    alpha_buf,
+                            &engine.ssm_dt_bias_bufs.?[layer_idx], &engine.ssm_a_bufs.?[layer_idx],
+                            beta_buf,                              &engine.ssm_state_bufs.?[layer_idx],
+                            &engine.attn_out_buf,
+                        };
+                        // SPIRV-Cross Metal shader loops over all head_v_dim rows internally
+                        // (stride-64), unlike the GLSL original which uses gl_WorkGroupID.y
+                        // for row tiling. grid.y must be 1 to avoid duplicate workgroups
+                        // racing on the same SSM state memory. (All unit tests already use y=1.)
+                        cmd.dispatchV2(&engine.ssm_delta_net_pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &dn_bufs, &push, @sizeOf(SsmDeltaNetPush), 0);
+                        if (profile) |p| p.ssm_delta_calls += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.attn_out_buf});
+                    if (should_debug_ssm_compare) {
+                        commitAndWaitProfiled(cmd, profile);
+                        const debug_start = profileStart(profile != null);
+                        try debugCompareSsmPreGatedNorm(
+                            engine,
+                            layer,
+                            layer_idx,
+                            wqkv_t,
+                            z_t,
+                            alpha_t,
+                            beta_t,
+                            hidden_dim,
+                            conv_channels,
+                            d_inner,
+                            d_conv,
+                            d_state,
+                            n_group,
+                            dt_rank,
+                            head_v_dim,
+                        );
+                        if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
+                        local_cmd_storage = try beginProfiledCommand(engine, profile);
+                        cmd = &local_cmd_storage;
+                    }
+
+                    // Gated norm: attn_out_buf → swiglu_buf
+                    dispatchSsmGatedNormOffsetWithPipe(
+                        cmd,
+                        &engine.ssm_gated_norm_pipe,
+                        &engine.attn_out_buf,
+                        &engine.ssm_norm_weight_bufs.?[layer_idx],
+                        z_gate_buf,
+                        &engine.swiglu_buf,
+                        d_inner,
+                        dt_rank,
+                        head_v_dim,
+                        d_state,
+                        engine.ssm_norm_per_head.?[layer_idx],
+                        z_gate_offset,
+                    );
+                    if (profile) |p| p.ssm_gated_norm_calls += 1;
+                    profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.swiglu_buf});
+                }
+
+                // SSM out DMMV: gated SSM activation → down_buf
+                const ssm_out_t = lt.ssm_out orelse return error.MissingTensor;
+                const ssm_out_buf: *const MetalBuffer = if (engine.private_ssm_out_bufs) |bufs|
+                    (if (bufs[layer_idx].handle != null) &bufs[layer_idx] else &ssm_out_t.gpu_buffer)
+                else
+                    &ssm_out_t.gpu_buffer;
+                const ssm_out_offset: u32 = if (ssm_out_buf == &ssm_out_t.gpu_buffer) tensorPageOffset(engine.model, ssm_out_t) else 0;
+                const ssm_activation_buf: *const MetalBuffer = if (use_fused_delta_gated_norm) &engine.attn_out_buf else &engine.swiglu_buf;
+                dispatchDmmvOnCmdWithWeightBuf(engine, cmd, ssm_out_t, ssm_out_buf, ssm_out_offset, ssm_activation_buf, &engine.down_buf, hidden_dim, d_inner, 0);
+                profileBarrierBuffers(cmd, profile, .ssm, &.{&engine.down_buf});
+                if (should_debug_ssm_compare) {
+                    commitAndWaitProfiled(cmd, profile);
+                    const debug_start = profileStart(profile != null);
+                    try debugCompareSsmPostProjection(
+                        engine,
+                        layer,
+                        layer_idx,
+                        wqkv_t,
+                        z_t,
+                        alpha_t,
+                        beta_t,
+                        ssm_out_t,
+                        hidden_dim,
+                        conv_channels,
+                        d_inner,
+                        d_conv,
+                        d_state,
+                        n_group,
+                        dt_rank,
+                        head_v_dim,
+                    );
+                    if (profile) |p| p.debug_validation_ns += profileElapsedNs(debug_start);
+                    local_cmd_storage = try beginProfiledCommand(engine, profile);
+                    cmd = &local_cmd_storage;
+                }
             }
 
             // Fused residual-add + RMS norm: hidden += down; norm_buf = normalize(hidden) * weights.
             // Eliminates one barrier vs separate scale_acc + barrier + rms_norm.
-            dispatchResidualRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.down_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0);
-            profileBarrier(cmd, profile, .router);
-            if (is_moe) {
+            var residual_router_output_ready = false;
+            if (!use_prefill_branch_norm) {
+                if (is_moe and
+                    !skip_pre_ffn_router and
+                    use_standard_gpu_routed_moe and
+                    ffn_norm_input_buf == &engine.norm_buf and
+                    ffn_norm_input_byte_offset == 0)
+                {
+                    const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
+                    if (canUseQwenResidualRmsNormRouterQ8Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used, ssm_residual_offset)) {
+                        const router_ref = routerWeightRef(engine, layer_idx, router_t);
+                        // Adapt llama.cpp's single-token Q8 `kernel_mul_mv_id`
+                        // router discipline and vLLM's compact top-k finalize:
+                        // materialize the exact token-major norm row and route
+                        // ids in one dispatch, then feed the unchanged MoE path.
+                        dispatchQwenResidualRmsNormRouterQ8TopkOnCmd(
+                            engine,
+                            cmd,
+                            &engine.hidden_buf,
+                            ssm_residual_buf,
+                            &engine.norm_buf,
+                            &engine.ffn_norm_bufs[layer_idx],
+                            router_t,
+                            router_ref.buffer,
+                            router_ref.offset,
+                            &engine.router_output_buf,
+                            hidden_dim,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            1.0,
+                            ssm_residual_offset,
+                        );
+                        residual_router_output_ready = true;
+                    } else if (allow_prefill_f32_router_fusion and
+                        canUseQwenResidualRmsNormRouterF32Topk(engine, router_t, hidden_dim, cfg.n_experts, cfg.n_experts_used))
+                    {
+                        // Qwen3.6's production router is F32. Fuse the SSM
+                        // residual+FFN norm and F32 top-k routing so the MoE
+                        // path still receives the materialized norm row while
+                        // dropping one dispatch and one router-input barrier.
+                        dispatchQwenResidualRmsNormRouterF32TopkOnCmd(
+                            engine,
+                            cmd,
+                            &engine.hidden_buf,
+                            ssm_residual_buf,
+                            &engine.norm_buf,
+                            &engine.ffn_norm_bufs[layer_idx],
+                            router_t,
+                            &engine.router_output_buf,
+                            hidden_dim,
+                            cfg.n_experts,
+                            cfg.n_experts_used,
+                            1.0,
+                            ssm_residual_offset,
+                        );
+                        residual_router_output_ready = true;
+                    } else {
+                        dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+                    }
+                } else {
+                    dispatchResidualRmsNormOffsetOnCmd(engine, cmd, &engine.hidden_buf, ssm_residual_buf, &engine.norm_buf, &engine.ffn_norm_bufs[layer_idx], hidden_dim, 1.0, ssm_residual_offset);
+                }
+            }
+            if (!is_moe and layer_shared_cmd != null) {
+                profileBarrier(cmd, profile, .dense_ffn);
+            }
+            if (is_moe and !skip_pre_ffn_router) {
+                // The direct branch-norm row was produced by the earlier
+                // precompute command buffer, so queue ordering is the
+                // dependency; there is no current-encoder write to flush.
+                if (!use_direct_prefill_branch_norm and !residual_router_output_ready) {
+                    const router_input_barrier_buf: *const MetalBuffer = if (cfg.architecture == .gemma)
+                        &engine.hidden_buf
+                    else
+                        ffn_norm_input_buf;
+                    profileBarrierBuffers(cmd, profile, .router, &.{router_input_barrier_buf});
+                }
                 const router_t = lt.ffn_gate_inp orelse return error.MissingTensor;
                 const router_in_buf: *const MetalBuffer = blk: {
                     if (cfg.architecture == .gemma) {
-                        dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, &engine.unit_rms_norm_weights, hidden_dim, 1);
-                        profileBarrier(cmd, profile, .router);
+                        const gate_scale = lt.ffn_gate_inp_scale orelse return error.MissingTensor;
+                        dispatchRmsNormOnCmdWithTensorWeights(engine, cmd, &engine.hidden_buf, &engine.residual_buf, gate_scale, hidden_dim, 1);
+                        profileBarrierBuffers(cmd, profile, .router, &.{&engine.residual_buf});
                         break :blk &engine.residual_buf;
                     }
-                    break :blk &engine.norm_buf;
+                    break :blk ffn_norm_input_buf;
                 };
-                dispatchDmmvOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0);
-                profileBarrier(cmd, profile, .router); // router_logits_buf visible before MoE
+                const router_in_byte_offset: u32 = if (cfg.architecture == .gemma) 0 else ffn_norm_input_byte_offset;
+                const use_fused_gptoss_router = blk: {
+                    if (!use_gpt_oss_gpu_routed_moe) break :blk false;
+                    const router_bias = lt.ffn_gate_inp_bias orelse break :blk false;
+                    break :blk canUseRouterF32TopkBias(engine, router_t, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                };
+                const use_fused_q8_router =
+                    !residual_router_output_ready and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterQ8Topk(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                const use_fused_f32_router =
+                    allow_prefill_f32_router_fusion and
+                    !residual_router_output_ready and
+                    !use_fused_q8_router and
+                    use_standard_gpu_routed_moe and
+                    canUseRouterF32TopkBatched(engine, router_t, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1);
+                const router_ref = routerWeightRef(engine, layer_idx, router_t);
+                if (use_fused_gptoss_router) {
+                    const router_bias = lt.ffn_gate_inp_bias orelse return error.MissingTensor;
+                    dispatchRouterF32TopkBiasOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, router_bias, cfg.n_experts, cfg.n_experts_used, hidden_dim);
+                } else if (residual_router_output_ready) {
+                    // Fused residual+router dispatch already wrote router_output_buf.
+                } else if (use_fused_q8_router) {
+                    dispatchRouterQ8TopkOnCmd(engine, cmd, router_t, router_ref.buffer, router_ref.offset, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, router_in_byte_offset);
+                } else if (use_fused_f32_router) {
+                    // Adapt llama.cpp `ggml_metal_op_concurrency_check/reset`
+                    // and vLLM top-k finalization: collapse Qwen's F32 router
+                    // matvec + top-k into one command for the token-major path.
+                    dispatchRouterF32TopkBatchedOnCmd(engine, cmd, router_t, router_in_buf, &engine.router_output_buf, cfg.n_experts, cfg.n_experts_used, hidden_dim, 1, router_in_byte_offset);
+                } else {
+                    dispatchDmmvOnCmdWithInputOffset(engine, cmd, router_t, router_in_buf, &engine.router_logits_buf, cfg.n_experts, hidden_dim, 0, router_in_byte_offset);
+                }
+                {
+                    var router_barrier_bufs: [2]*const MetalBuffer = undefined;
+                    var router_barrier_count: usize = 1;
+                    router_barrier_bufs[0] = if (residual_router_output_ready or use_fused_gptoss_router or use_fused_q8_router or use_fused_f32_router)
+                        &engine.router_output_buf
+                    else
+                        &engine.router_logits_buf;
+                    if (residual_router_output_ready) {
+                        router_barrier_bufs[router_barrier_count] = ffn_norm_input_buf;
+                        router_barrier_count += 1;
+                    }
+                    profileBarrierBuffers(cmd, profile, .router, router_barrier_bufs[0..router_barrier_count]);
+                }
                 if (use_gpu_routed_moe) {
                     if (profile) |p| p.layer_record_ns += profileElapsedNs(layer_record_start);
                     if (profile) |p| p.gpu_routed_moe_layers += 1;
                     const moe_record_start = profileStart(profile != null);
-                    try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                    if (shouldValidateQwenPrefillMoe(engine, layer_idx, use_standard_gpu_routed_moe, using_local_cmd)) {
+                        commitAndWaitProfiled(cmd, profile);
+                        qwen_moe_validation_ref = try prepareQwenPrefillMoeValidation(engine, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim);
+                        local_cmd_storage = try beginProfiledCommand(engine, profile);
+                        cmd = &local_cmd_storage;
+                    }
+                    if (use_standard_gpu_routed_moe) {
+                        const fold_moe_layer_scale = layer_output_scale != 1.0 and
+                            canFoldQwenGpuMoeLayerOutputScale(engine, lt, hidden_dim);
+                        const moe_hidden_scale: f32 = if (fold_moe_layer_scale) layer_output_scale else 1.0;
+                        const next_attn_norm = if (layer_output_scale == 1.0 or fold_moe_layer_scale)
+                            qwenMoeNextAttnNormTarget(engine, layer_idx, layer_count)
+                        else
+                            null;
+                        const wrote_next_norm = try recordGpuRoutedBatchedMoeOnCmd(engine, cmd, profile, layer_idx, lt, hidden_dim, inter_dim, shexp_inter_dim, residual_router_output_ready or use_fused_q8_router or use_fused_f32_router, ffn_norm_input_buf, ffn_norm_input_byte_offset, next_attn_norm, moe_hidden_scale);
+                        if (wrote_next_norm) prev_fused_attn_norm = true;
+                        if (fold_moe_layer_scale) layer_output_scale_fused_into_post_norm = true;
+                    } else {
+                        try recordGpuRoutedGptOssMoeOnCmd(engine, cmd, profile, lt, hidden_dim, inter_dim, use_fused_gptoss_router);
+                    }
                     if (profile) |p| p.gpu_routed_moe_record_ns += profileElapsedNs(moe_record_start);
                 } else if (profile) |p| {
                     p.layer_record_ns += profileElapsedNs(layer_record_start);
@@ -5792,6 +16047,11 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 p.layer_record_ns += profileElapsedNs(layer_record_start);
             }
             if (using_local_cmd) commitAndWaitProfiled(cmd, profile);
+            if (qwen_moe_validation_ref) |*validation| {
+                const validation_start = profileStart(profile != null);
+                try finishQwenPrefillMoeValidation(engine, profile, layer_idx, lt, validation, hidden_dim, inter_dim);
+                if (profile) |p| p.debug_validation_ns += profileElapsedNs(validation_start);
+            }
         }
 
         if (engine.debug_validation_enabled and engine.position == 0) {
@@ -5822,6 +16082,7 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 } else {
                     topKSoftmax(@as([*]const f32, router_ptr)[0..cfg.n_experts], cfg.n_experts_used, expert_ids[0..cfg.n_experts_used], expert_weights[0..cfg.n_experts_used]);
                 }
+                if (profile) |p| p.router_topk_calls += 1;
                 const should_debug_moe_compare = engine.debug_validation_enabled and engine.position == 0 and layer_idx == 6;
                 const hidden_before_snapshot: ?[]f32 = if (should_debug_moe_compare) blk: {
                     const snap = try engine.allocator.alloc(f32, hidden_dim);
@@ -5853,10 +16114,12 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                 const up_exps = gate_up_layout.up_tensor;
                 const down_exps = lt.ffn_down_exps orelse return error.MissingTensor;
                 const gate_quant = gate_exps.info.type_;
+                const up_quant = up_exps.info.type_;
                 const down_quant = down_exps.info.type_;
                 const expert_gate_bytes = gate_up_layout.gate_expert_stride;
                 const expert_down_bytes = expertSliceBytes(down_quant, hidden_dim, inter_dim);
                 const use_batched_q4k_moe = canUseBatchedQ4kMoe(engine, gate_quant, down_quant) and !usesGeglu(cfg) and lt.ffn_gate_up_exps == null;
+                const use_batched_mxfp4_moe = canUseBatchedMxfp4GptOssMoe(engine, lt, gate_quant, up_quant, down_quant, hidden_dim, inter_dim);
 
                 {
                     const expert_ids_ptr: [*]u32 = @ptrCast(@alignCast(engine.expert_ids_buf.cpu_ptr.?));
@@ -5878,8 +16141,8 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
 
                     if (use_batched_q4k_moe) {
                         // Phase 1: Batched gate+up expert projections (+ shared expert)
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, up_exps, &engine.norm_buf, &engine.expert_up_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0, 0);
                         if (has_shexp) {
                             dispatchDmmvOnCmd(engine, &cmd, gate_shexp.?, &engine.norm_buf, &engine.gate_buf, shexp_inter_dim, hidden_dim, 0);
                             dispatchDmmvOnCmd(engine, &cmd, up_shexp.?, &engine.norm_buf, &engine.up_buf, shexp_inter_dim, hidden_dim, 0);
@@ -5900,7 +16163,7 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                         profileBarrier(&cmd, profile, .fallback_moe);
 
                         // Phase 3: Batched down expert projection (+ shared expert)
-                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
+                        dispatchDmmvMoeQ4kOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0, 0);
                         if (down_shexp != null) {
                             dispatchDmmvOnCmd(engine, &cmd, down_shexp.?, &engine.swiglu_buf, &engine.down_buf, hidden_dim, shexp_inter_dim, 0);
                         }
@@ -5926,6 +16189,55 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
                             &engine.down_buf,
                         };
                         cmd.dispatchV2(&engine.moe_acc_batched_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &moe_bufs, &moe_push, @sizeOf(MoeAccBatchedPush), 3);
+                        profileBarrier(&cmd, profile, .fallback_moe);
+                    } else if (use_batched_mxfp4_moe) {
+                        // GPT-OSS MXFP4 experts: keep all selected experts in
+                        // contiguous batched buffers and apply OAI biases on GPU.
+                        try dispatchDmmvMoeOnCmd(engine, &cmd, gate_exps, &engine.norm_buf, &engine.expert_gate_batch_buf, &engine.expert_ids_buf, inter_dim, hidden_dim, expert_gate_bytes, 0, 0);
+                        try dispatchDmmvMoeOnCmd(
+                            engine,
+                            &cmd,
+                            up_exps,
+                            &engine.norm_buf,
+                            &engine.expert_up_batch_buf,
+                            &engine.expert_ids_buf,
+                            inter_dim,
+                            hidden_dim,
+                            gate_up_layout.up_expert_stride,
+                            0,
+                            0,
+                        );
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        dispatchOaiSwiGLUBatchedBiasOnCmd(
+                            engine,
+                            &cmd,
+                            &engine.expert_gate_batch_buf,
+                            &engine.expert_swiglu_batch_buf,
+                            &engine.expert_up_batch_buf,
+                            &engine.expert_ids_buf,
+                            lt.ffn_gate_exps_bias.?,
+                            lt.ffn_up_exps_bias.?,
+                            inter_dim,
+                        );
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        try dispatchDmmvMoeOnCmd(engine, &cmd, down_exps, &engine.expert_swiglu_batch_buf, &engine.expert_down_batch_buf, &engine.expert_ids_buf, hidden_dim, inter_dim, expert_down_bytes, inter_dim, 0);
+                        profileBarrier(&cmd, profile, .fallback_moe);
+
+                        dispatchMoeAccBatchedBiasOnCmd(
+                            engine,
+                            &cmd,
+                            moe_accum_buf,
+                            &engine.expert_down_batch_buf,
+                            &engine.down_buf,
+                            &engine.expert_ids_buf,
+                            lt.ffn_down_exps_bias.?,
+                            hidden_dim,
+                            hidden_dim,
+                            expert_weights[0..cfg.n_experts_used],
+                            0.0,
+                        );
                         profileBarrier(&cmd, profile, .fallback_moe);
                     } else {
                         // Phase 1: All expert gate+up DMMVs in parallel (+ shared expert)
@@ -6096,36 +16408,120 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
 
             {
                 const dense_record_start = profileStart(profile != null);
-                var cmd = try beginProfiledCommand(engine, profile);
-                dispatchDmmvOnCmd(engine, &cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
-                dispatchDmmvOnCmd(engine, &cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
-                profileBarrier(&cmd, profile, .dense_ffn);
-
-                dispatchFfnActivationOnCmd(engine, &cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
-                profileBarrier(&cmd, profile, .dense_ffn);
-
-                dispatchDmmvOnCmd(engine, &cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
-                profileBarrier(&cmd, profile, .dense_ffn);
-                if (engine.post_ffn_norm_present[layer_idx]) {
-                    dispatchRmsNormOnCmd(engine, &cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
-                    profileBarrier(&cmd, profile, .dense_ffn);
+                var local_cmd_storage: MetalCommand = undefined;
+                var using_local_cmd = false;
+                const cmd = try acquireLayerCommand(engine, layer_shared_cmd, &local_cmd_storage, &using_local_cmd, profile);
+                const fused_gate_up_geglu = canUseDenseQ4KGateUpGeGLU(engine, gate_t, up_t, inter_dim, hidden_dim);
+                const fused_gate_up_swiglu = !fused_gate_up_geglu and
+                    canUseDenseQ4KGateUpSwiGLU(engine, gate_t, up_t, inter_dim, hidden_dim);
+                const fused_gate_up = fused_gate_up_geglu or fused_gate_up_swiglu;
+                if (fused_gate_up_geglu) {
+                    dispatchDenseQ4KGateUpGeGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+                } else if (fused_gate_up_swiglu) {
+                    dispatchDenseQ4KGateUpSwiGLUOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.swiglu_buf, inter_dim, hidden_dim);
+                } else if (canUseDenseQ4KGateUpDual(engine, gate_t, up_t, inter_dim, hidden_dim)) {
+                    dispatchDenseQ4KGateUpDualOnCmd(engine, cmd, gate_t, up_t, &engine.norm_buf, &engine.gate_buf, &engine.up_buf, inter_dim, hidden_dim);
+                } else {
+                    dispatchDmmvOnCmd(engine, cmd, gate_t, &engine.norm_buf, &engine.gate_buf, inter_dim, hidden_dim, 0);
+                    dispatchDmmvOnCmd(engine, cmd, up_t, &engine.norm_buf, &engine.up_buf, inter_dim, hidden_dim, 0);
                 }
+                if (!fused_gate_up) {
+                    profileBarrier(cmd, profile, .dense_ffn);
+                    dispatchFfnActivationOnCmd(engine, cmd, &engine.gate_buf, &engine.swiglu_buf, &engine.up_buf, inter_dim);
+                }
+                profileBarrier(cmd, profile, .dense_ffn);
 
+                dispatchDmmvOnCmd(engine, cmd, down_t, &engine.swiglu_buf, &engine.down_buf, hidden_dim, inter_dim, 0);
+                profileBarrier(cmd, profile, .dense_ffn);
+
+                const next_layer_idx_u = layer_idx + 1;
+                const layer_output_scale_folded_pre = skip_pre_ffn_router and !engine.debug_validation_enabled;
+                // The fused kernel now folds an arbitrary `hidden_scale` into
+                // its in-place hidden write, so a non-unit `layer_output_scale`
+                // no longer disqualifies the four-way fusion. The scale_in_place
+                // dispatch + barrier at the layer tail is skipped when this
+                // path fires (see `layer_output_scale_fused_into_post_norm`).
+                const can_fold_layer_scale_here = layer_output_scale != 1.0 and !layer_output_scale_folded_pre;
+                const can_fuse_next_attn_norm = layer_shared_cmd != null and
+                    use_dense_layer_cmd and
+                    next_layer_idx_u < layer_count and
+                    engine.layer_output_scales[next_layer_idx_u] != 0.0 and
+                    ((@as(u32, @intCast(next_layer_idx_u)) + 1) % full_attn_interval == 0);
+
+                // Three-way fusion: post_ffn_norm + residual_add + next-attn-norm
+                // collapses two dispatches and two barriers into one. Adapted from
+                // the existing residual_rms_norm.metal pattern + llama.cpp
+                // `ggml_metal_op_rms_norm` op-fusion idea, extended with a second
+                // reduction. Saves ≈59 dispatches and ≈59 barriers per token on
+                // Gemma 31B's 60 dense full-attn layers. Now also folds
+                // `layer_output_scale` into the in-place hidden write — RMS norm
+                // is invariant to (positive) scaling and the cached h_vals stay
+                // unscaled, so the second-pass norm output is bit-identical to
+                // the previous (post_norm_residual_rms_norm → barrier → scale_in_place)
+                // ordering. Removes the trailing scale_in_place dispatch+barrier
+                // (≈60 dispatches/60 barriers per token on Gemma 31B).
+                if (can_fuse_next_attn_norm and engine.post_ffn_norm_present[layer_idx]) {
+                    const hidden_scale: f32 = if (can_fold_layer_scale_here) layer_output_scale else 1.0;
+                    dispatchPostNormResidualRmsNormOnCmd(
+                        engine,
+                        cmd,
+                        &engine.hidden_buf,
+                        &engine.down_buf,
+                        &engine.post_ffn_norm_bufs[layer_idx],
+                        &engine.norm_buf,
+                        &engine.attn_norm_bufs[next_layer_idx_u],
+                        hidden_dim,
+                        hidden_scale,
+                    );
+                    profileBarrier(cmd, profile, .dense_ffn);
+                    prev_fused_attn_norm = true;
+                    if (can_fold_layer_scale_here) layer_output_scale_fused_into_post_norm = true;
+                } else {
+                    if (engine.post_ffn_norm_present[layer_idx]) {
+                        dispatchRmsNormOnCmd(engine, cmd, &engine.down_buf, &engine.down_buf, &engine.post_ffn_norm_bufs[layer_idx], hidden_dim, 1);
+                        profileBarrier(cmd, profile, .dense_ffn);
+                    }
+
+                    if (layer_shared_cmd != null) {
+                        if (can_fuse_next_attn_norm) {
+                            dispatchResidualRmsNormOnCmd(
+                                engine,
+                                cmd,
+                                &engine.hidden_buf,
+                                &engine.down_buf,
+                                &engine.norm_buf,
+                                &engine.attn_norm_bufs[next_layer_idx_u],
+                                hidden_dim,
+                                1.0,
+                            );
+                            profileBarrier(cmd, profile, .dense_ffn);
+                            prev_fused_attn_norm = true;
+                        } else {
+                            const acc_push = ScaleAccPush{ .n = hidden_dim, .scale_bits = @as(u32, @bitCast(@as(f32, 1.0))) };
+                            const acc_bufs = [_]*const MetalBuffer{ &engine.hidden_buf, &engine.down_buf };
+                            cmd.dispatchV2(&engine.scale_acc_pipe, .{ (hidden_dim + 63) / 64, 1, 1 }, .{ 64, 1, 1 }, &acc_bufs, &acc_push, @sizeOf(ScaleAccPush), 0);
+                            profileBarrier(cmd, profile, .dense_ffn);
+                        }
+                    }
+                }
                 if (profile) |p| p.dense_ffn_record_ns += profileElapsedNs(dense_record_start);
-                commitAndWaitProfiled(&cmd, profile);
+                if (using_local_cmd) {
+                    commitAndWaitProfiled(cmd, profile);
 
-                const hidden_ptr: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
-                const down_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
-                for (0..hidden_dim) |i| hidden_ptr[i] += down_ptr[i];
+                    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(engine.hidden_buf.cpu_ptr.?));
+                    const down_ptr: [*]const f32 = @ptrCast(@alignCast(engine.down_buf.cpu_ptr.?));
+                    for (0..hidden_dim) |i| hidden_ptr[i] += down_ptr[i];
+                }
             }
         }
 
-        if (layer_output_scale != 1.0) {
+        const layer_output_scale_folded = (skip_pre_ffn_router and !engine.debug_validation_enabled) or layer_output_scale_fused_into_post_norm;
+        if (layer_output_scale != 1.0 and !layer_output_scale_folded) {
             const scale_barrier_class: BarrierClass = if (is_moe)
                 (if (use_gpu_routed_moe) .gpu_routed_moe else .fallback_moe)
             else
                 .dense_ffn;
-            if (shared_cmd) |cmd| {
+            if (layer_shared_cmd) |cmd| {
                 dispatchScaleInPlaceOnCmd(engine, cmd, &engine.hidden_buf, &engine.residual_buf, hidden_dim, layer_output_scale, profile, scale_barrier_class);
             } else {
                 var scale_cmd = try beginProfiledCommand(engine, profile);
@@ -6137,51 +16533,98 @@ fn runDecodeStep(engine: *InferenceEngine) !void {
         if (engine.debug_validation_enabled and engine.position == 0) {
             logLayerDiagnostics(engine, lt, layer, is_full_attn, "post_ffn");
         }
+        if (use_dense_layer_cmd and dense_group_cmd_storage.handle != null) {
+            const next_layer = layer_idx + 1;
+            if (next_layer == layer_count or next_layer % dense_cmd_group_layers == 0) {
+                submitPendingDenseCommand(&dense_group_cmd_storage, dense_pending_cmds[0..], &dense_pending_count, profile);
+            }
+        }
+    }
+
+    if (!emit_logits) {
+        if (shared_cmd) |cmd| {
+            if (using_external_shared_cmd) {
+                // The caller owns submission for a larger prompt command.
+            } else if (async_out) |out| {
+                commitAsyncProfiled(cmd, profile);
+                out.* = cmd.*;
+                cmd.* = .{
+                    .handle = null,
+                    .dispatch_count = 0,
+                    .barrier_count = 0,
+                    .barrier_enabled = false,
+                };
+            } else {
+                commitAndWaitProfiled(cmd, profile);
+            }
+        } else if (async_out != null) {
+            return error.QueuedPrefillRequiresSharedCommand;
+        }
+        waitPendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count, profile);
+        engine.position += 1;
+        return;
     }
 
     // ===== Final: GPU norm → LM head (batched) =====
+    // For dense Q4_K LM heads (Gemma 31B), the standalone `final_norm`
+    // dispatch + barrier are folded into the LM head matvec via the
+    // `dmmv_q4k_lmhead_norm` kernel — drops one dispatch and one
+    // barrier from the final phase per decode step.
     const final_record_start = profileStart(profile != null);
+    const cpu_lm_head = shouldCpuLmHeadFallback(engine);
+    if (cpu_lm_head and using_external_shared_cmd) return error.InvalidPrefillCommandMode;
+    const fuse_final_norm = !cpu_lm_head and canUseLmHeadFusedNorm(engine, hidden_dim);
     if (shared_cmd) |cmd| {
-        dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-        profileBarrier(cmd, profile, .final);
-        if (shouldCpuLmHeadFallback(engine)) {
+        if (cpu_lm_head) {
+            dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrier(cmd, profile, .final);
             commitAndWaitProfiled(cmd, profile);
-            const mmap = engine.model.mmap_data orelse return error.NoMmapData;
-            const tdo = engine.model.gguf_file.tensor_data_offset;
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
-            try cpuDmmvFallback(mmap, engine.lm_head, tdo, in_ptr, out_ptr, cfg.vocab_size, hidden_dim, 0, engine.allocator);
-            var argmax_cmd = try beginProfiledCommand(engine, profile);
-            dispatchArgmaxOnCmd(engine, &argmax_cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(&argmax_cmd, profile);
+        } else if (fuse_final_norm) {
+            dispatchLmHeadFusedNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            profileBarrier(cmd, profile, .final);
+            dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         } else {
+            dispatchRmsNormOnCmd(engine, cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrier(cmd, profile, .final);
             dispatchLmHeadOnCmd(engine, cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             profileBarrier(cmd, profile, .final);
             dispatchArgmaxOnCmd(engine, cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
             if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-            commitAndWaitProfiled(cmd, profile);
+            if (!using_external_shared_cmd) commitAndWaitProfiled(cmd, profile);
         }
     } else {
         var cmd = try beginProfiledCommand(engine, profile);
-        dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
-        profileBarrier(&cmd, profile, .final);
-        if (shouldCpuLmHeadFallback(engine)) {
+        if (cpu_lm_head) {
+            dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrier(&cmd, profile, .final);
             commitAndWaitProfiled(&cmd, profile);
-            const mmap = engine.model.mmap_data orelse return error.NoMmapData;
-            const tdo = engine.model.gguf_file.tensor_data_offset;
             const in_ptr: [*]const f32 = @ptrCast(@alignCast(engine.norm_buf.cpu_ptr.?));
             const out_ptr: [*]f32 = @ptrCast(@alignCast(engine.logits_buf.cpu_ptr.?));
-            try cpuDmmvFallback(mmap, engine.lm_head, tdo, in_ptr, out_ptr, cfg.vocab_size, hidden_dim, 0, engine.allocator);
-            cmd = try beginProfiledCommand(engine, profile);
+            try cpuLmHeadFallbackWithArgmax(engine, in_ptr, out_ptr);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+        } else if (fuse_final_norm) {
+            dispatchLmHeadFusedNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.final_norm_gpu, &engine.logits_buf, hidden_dim, cfg.vocab_size);
+            profileBarrier(&cmd, profile, .final);
+            dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            commitAndWaitProfiled(&cmd, profile);
         } else {
+            dispatchRmsNormOnCmd(engine, &cmd, &engine.hidden_buf, &engine.norm_buf, &engine.final_norm_gpu, hidden_dim, 1);
+            profileBarrier(&cmd, profile, .final);
             dispatchLmHeadOnCmd(engine, &cmd, &engine.norm_buf, &engine.logits_buf, hidden_dim, cfg.vocab_size);
             profileBarrier(&cmd, profile, .final);
+            dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
+            if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
+            commitAndWaitProfiled(&cmd, profile);
         }
-        dispatchArgmaxOnCmd(engine, &cmd, &engine.logits_buf, &engine.argmax_buf, cfg.vocab_size);
-        if (profile) |p| p.final_record_ns += profileElapsedNs(final_record_start);
-        commitAndWaitProfiled(&cmd, profile);
     }
+    releasePendingDenseCommands(dense_pending_cmds[0..], &dense_pending_count);
     if (engine.debug_validation_enabled and engine.position == 5) {
         const debug_start = profileStart(profile != null);
         try debugCompareFinalLogits(engine);
@@ -7213,7 +17656,7 @@ pub fn generateWithMetrics(
     eos_id: u32,
     allocator: std.mem.Allocator,
 ) !GenerateResult {
-    var output: std.ArrayList(u32) = .{};
+    var output: std.ArrayList(u32) = .empty;
     errdefer output.deinit(allocator);
 
     const prompt_token_count: u32 = @intCast(@min(prompt_tokens.len, std.math.maxInt(u32)));
@@ -7226,14 +17669,17 @@ pub fn generateWithMetrics(
     state.requested_context_tokens = request_budget.target_context_tokens;
 
     // Prefill: process each prompt token through all layers
-    const prefill_start = std.time.nanoTimestamp();
+    const prefill_start = nanoTimestamp();
     if (prompt_tokens.len > 0) {
         try engine.prefillBatched(&state, prompt_tokens);
     } else {
         try engine.resetRequestState(state.requested_context_tokens);
     }
-    const prefill_end = std.time.nanoTimestamp();
+    const prefill_end = nanoTimestamp();
     const prefill_ns: u64 = @intCast(prefill_end - prefill_start);
+    if (engine.profile_enabled) {
+        engine.prefill_profile = engine.request_profile;
+    }
     const prefill_tps = if (prompt_tokens.len > 0 and prefill_ns > 0)
         @as(f64, @floatFromInt(prompt_tokens.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(prefill_ns))
     else
@@ -7264,7 +17710,7 @@ pub fn generateWithMetrics(
     }
 
     // Decode loop
-    const decode_start = std.time.nanoTimestamp();
+    const decode_start = nanoTimestamp();
     var tokens_generated: u32 = @intCast(output.items.len);
     while (tokens_generated < decode_budget and output.items.len > 0) {
         const input_token = output.items[output.items.len - 1];
@@ -7277,7 +17723,7 @@ pub fn generateWithMetrics(
         try state.generated_tokens.append(allocator, next_token);
         tokens_generated += 1;
     }
-    const decode_end = std.time.nanoTimestamp();
+    const decode_end = nanoTimestamp();
     const decode_ns: u64 = @intCast(decode_end - decode_start);
     const decode_tps = if (tokens_generated > 0 and decode_ns > 0)
         @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns))
@@ -7833,6 +18279,106 @@ test "residual_rms_norm dispatch normalizes post-residual hidden state" {
     try std.testing.expect(differs_from_stale);
 }
 
+test "gemma_moe_post_norm_residual fuses post MoE tail" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemma_moe_post_norm_residual");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n: u32 = 10;
+    const expert_weight_offset: u32 = 3;
+    const shared_weight_offset: u32 = 5;
+    const eps: f32 = 1e-6;
+
+    var expert_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&expert_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var expert_weights_buf = try metal_buffer.createBuffer(ctx, (expert_weight_offset + n) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&expert_weights_buf);
+    var shared_weights_buf = try metal_buffer.createBuffer(ctx, (shared_weight_offset + n) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_weights_buf);
+    var final_weights_buf = try metal_buffer.createBuffer(ctx, n * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&final_weights_buf);
+    var gate_buf = try metal_buffer.createBuffer(ctx, @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_buf);
+
+    const expert: [*]f32 = @ptrCast(@alignCast(expert_buf.cpu_ptr.?));
+    const shared: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const hidden: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    const expert_weights: [*]f32 = @ptrCast(@alignCast(expert_weights_buf.cpu_ptr.?));
+    const shared_weights: [*]f32 = @ptrCast(@alignCast(shared_weights_buf.cpu_ptr.?));
+    const final_weights: [*]f32 = @ptrCast(@alignCast(final_weights_buf.cpu_ptr.?));
+    const gate: [*]f32 = @ptrCast(@alignCast(gate_buf.cpu_ptr.?));
+
+    for (0..expert_weight_offset + n) |i| expert_weights[i] = -99.0;
+    for (0..shared_weight_offset + n) |i| shared_weights[i] = -88.0;
+    for (0..n) |i| {
+        const ii: f32 = @floatFromInt(i);
+        expert[i] = 0.25 * (ii - 4.0);
+        shared[i] = -0.125 * (ii - 6.0);
+        hidden[i] = 1.0 + 0.05 * ii;
+        expert_weights[expert_weight_offset + i] = 0.75 + 0.03 * ii;
+        shared_weights[shared_weight_offset + i] = 1.10 - 0.02 * ii;
+        final_weights[i] = 0.90 + 0.01 * ii;
+    }
+    gate[0] = 0.35;
+
+    var expected: [n]f32 = undefined;
+    for (0..n) |i| expected[i] = hidden[i];
+
+    var expert_sum: f32 = 0;
+    var shared_sum: f32 = 0;
+    for (0..n) |i| {
+        expert_sum += expert[i] * expert[i];
+        shared_sum += shared[i] * shared[i];
+    }
+    const expert_rms = 1.0 / @sqrt(expert_sum / @as(f32, @floatFromInt(n)) + eps);
+    const shared_rms = 1.0 / @sqrt(shared_sum / @as(f32, @floatFromInt(n)) + eps);
+    const gate_value = 1.0 / (1.0 + @exp(-gate[0]));
+    var combined: [n]f32 = undefined;
+    var combined_sum: f32 = 0;
+    for (0..n) |i| {
+        combined[i] = expert_weights[expert_weight_offset + i] * (expert[i] * expert_rms) +
+            gate_value * shared_weights[shared_weight_offset + i] * (shared[i] * shared_rms);
+        combined_sum += combined[i] * combined[i];
+    }
+    const combined_rms = 1.0 / @sqrt(combined_sum / @as(f32, @floatFromInt(n)) + eps);
+    for (0..n) |i| {
+        expected[i] += final_weights[i] * (combined[i] * combined_rms);
+    }
+
+    const push = GemmaMoePostNormResidualPush{
+        .n = n,
+        .eps = eps,
+        .expert_weight_offset = expert_weight_offset,
+        .shared_weight_offset = shared_weight_offset,
+        .has_gate = 1,
+        .has_final_norm = 1,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &expert_buf,
+        &shared_buf,
+        &hidden_buf,
+        &expert_weights_buf,
+        &shared_weights_buf,
+        &final_weights_buf,
+        &gate_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(GemmaMoePostNormResidualPush), 0);
+    cmd.commitAndWait();
+
+    for (0..n) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], hidden[i], 0.00001);
+    }
+}
+
 test "ssm_delta_net shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -7915,6 +18461,9 @@ test "ssm_delta_net shader matches CPU reference" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -7936,6 +18485,439 @@ test "ssm_delta_net shader matches CPU reference" {
     for (0..state_len) |i| {
         try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
     }
+}
+
+test "ssm_delta_net_offset shader matches CPU reference with row offsets" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_offset");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const dt_rank: u32 = 2;
+    const head_v_dim: u32 = 4;
+    const d_state: u32 = 2;
+    const n_group: u32 = 1;
+    const d_inner: u32 = dt_rank * head_v_dim;
+    const qk_dim: u32 = d_state * n_group;
+    const conv_len: u32 = 2 * qk_dim + d_inner;
+    const state_len: u32 = dt_rank * head_v_dim * head_v_dim;
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, 2 * conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, 2 * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, 2 * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, 2 * d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    @memset(conv_ptr[0 .. 2 * conv_len], 0.125);
+    const conv_init = [_]f32{ 3.0, 4.0, 4.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.5, -1.0, 2.0, -2.0 };
+    @memcpy(conv_ptr[conv_len .. 2 * conv_len], conv_init[0..conv_len]);
+    alpha_ptr[0] = 9.0;
+    alpha_ptr[1] = 9.0;
+    alpha_ptr[2] = 0.1;
+    alpha_ptr[3] = -0.2;
+    dt_bias_ptr[0] = 0.3;
+    dt_bias_ptr[1] = -0.1;
+    ssm_a_ptr[0] = 0.5;
+    ssm_a_ptr[1] = -0.75;
+    beta_ptr[0] = 9.0;
+    beta_ptr[1] = 9.0;
+    beta_ptr[2] = 0.25;
+    beta_ptr[3] = -0.5;
+    for (0..state_len) |i| {
+        state_ptr[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.1;
+    }
+    @memset(output_ptr[0 .. 2 * d_inner], 0);
+
+    var ref_state: [32]f32 = undefined;
+    var ref_output: [8]f32 = [_]f32{0} ** 8;
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    refRunSsmDeltaNet(
+        conv_ptr[conv_len .. 2 * conv_len],
+        alpha_ptr[dt_rank .. 2 * dt_rank],
+        dt_bias_ptr[0..dt_rank],
+        beta_ptr[dt_rank .. 2 * dt_rank],
+        ssm_a_ptr[0..dt_rank],
+        ref_state[0..state_len],
+        ref_output[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        n_group,
+    );
+
+    const push = SsmDeltaNetOffsetPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .has_dt_bias = 1,
+        .has_ssm_a = 1,
+        .alpha_offset = dt_rank,
+        .beta_offset = dt_rank,
+        .output_offset = d_inner,
+        .conv_offset = conv_len,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetOffsetPush), 0);
+    cmd.commitAndWait();
+
+    for (0..d_inner) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[d_inner + i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "ssm_delta_net_prefill shader matches CPU reference across token chunk" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: u32 = 3;
+    const dt_rank: u32 = 2;
+    const head_v_dim: u32 = 4;
+    const d_state: u32 = 2;
+    const n_group: u32 = 1;
+    const d_inner: u32 = dt_rank * head_v_dim;
+    const qk_dim: u32 = d_state * n_group;
+    const conv_len: u32 = 2 * qk_dim + d_inner;
+    const state_len: u32 = dt_rank * head_v_dim * head_v_dim;
+    const token_count: usize = @intCast(n_tokens);
+    const dt_rank_usize: usize = @intCast(dt_rank);
+    const d_inner_usize: usize = @intCast(d_inner);
+    const conv_len_usize: usize = @intCast(conv_len);
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..token_count) |t| {
+        for (0..conv_len_usize) |j| {
+            const pattern: i32 = @intCast((t * 13 + j * 5) % 17);
+            conv_ptr[t * conv_len_usize + j] = @as(f32, @floatFromInt(pattern - 8)) * 0.125 + @as(f32, @floatFromInt(t)) * 0.05;
+        }
+        for (0..dt_rank_usize) |h| {
+            const idx = t * dt_rank_usize + h;
+            alpha_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(t)) - @as(i32, @intCast(h)))) * 0.17;
+            beta_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(t + h)))) * -0.11 + 0.25;
+        }
+    }
+    dt_bias_ptr[0] = 0.3;
+    dt_bias_ptr[1] = -0.1;
+    ssm_a_ptr[0] = 0.5;
+    ssm_a_ptr[1] = -0.75;
+    for (0..state_len) |i| {
+        state_ptr[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.07;
+    }
+    @memset(output_ptr[0 .. n_tokens * d_inner], 0);
+
+    var initial_state: [32]f32 = undefined;
+    @memcpy(initial_state[0..state_len], state_ptr[0..state_len]);
+    var ref_state: [32]f32 = undefined;
+    var ref_output: [24]f32 = [_]f32{0} ** 24;
+    @memcpy(ref_state[0..state_len], initial_state[0..state_len]);
+    for (0..token_count) |t| {
+        const conv_base = t * conv_len_usize;
+        const dt_base = t * dt_rank_usize;
+        const out_base = t * d_inner_usize;
+        refRunSsmDeltaNet(
+            conv_ptr[conv_base .. conv_base + conv_len_usize],
+            alpha_ptr[dt_base .. dt_base + dt_rank_usize],
+            dt_bias_ptr[0..dt_rank],
+            beta_ptr[dt_base .. dt_base + dt_rank_usize],
+            ssm_a_ptr[0..dt_rank],
+            ref_state[0..state_len],
+            ref_output[out_base .. out_base + d_inner_usize],
+            dt_rank,
+            head_v_dim,
+            d_state,
+            n_group,
+        );
+    }
+
+    const push = SsmDeltaNetPrefillPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .has_dt_bias = 1,
+        .has_ssm_a = 1,
+        .n_tokens = n_tokens,
+        .alpha_stride = dt_rank,
+        .beta_stride = dt_rank,
+        .conv_stride = conv_len,
+        .output_stride = d_inner,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .conv_offset = 0,
+        .output_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+    cmd.commitAndWait();
+
+    for (0..token_count * d_inner_usize) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
+    }
+
+    if (pipe.max_threads_per_threadgroup >= 128) {
+        @memcpy(state_ptr[0..state_len], initial_state[0..state_len]);
+        @memset(output_ptr[0 .. n_tokens * d_inner], 0);
+
+        var cmd_128 = try metal_command.beginCommand(ctx);
+        cmd_128.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+        cmd_128.commitAndWait();
+
+        for (0..token_count * d_inner_usize) |i| {
+            try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+        }
+        for (0..state_len) |i| {
+            try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
+        }
+    }
+}
+
+test "ssm_delta_net_prefill exact Qwen shape matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: u32 = 2;
+    const dt_rank: u32 = 32;
+    const head_v_dim: u32 = 128;
+    const d_state: u32 = 128;
+    const n_group: u32 = 16;
+    const d_inner: u32 = dt_rank * head_v_dim;
+    const qk_dim: u32 = d_state * n_group;
+    const conv_len: u32 = 2 * qk_dim + d_inner;
+    const state_len: usize = @as(usize, dt_rank) * head_v_dim * head_v_dim;
+    const token_count: usize = @intCast(n_tokens);
+    const dt_rank_usize: usize = @intCast(dt_rank);
+    const d_inner_usize: usize = @intCast(d_inner);
+    const conv_len_usize: usize = @intCast(conv_len);
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, n_tokens * dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..token_count) |t| {
+        for (0..conv_len_usize) |j| {
+            const pattern: i32 = @intCast((t * 17 + j * 7) % 23);
+            conv_ptr[t * conv_len_usize + j] =
+                @as(f32, @floatFromInt(pattern - 11)) * 0.0125 + @as(f32, @floatFromInt(t)) * 0.002;
+        }
+        for (0..dt_rank_usize) |h| {
+            const idx = t * dt_rank_usize + h;
+            alpha_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(t)) - @as(i32, @intCast(h % 5)))) * 0.025;
+            beta_ptr[idx] = @as(f32, @floatFromInt(@as(i32, @intCast((t + h) % 7)) - 3)) * 0.03;
+        }
+    }
+    for (0..dt_rank_usize) |h| {
+        dt_bias_ptr[h] = @as(f32, @floatFromInt(@as(i32, @intCast(h % 5)) - 2)) * 0.02;
+        ssm_a_ptr[h] = -0.25 - @as(f32, @floatFromInt(h % 3)) * 0.04;
+    }
+    for (0..state_len) |i| {
+        state_ptr[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.004;
+    }
+    @memset(output_ptr[0 .. n_tokens * d_inner], 0);
+
+    const allocator = std.testing.allocator;
+    const ref_state = try allocator.alloc(f32, state_len);
+    defer allocator.free(ref_state);
+    const ref_output = try allocator.alloc(f32, token_count * d_inner_usize);
+    defer allocator.free(ref_output);
+    @memcpy(ref_state, state_ptr[0..state_len]);
+    @memset(ref_output, 0);
+
+    for (0..token_count) |t| {
+        const conv_base = t * conv_len_usize;
+        const dt_base = t * dt_rank_usize;
+        const out_base = t * d_inner_usize;
+        refRunSsmDeltaNet(
+            conv_ptr[conv_base .. conv_base + conv_len_usize],
+            alpha_ptr[dt_base .. dt_base + dt_rank_usize],
+            dt_bias_ptr[0..dt_rank],
+            beta_ptr[dt_base .. dt_base + dt_rank_usize],
+            ssm_a_ptr[0..dt_rank],
+            ref_state,
+            ref_output[out_base .. out_base + d_inner_usize],
+            dt_rank,
+            head_v_dim,
+            d_state,
+            n_group,
+        );
+    }
+
+    const push = SsmDeltaNetPrefillPush{
+        .d_inner = d_inner,
+        .dt_rank = dt_rank,
+        .head_v_dim = head_v_dim,
+        .d_state = d_state,
+        .n_group = n_group,
+        .has_dt_bias = 1,
+        .has_ssm_a = 1,
+        .n_tokens = n_tokens,
+        .alpha_stride = dt_rank,
+        .beta_stride = dt_rank,
+        .conv_stride = conv_len,
+        .output_stride = d_inner,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .conv_offset = 0,
+        .output_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    };
+
+    const tg_size = ssmDeltaNetPrefillThreadgroupSize(&pipe, dt_rank, head_v_dim, d_state, n_group);
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ dt_rank, 1, 1 }, .{ tg_size, 1, 1 }, &bufs, &push, @sizeOf(SsmDeltaNetPrefillPush), 0);
+    cmd.commitAndWait();
+
+    for (0..token_count * d_inner_usize) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.003);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.003);
+    }
+}
+
+test "qwen ssm conv d4 threadgroup helper uses exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 128), ssmConv1dThreadgroupSize(&pipe, 8192, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 3, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 4096, 4, false));
+    try std.testing.expectEqual(@as(u32, 64), ssmConv1dThreadgroupSize(&pipe, 8192, 4, true));
+}
+
+test "qwen ssm delta prefill threadgroup helper uses exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 128), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 16, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 64, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaNetPrefillThreadgroupSize(&pipe, 32, 128, 64, 16));
+}
+
+test "qwen ssm delta gated norm threadgroup helper uses tg128 exact model shape" {
+    const pipe = MetalPipeline{
+        .handle = null,
+        .max_threads_per_threadgroup = 128,
+        .thread_execution_width = 32,
+        .static_threadgroup_memory_length = 0,
+    };
+
+    try std.testing.expectEqual(@as(u32, 128), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 16, 128, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 64, 128, 16));
+    try std.testing.expectEqual(@as(u32, 64), ssmDeltaGatedNormThreadgroupSize(&pipe, 32, 128, 64, 16));
 }
 
 test "ssm_conv1d shader matches CPU reference" {
@@ -8011,6 +18993,179 @@ test "ssm_conv1d shader matches CPU reference" {
     cmd.commitAndWait();
 
     for (0..conv_channels) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "ssm_conv1d_prefill shader matches repeated CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 5;
+    const d_conv: usize = 4;
+    const n_tokens: usize = 3;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * conv_channels * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    const kernel_init = [_]f32{
+        0.25,  -0.50, 0.75,  1.00,
+        -1.25, 0.50,  -0.25, 0.80,
+        0.10,  0.20,  0.30,  0.40,
+        -0.60, 0.90,  -1.10, 0.70,
+        1.20,  -0.70, 0.50,  -0.30,
+    };
+    const state_init = [_]f32{
+        -0.40, 0.25,  1.10, -0.75, 0.60,
+        0.50,  -0.20, 0.35, 0.90,  -1.25,
+        1.40,  -0.80, 0.15, -0.45, 0.95,
+    };
+    const input_init = [_]f32{
+        0.80,  -1.50, 0.45,  1.25,  -0.65,
+        0.20,  0.30,  -0.70, 0.55,  1.10,
+        -0.40, 1.20,  0.90,  -1.30, 0.15,
+    };
+
+    @memcpy(kernel_ptr[0..kernel_len], kernel_init[0..kernel_len]);
+    @memcpy(state_ptr[0..state_len], state_init[0..state_len]);
+    @memcpy(input_ptr[0 .. n_tokens * conv_channels], input_init[0 .. n_tokens * conv_channels]);
+    @memset(output_ptr[0 .. n_tokens * conv_channels], 0);
+
+    var ref_state: [state_len]f32 = undefined;
+    var ref_output: [n_tokens * conv_channels]f32 = [_]f32{0} ** (n_tokens * conv_channels);
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    for (0..n_tokens) |t| {
+        refRunSsmConv1d(
+            input_ptr[t * conv_channels .. (t + 1) * conv_channels],
+            kernel_ptr[0..kernel_len],
+            ref_state[0..state_len],
+            ref_output[t * conv_channels .. (t + 1) * conv_channels],
+            conv_channels,
+            d_conv,
+        );
+    }
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        @intCast(n_tokens),
+        @intCast(conv_channels),
+        0,
+        0,
+    );
+    cmd.commitAndWait();
+
+    for (0..n_tokens * conv_channels) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.0005);
+    }
+}
+
+test "qwen ssm_conv1d_prefill d4 shader matches repeated CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const conv_channels: usize = 8192;
+    const d_conv: usize = 4;
+    const n_tokens: usize = 3;
+    const state_len: usize = (d_conv - 1) * conv_channels;
+    const kernel_len: usize = conv_channels * d_conv;
+    const total_values: usize = n_tokens * conv_channels;
+
+    var kernel_buf = try metal_buffer.createBuffer(ctx, kernel_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&kernel_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, total_values * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, total_values * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const kernel_ptr: [*]f32 = @ptrCast(@alignCast(kernel_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..kernel_len) |i| {
+        kernel_ptr[i] = (@as(f32, @floatFromInt(i % 17)) - 8.0) * 0.03125;
+    }
+    for (0..state_len) |i| {
+        state_ptr[i] = (@as(f32, @floatFromInt(i % 23)) - 11.0) * 0.015625;
+    }
+    for (0..total_values) |i| {
+        input_ptr[i] = (@as(f32, @floatFromInt(i % 29)) - 14.0) * 0.020833334;
+    }
+    @memset(output_ptr[0..total_values], 0);
+
+    const allocator = std.testing.allocator;
+    const ref_state = try allocator.alloc(f32, state_len);
+    defer allocator.free(ref_state);
+    const ref_output = try allocator.alloc(f32, total_values);
+    defer allocator.free(ref_output);
+    @memcpy(ref_state, state_ptr[0..state_len]);
+    @memset(ref_output, 0);
+    for (0..n_tokens) |t| {
+        refRunSsmConv1d(
+            input_ptr[t * conv_channels .. (t + 1) * conv_channels],
+            kernel_ptr[0..kernel_len],
+            ref_state,
+            ref_output[t * conv_channels .. (t + 1) * conv_channels],
+            conv_channels,
+            d_conv,
+        );
+    }
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmConv1dPrefillOnCmd(
+        &cmd,
+        &pipe,
+        &kernel_buf,
+        &state_buf,
+        &input_buf,
+        &output_buf,
+        @intCast(conv_channels),
+        @intCast(d_conv),
+        @intCast(n_tokens),
+        @intCast(conv_channels),
+        0,
+        0,
+    );
+    cmd.commitAndWait();
+
+    for (0..total_values) |i| {
         try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.0005);
     }
     for (0..state_len) |i| {
@@ -8246,6 +19401,9 @@ test "ssm_delta_net shader matches CPU reference at realistic head width" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -8357,6 +19515,9 @@ test "ssm_delta_net shader matches CPU reference at model-like dimensions" {
         .dt_bias_is_f16 = 0,
         .has_dt_bias = 1,
         .has_ssm_a = 1,
+        .alpha_offset = 0,
+        .beta_offset = 0,
+        .output_offset = 0,
     };
     const bufs = [_]*const MetalBuffer{
         &conv_buf,
@@ -8377,6 +19538,138 @@ test "ssm_delta_net shader matches CPU reference at model-like dimensions" {
     }
     for (0..state_len) |i| {
         try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.002);
+    }
+}
+
+test "ssm_delta_net_gated_norm shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const dt_rank: usize = 2;
+    const head_v_dim: usize = 4;
+    const d_state: usize = 2;
+    const n_group: usize = 1;
+    const d_inner: usize = dt_rank * head_v_dim;
+    const qk_dim: usize = d_state * n_group;
+    const conv_len: usize = 2 * qk_dim + d_inner;
+    const state_len: usize = dt_rank * head_v_dim * head_v_dim;
+
+    var conv_buf = try metal_buffer.createBuffer(ctx, conv_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&conv_buf);
+    var alpha_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&alpha_buf);
+    var dt_bias_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dt_bias_buf);
+    var ssm_a_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&ssm_a_buf);
+    var beta_buf = try metal_buffer.createBuffer(ctx, dt_rank * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&beta_buf);
+    var state_buf = try metal_buffer.createBuffer(ctx, state_len * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&state_buf);
+    var z_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&z_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, d_inner * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const conv_ptr: [*]f32 = @ptrCast(@alignCast(conv_buf.cpu_ptr.?));
+    const alpha_ptr: [*]f32 = @ptrCast(@alignCast(alpha_buf.cpu_ptr.?));
+    const dt_bias_ptr: [*]f32 = @ptrCast(@alignCast(dt_bias_buf.cpu_ptr.?));
+    const ssm_a_ptr: [*]f32 = @ptrCast(@alignCast(ssm_a_buf.cpu_ptr.?));
+    const beta_ptr: [*]f32 = @ptrCast(@alignCast(beta_buf.cpu_ptr.?));
+    const state_ptr: [*]f32 = @ptrCast(@alignCast(state_buf.cpu_ptr.?));
+    const z_ptr: [*]f32 = @ptrCast(@alignCast(z_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+
+    for (0..conv_len) |i| {
+        const pattern: i32 = @intCast((i * 7) % 19);
+        conv_ptr[i] = @as(f32, @floatFromInt(pattern - 9)) * 0.09;
+    }
+    for (0..dt_rank) |i| {
+        const value: f32 = @floatFromInt(i);
+        alpha_ptr[i] = 0.13 * value - 0.08;
+        beta_ptr[i] = 0.21 - 0.17 * value;
+        dt_bias_ptr[i] = 0.05 * value - 0.02;
+        ssm_a_ptr[i] = -0.6 - 0.1 * value;
+    }
+    for (0..state_len) |i| {
+        const pattern: i32 = @intCast((i * 5) % 23);
+        state_ptr[i] = @as(f32, @floatFromInt(pattern - 11)) * 0.035;
+    }
+    for (0..d_inner) |i| {
+        const pattern: i32 = @intCast((i * 3) % 13);
+        z_ptr[i] = @as(f32, @floatFromInt(pattern - 6)) * 0.11;
+        norm_ptr[i] = 0.75 + @as(f32, @floatFromInt(i % 5)) * 0.07;
+    }
+    @memset(output_ptr[0..d_inner], 0);
+
+    var ref_state: [state_len]f32 = undefined;
+    var ref_delta: [d_inner]f32 = [_]f32{0} ** d_inner;
+    var ref_output: [d_inner]f32 = [_]f32{0} ** d_inner;
+    @memcpy(ref_state[0..state_len], state_ptr[0..state_len]);
+    refRunSsmDeltaNet(
+        conv_ptr[0..conv_len],
+        alpha_ptr[0..dt_rank],
+        dt_bias_ptr[0..dt_rank],
+        beta_ptr[0..dt_rank],
+        ssm_a_ptr[0..dt_rank],
+        ref_state[0..state_len],
+        ref_delta[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        n_group,
+    );
+    refRunSsmGatedNorm(
+        ref_delta[0..d_inner],
+        z_ptr[0..d_inner],
+        norm_ptr[0..d_inner],
+        ref_output[0..d_inner],
+        dt_rank,
+        head_v_dim,
+        d_state,
+        true,
+    );
+
+    var cmd = try metal_command.beginCommand(ctx);
+    dispatchSsmDeltaNetGatedNormOnCmd(
+        &cmd,
+        &pipe,
+        &conv_buf,
+        &alpha_buf,
+        &dt_bias_buf,
+        &ssm_a_buf,
+        &beta_buf,
+        &state_buf,
+        &z_buf,
+        &norm_buf,
+        &output_buf,
+        @intCast(d_inner),
+        @intCast(dt_rank),
+        @intCast(head_v_dim),
+        @intCast(d_state),
+        @intCast(n_group),
+        true,
+        true,
+        0,
+        0,
+        0,
+        0,
+        true,
+    );
+    cmd.commitAndWait();
+
+    for (0..d_inner) |i| {
+        try std.testing.expectApproxEqAbs(ref_output[i], output_ptr[i], 0.001);
+    }
+    for (0..state_len) |i| {
+        try std.testing.expectApproxEqAbs(ref_state[i], state_ptr[i], 0.001);
     }
 }
 
@@ -8853,6 +20146,459 @@ test "dmmv_q4k_moe_k2048 shader matches CPU reference across selected experts" {
     }
 }
 
+test "dmmv_q4k_moe_gate_up shader matches CPU reference across selected experts" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 17;
+    const K: usize = 512;
+    const n_used: usize = 2;
+    const n_experts: usize = 3;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 144;
+    const half_stride: usize = M * row_bytes;
+    const expert_stride: usize = 2 * half_stride;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var gate_output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_output_buf);
+    var up_output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&up_output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(gate_output_buf.cpu_ptr.?[0..gate_output_buf.size], 0);
+    @memset(up_output_buf.cpu_ptr.?[0..up_output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..2) |half| {
+            for (0..M) |row| {
+                for (0..blocks_per_row) |blk| {
+                    const base = expert * expert_stride + half * half_stride + row * row_bytes + blk * 144;
+                    const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + half * 3 + expert + (row % 5) + blk))));
+                    const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((half * 11 + expert + row + blk) % 7)))));
+                    const d_bits = @as(u16, @bitCast(d));
+                    const dmin_bits = @as(u16, @bitCast(dmin));
+                    weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+                    weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                    weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                    weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                    for (0..12) |i| {
+                        weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((half * 37 + expert * 31 + row * 9 + blk * 5 + i * 3) & 0xFF);
+                    }
+                    for (0..128) |i| {
+                        const lo: u8 = @intCast((half * 23 + expert * 19 + row * 13 + blk * 17 + i * 7) & 0x0F);
+                        const hi: u8 = @intCast((half * 29 + expert * 11 + row * 5 + blk * 3 + i * 9) & 0x0F);
+                        weight_buf.cpu_ptr.?[base + 16 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 23 + i * 19 + 5) % 21);
+            input_ptr[slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 10));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 2;
+    routing_ptr[1] = 0;
+
+    const push = MoeGateUpDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .gate_base_offset = 0,
+        .up_base_offset = @intCast(half_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &gate_output_buf, &up_output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const gate_output: [*]const f32 = @ptrCast(@alignCast(gate_output_buf.cpu_ptr.?));
+    const up_output: [*]const f32 = @ptrCast(@alignCast(up_output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const expert_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(expert_raw[0..half_stride], @intCast(row), @intCast(K), .q4_k, ref_row);
+            var expected_gate: f32 = 0.0;
+            for (0..K) |i| expected_gate += ref_row[i] * input_slice[i];
+            try std.testing.expectApproxEqAbs(expected_gate, gate_output[slot * M + row], 0.05);
+
+            dequantRow(expert_raw[half_stride..expert_stride], @intCast(row), @intCast(K), .q4_k, ref_row);
+            var expected_up: f32 = 0.0;
+            for (0..K) |i| expected_up += ref_row[i] * input_slice[i];
+            try std.testing.expectApproxEqAbs(expected_up, up_output[slot * M + row], 0.05);
+        }
+    }
+}
+
+test "dmmv_q4k_moe_gate_up_dual_k2048 matches cached dual path" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var ref_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+    defer metal_pipeline.freePipeline(&ref_pipe);
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 17;
+    const K: usize = 2048;
+    const n_used: usize = 2;
+    const n_experts: usize = 3;
+    const x_pad: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 144;
+    const expert_stride: usize = M * row_bytes;
+
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+    var up_weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&up_weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + n_used * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var gate_ref_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_ref_buf);
+    var up_ref_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&up_ref_buf);
+    var gate_out_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_out_buf);
+    var up_out_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&up_out_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(gate_weight_buf.cpu_ptr.?[0..gate_weight_buf.size], 0);
+    @memset(up_weight_buf.cpu_ptr.?[0..up_weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(gate_ref_buf.cpu_ptr.?[0..gate_ref_buf.size], 0);
+    @memset(up_ref_buf.cpu_ptr.?[0..up_ref_buf.size], 0);
+    @memset(gate_out_buf.cpu_ptr.?[0..gate_out_buf.size], 0);
+    @memset(up_out_buf.cpu_ptr.?[0..up_out_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for ([_]*MetalBuffer{ &gate_weight_buf, &up_weight_buf }, 0..) |buf, tensor_idx| {
+        for (0..n_experts) |expert| {
+            for (0..M) |row| {
+                for (0..blocks_per_row) |blk| {
+                    const base = expert * expert_stride + row * row_bytes + blk * 144;
+                    const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + tensor_idx * 5 + expert + (row % 7) + blk))));
+                    const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((tensor_idx * 13 + expert + row + blk) % 9)))));
+                    const d_bits = @as(u16, @bitCast(d));
+                    const dmin_bits = @as(u16, @bitCast(dmin));
+                    buf.cpu_ptr.?[base] = @truncate(d_bits);
+                    buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                    buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                    buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                    for (0..12) |i| {
+                        buf.cpu_ptr.?[base + 4 + i] = @intCast((tensor_idx * 41 + expert * 31 + row * 9 + blk * 5 + i * 3) & 0xFF);
+                    }
+                    for (0..128) |i| {
+                        const lo: u8 = @intCast((tensor_idx * 23 + expert * 19 + row * 13 + blk * 17 + i * 7) & 0x0F);
+                        const hi: u8 = @intCast((tensor_idx * 29 + expert * 11 + row * 5 + blk * 3 + i * 9) & 0x0F);
+                        buf.cpu_ptr.?[base + 16 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 23 + i * 19 + 5) % 21);
+            input_ptr[x_pad + slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 10));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 2;
+    routing_ptr[1] = 0;
+
+    const push = MoeGateUpDualDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .gate_a_offset = 0,
+        .up_a_offset = 0,
+        .gate_expert_stride = @intCast(expert_stride),
+        .up_expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .gate_y_offset = 0,
+        .up_y_offset = 0,
+    };
+
+    {
+        const bufs = [_]*const MetalBuffer{ &gate_weight_buf, &up_weight_buf, &input_buf, &gate_ref_buf, &up_ref_buf, &routing_buf };
+        var cmd = try metal_command.beginCommand(ctx);
+        cmd.dispatchV2(&ref_pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpDualDmmvPush), 1);
+        cmd.commitAndWait();
+    }
+    {
+        const bufs = [_]*const MetalBuffer{ &gate_weight_buf, &up_weight_buf, &input_buf, &gate_out_buf, &up_out_buf, &routing_buf };
+        var cmd = try metal_command.beginCommand(ctx);
+        cmd.dispatchV2(&pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeGateUpDualDmmvPush), 1);
+        cmd.commitAndWait();
+    }
+
+    const gate_ref: [*]const f32 = @ptrCast(@alignCast(gate_ref_buf.cpu_ptr.?));
+    const up_ref: [*]const f32 = @ptrCast(@alignCast(up_ref_buf.cpu_ptr.?));
+    const gate_out: [*]const f32 = @ptrCast(@alignCast(gate_out_buf.cpu_ptr.?));
+    const up_out: [*]const f32 = @ptrCast(@alignCast(up_out_buf.cpu_ptr.?));
+    for (0..n_used * M) |i| {
+        try std.testing.expectApproxEqAbs(gate_ref[i], gate_out[i], 0.01);
+        try std.testing.expectApproxEqAbs(up_ref[i], up_out[i], 0.01);
+    }
+}
+
+test "dmmv_q5_1_moe shader matches CPU reference across selected experts" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 19;
+    const K: usize = 64;
+    const n_used: usize = 3;
+    const n_experts: usize = 4;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 24;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 24;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 5)))));
+                const m = @as(f16, @floatCast(-0.25 + 0.015625 * @as(f32, @floatFromInt((expert * 3 + row + blk) % 9))));
+                std.mem.writeInt(u16, weight_buf.cpu_ptr.?[base..][0..2], @bitCast(d), .little);
+                std.mem.writeInt(u16, weight_buf.cpu_ptr.?[base + 2 ..][0..2], @bitCast(m), .little);
+
+                var qh: u32 = 0;
+                for (0..32) |j| {
+                    if (((expert * 13 + row * 7 + blk * 5 + j * 3) % 5) >= 2) {
+                        qh |= @as(u32, 1) << @intCast(j);
+                    }
+                }
+                std.mem.writeInt(u32, weight_buf.cpu_ptr.?[base + 4 ..][0..4], qh, .little);
+
+                for (0..16) |j| {
+                    const lo: u8 = @intCast((expert * 11 + row * 5 + blk * 3 + j * 7) & 0x0F);
+                    const hi: u8 = @intCast((expert * 17 + row * 3 + blk * 13 + j * 5) & 0x0F);
+                    weight_buf.cpu_ptr.?[base + 8 + j] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 29 + i * 11 + 3) % 23);
+            input_ptr[slot * K + i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 0;
+    routing_ptr[2] = 2;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_used), 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_1, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.001);
+        }
+    }
+}
+
+test "dmmv_q4k_moe_cols shader matches per-route CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 7;
+    const K: usize = 512;
+    const n_tokens: usize = 5;
+    const k_used: usize = 2;
+    const n_experts: usize = 3;
+    const route_slots = n_tokens * k_used;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 144;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, route_slots * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * n_tokens * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const weight_ptr = weight_buf.cpu_ptr.?;
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 144;
+                const d = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + expert + (row % 5) + blk))));
+                const dmin = @as(f16, @floatCast(0.0078125 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 7)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                std.mem.writeInt(u16, weight_ptr[base..][0..2], d_bits, .little);
+                std.mem.writeInt(u16, weight_ptr[base + 2 ..][0..2], dmin_bits, .little);
+                for (0..12) |i| {
+                    weight_ptr[base + 4 + i] = @intCast((expert * 31 + row * 9 + blk * 5 + i * 3) & 0xFF);
+                }
+                for (0..128) |i| {
+                    const lo: u8 = @intCast((expert * 19 + row * 13 + blk * 17 + i * 7) & 0x0F);
+                    const hi: u8 = @intCast((expert * 11 + row * 5 + blk * 3 + i * 9) & 0x0F);
+                    weight_ptr[base + 16 + i] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_tokens) |token| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((token * 17 + i * 11 + 5) % 23);
+            input_ptr[token * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    counts_ptr[1] = @intCast(n_tokens);
+    counts_ptr[2] = @intCast(n_tokens);
+    for (0..n_tokens) |token| {
+        ids_ptr[1 * n_tokens + token] = @intCast(token * k_used);
+        ids_ptr[2 * n_tokens + token] = @intCast(token * k_used + 1);
+    }
+
+    const push = MoeColsDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = @intCast(k_used),
+        .use_active_blocks = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    var max_diff: f32 = 0.0;
+    for (0..route_slots) |route| {
+        const expert_id: usize = if (route % 2 == 0) 1 else 2;
+        const token = route / k_used;
+        const matrix_raw = weight_buf.cpu_ptr.?[expert_id * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[token * K .. (token + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q4_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            const actual = output_ptr[route * M + row];
+            max_diff = @max(max_diff, @abs(expected - actual));
+        }
+    }
+    try std.testing.expect(max_diff < 0.001);
+}
+
 test "dmmv_q5k_moe shader matches CPU reference across selected experts" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -8933,6 +20679,315 @@ test "dmmv_q5k_moe shader matches CPU reference across selected experts" {
 
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_used), 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.05);
+        }
+    }
+}
+
+test "dmmv_q5k_moe_k512 shader matches CPU reference across paired rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 67;
+    const K: usize = 512;
+    const n_used: usize = 3;
+    const n_experts: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 176;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 7) + blk))));
+                const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 5)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+                weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                for (0..12) |i| {
+                    weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((expert * 37 + row * 11 + blk * 5 + i * 3) & 0xFF);
+                }
+                for (0..32) |i| {
+                    weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((expert * 19 + row * 7 + blk * 13 + i * 5) & 0xFF);
+                }
+                for (0..128) |i| {
+                    weight_buf.cpu_ptr.?[base + 48 + i] = @intCast((expert * 23 + row * 17 + blk * 19 + i * 7) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 29 + i * 17 + 3) % 23);
+            input_ptr[slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 0;
+    routing_ptr[2] = 2;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.05);
+        }
+    }
+}
+
+test "dmmv_q5k_moe_k512_quad shader matches CPU reference across four rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 69;
+    const K: usize = 512;
+    const n_used: usize = 3;
+    const n_experts: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 176;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 7) + blk))));
+                const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 5)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+                weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                for (0..12) |i| {
+                    weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((expert * 41 + row * 13 + blk * 7 + i * 3) & 0xFF);
+                }
+                for (0..32) |i| {
+                    weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((expert * 23 + row * 11 + blk * 17 + i * 5) & 0xFF);
+                }
+                for (0..128) |i| {
+                    weight_buf.cpu_ptr.?[base + 48 + i] = @intCast((expert * 29 + row * 19 + blk * 23 + i * 7) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 31 + i * 17 + 9) % 23);
+            input_ptr[slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 0;
+    routing_ptr[2] = 2;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 63) / 64), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = weight_buf.cpu_ptr.?[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[slot * K .. (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.05);
+        }
+    }
+}
+
+test "dmmv_q5k_moe_k512_tri shader matches CPU reference across three rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_tri");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 70;
+    const K: usize = 512;
+    const n_used: usize = 3;
+    const n_experts: usize = 4;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_used * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_used * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 176;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 7) + blk))));
+                const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 5)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+                weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+                weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+                weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+                for (0..12) |i| {
+                    weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((expert * 43 + row * 17 + blk * 7 + i * 3) & 0xFF);
+                }
+                for (0..32) |i| {
+                    weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((expert * 29 + row * 13 + blk * 19 + i * 5) & 0xFF);
+                }
+                for (0..128) |i| {
+                    weight_buf.cpu_ptr.?[base + 48 + i] = @intCast((expert * 31 + row * 23 + blk * 29 + i * 7) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((slot * 37 + i * 19 + 11) % 23);
+            input_ptr[slot * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 0;
+    routing_ptr[2] = 2;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 47) / 48), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
     cmd.commitAndWait();
 
     const allocator = std.testing.allocator;
@@ -9047,6 +21102,433 @@ test "dmmv_q6k_moe shader matches CPU reference across selected experts" {
             }
             try std.testing.expectApproxEqAbs(expected, output_ptr[slot * M + row], 0.05);
         }
+    }
+}
+
+test "dmmv_q5_1_moe_cols shader matches per-route CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 5;
+    const K: usize = 64;
+    const n_tokens: usize = 5;
+    const k_used: usize = 2;
+    const n_experts: usize = 3;
+    const route_slots = n_tokens * k_used;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 24;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, route_slots * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, route_slots * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * n_tokens * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const weight_ptr = weight_buf.cpu_ptr.?;
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 24;
+                const scale = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + row + blk))));
+                const min_val = @as(f16, @floatCast(-0.125 + 0.015625 * @as(f32, @floatFromInt(expert + row + blk))));
+                const scale_bits = @as(u16, @bitCast(scale));
+                const min_bits = @as(u16, @bitCast(min_val));
+                std.mem.writeInt(u16, weight_ptr[base..][0..2], scale_bits, .little);
+                std.mem.writeInt(u16, weight_ptr[base + 2 ..][0..2], min_bits, .little);
+
+                var qh: u32 = 0;
+                for (0..16) |j| {
+                    const q0: u32 = @intCast((expert * 11 + row * 7 + blk * 5 + j * 3) % 32);
+                    const q1: u32 = @intCast((expert * 13 + row * 5 + blk * 3 + j * 9 + 1) % 32);
+                    if (q0 >= 16) qh |= @as(u32, 1) << @as(u5, @intCast(j));
+                    if (q1 >= 16) qh |= @as(u32, 1) << @as(u5, @intCast(j + 16));
+                    const lo: u8 = @intCast(q0 & 0x0f);
+                    const hi: u8 = @intCast(q1 & 0x0f);
+                    weight_ptr[base + 8 + j] = lo | (hi << 4);
+                }
+                std.mem.writeInt(u32, weight_ptr[base + 4 ..][0..4], qh, .little);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((route * 17 + i * 7 + 3) % 19);
+            input_ptr[route * K + i] = 0.0625 * @as(f32, @floatFromInt(raw - 9));
+        }
+    }
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    counts_ptr[1] = @intCast(n_tokens);
+    counts_ptr[2] = @intCast(n_tokens);
+    for (0..n_tokens) |token| {
+        ids_ptr[1 * n_tokens + token] = @intCast(token * k_used);
+        ids_ptr[2 * n_tokens + token] = @intCast(token * k_used + 1);
+    }
+
+    const push = MoeColsDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
+        .use_active_blocks = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    var max_diff: f32 = 0.0;
+    for (0..route_slots) |route| {
+        const expert_id: usize = if (route % 2 == 0) 1 else 2;
+        const matrix_raw = weight_buf.cpu_ptr.?[expert_id * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[route * K .. (route + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_1, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            const actual = output_ptr[route * M + row];
+            max_diff = @max(max_diff, @abs(expected - actual));
+        }
+    }
+    try std.testing.expect(max_diff < 0.001);
+}
+
+test "dmmv_q5k_moe_cols shader matches per-route CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 7;
+    const K: usize = 512;
+    const n_tokens: usize = 5;
+    const k_used: usize = 2;
+    const n_experts: usize = 3;
+    const route_slots = n_tokens * k_used;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, route_slots * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, route_slots * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * n_tokens * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const weight_ptr = weight_buf.cpu_ptr.?;
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 176;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 5) + blk))));
+                const dmin = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + ((expert + row + blk) % 7)))));
+                const d_bits = @as(u16, @bitCast(d));
+                const dmin_bits = @as(u16, @bitCast(dmin));
+                std.mem.writeInt(u16, weight_ptr[base..][0..2], d_bits, .little);
+                std.mem.writeInt(u16, weight_ptr[base + 2 ..][0..2], dmin_bits, .little);
+                for (0..12) |i| {
+                    weight_ptr[base + 4 + i] = @intCast((expert * 31 + row * 9 + blk * 5 + i * 3) & 0xFF);
+                }
+                for (0..32) |i| {
+                    weight_ptr[base + 16 + i] = @intCast((expert * 17 + row * 7 + blk * 11 + i * 5) & 0xFF);
+                }
+                for (0..128) |i| {
+                    weight_ptr[base + 48 + i] = @intCast((expert * 19 + row * 13 + blk * 17 + i * 7) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((route * 17 + i * 7 + 3) % 19);
+            input_ptr[route * K + i] = 0.0625 * @as(f32, @floatFromInt(raw - 9));
+        }
+    }
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    counts_ptr[1] = @intCast(n_tokens);
+    counts_ptr[2] = @intCast(n_tokens);
+    for (0..n_tokens) |token| {
+        ids_ptr[1 * n_tokens + token] = @intCast(token * k_used);
+        ids_ptr[2 * n_tokens + token] = @intCast(token * k_used + 1);
+    }
+
+    const push = MoeColsDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
+        .use_active_blocks = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    var max_diff: f32 = 0.0;
+    for (0..route_slots) |route| {
+        const expert_id: usize = if (route % 2 == 0) 1 else 2;
+        const matrix_raw = weight_buf.cpu_ptr.?[expert_id * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[route * K .. (route + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q5_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            const actual = output_ptr[route * M + row];
+            max_diff = @max(max_diff, @abs(expected - actual));
+        }
+    }
+    try std.testing.expect(max_diff < 0.05);
+}
+
+test "dmmv_q6k_moe_cols shader matches per-route CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 7;
+    const K: usize = 512;
+    const n_tokens: usize = 5;
+    const k_used: usize = 2;
+    const n_experts: usize = 3;
+    const route_slots = n_tokens * k_used;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 210;
+    const expert_stride: usize = M * row_bytes;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, route_slots * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, route_slots * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * n_tokens * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const weight_ptr = weight_buf.cpu_ptr.?;
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 210;
+                const d = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + expert + (row % 5) + blk))));
+                const d_bits = @as(u16, @bitCast(d));
+                weight_ptr[base + 208] = @truncate(d_bits);
+                weight_ptr[base + 209] = @truncate(d_bits >> 8);
+                for (0..192) |i| {
+                    weight_ptr[base + i] = @intCast((expert * 23 + row * 11 + blk * 17 + i * 7) & 0xFF);
+                }
+                for (0..16) |i| {
+                    weight_ptr[base + 192 + i] = @intCast((expert * 29 + row * 13 + blk * 19 + i * 5) & 0xFF);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((route * 31 + i * 17 + 9) % 25);
+            input_ptr[route * K + i] = 0.125 * @as(f32, @floatFromInt(raw - 12));
+        }
+    }
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    counts_ptr[1] = @intCast(n_tokens);
+    counts_ptr[2] = @intCast(n_tokens);
+    for (0..n_tokens) |token| {
+        ids_ptr[1 * n_tokens + token] = @intCast(token * k_used);
+        ids_ptr[2 * n_tokens + token] = @intCast(token * k_used + 1);
+    }
+
+    const push = MoeColsDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .expert_stride = @intCast(expert_stride),
+        .x_offset = 0,
+        .y_offset = 0,
+        .ids_stride = @intCast(n_tokens),
+        .x_route_divisor = 1,
+        .use_active_blocks = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &counts_buf, &ids_buf, &ids_buf, &counts_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 7) / 8), @intCast(n_experts), @intCast((n_tokens + 3) / 4) }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeColsDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    var max_diff: f32 = 0.0;
+    for (0..route_slots) |route| {
+        const expert_id: usize = if (route % 2 == 0) 1 else 2;
+        const matrix_raw = weight_buf.cpu_ptr.?[expert_id * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[route * K .. (route + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .q6_k, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            const actual = output_ptr[route * M + row];
+            max_diff = @max(max_diff, @abs(expected - actual));
+        }
+    }
+    try std.testing.expect(max_diff < 0.05);
+}
+
+test "dotQ8_0Row matches dequantized row dot" {
+    const M: usize = 3;
+    const K: usize = 64;
+    const block_size: usize = 32;
+    const bpb: usize = 34;
+    const bpr = K / block_size;
+
+    var raw: [M * bpr * bpb]u8 = undefined;
+    for (0..M) |row| {
+        for (0..bpr) |block| {
+            const bo = (row * bpr + block) * bpb;
+            const scale = @as(f32, 0.125) * @as(f32, @floatFromInt(row + block + 1));
+            const scale_bits: u16 = @bitCast(@as(f16, @floatCast(scale)));
+            std.mem.writeInt(u16, raw[bo..][0..2], scale_bits, .little);
+            for (0..block_size) |j| {
+                const q: i8 = @intCast(@as(i32, @intCast((row * 17 + block * 11 + j * 3) % 31)) - 15);
+                raw[bo + 2 + j] = @bitCast(q);
+            }
+        }
+    }
+
+    var input: [K]f32 = undefined;
+    for (&input, 0..) |*v, i| {
+        v.* = (@as(f32, @floatFromInt((i * 7) % 19)) - 9.0) * 0.03125;
+    }
+
+    var row_buf: [K]f32 = undefined;
+    for (0..M) |row| {
+        dequantRow(raw[0..], @intCast(row), @intCast(K), .q8_0, row_buf[0..]);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += row_buf[i] * input[i];
+        try std.testing.expectApproxEqAbs(expected, dotQ8_0Row(raw[0..], @intCast(row), @intCast(K), input[0..].ptr), 0.00001);
+    }
+}
+
+test "cpu Q8_0 parallel argmax matches serial row pass" {
+    const allocator = std.testing.allocator;
+    const M: u32 = 4096;
+    const K: u32 = 64;
+    const block_size: usize = 32;
+    const bpb: usize = 34;
+    const bpr: usize = @as(usize, K) / block_size;
+    const row_bytes = bpr * bpb;
+
+    const raw = try allocator.alloc(u8, @as(usize, M) * row_bytes);
+    defer allocator.free(raw);
+    const input = try allocator.alloc(f32, K);
+    defer allocator.free(input);
+    const parallel_out = try allocator.alloc(f32, M);
+    defer allocator.free(parallel_out);
+    const serial_out = try allocator.alloc(f32, M);
+    defer allocator.free(serial_out);
+
+    for (0..@as(usize, M)) |row| {
+        for (0..bpr) |block| {
+            const bo = row * row_bytes + block * bpb;
+            const scale = @as(f32, 0.03125) * @as(f32, @floatFromInt(1 + ((row + block) % 7)));
+            const scale_bits: u16 = @bitCast(@as(f16, @floatCast(scale)));
+            std.mem.writeInt(u16, raw[bo..][0..2], scale_bits, .little);
+            for (0..block_size) |j| {
+                const q_raw: i32 = @intCast((row * 13 + block * 7 + j * 5) % 63);
+                const q: i8 = @intCast(q_raw - 31);
+                raw[bo + 2 + j] = @bitCast(q);
+            }
+        }
+    }
+
+    for (input, 0..) |*v, i| {
+        v.* = (@as(f32, @floatFromInt((i * 3) % 17)) - 8.0) * 0.125;
+    }
+
+    const parallel_best = cpuDmmvQ8_0ParallelArgmax(raw, M, K, input.ptr, parallel_out.ptr, allocator);
+    const serial_best = cpuDmmvQ8_0RowsArgmax(raw, 0, M, K, input.ptr, serial_out.ptr);
+
+    try std.testing.expectEqual(serial_best.idx, parallel_best.idx);
+    try std.testing.expectApproxEqAbs(serial_best.val, parallel_best.val, 0.00001);
+    for (0..@as(usize, M)) |row| {
+        try std.testing.expectApproxEqAbs(serial_out[row], parallel_out[row], 0.00001);
     }
 }
 
@@ -9265,6 +21747,317 @@ test "dmmv_q8_0 shader matches CPU reference across many workgroups" {
     }
 }
 
+test "gemm_q8_0 shader matches CPU reference for batched tokens" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemm_q8_0");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 70;
+    const K: usize = 64;
+    const N: usize = 5;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 3)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = K * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2WithTgMem(&pipe, .{ @intCast((N + 31) / 32), @intCast((M + 63) / 64), 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        const token_input = input_ptr[token * K .. (token + 1) * K];
+        for (0..M) |row| {
+            dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+            var expected: f32 = 0;
+            for (0..K) |i| expected += ref_row[i] * token_input[i];
+            try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.1);
+        }
+    }
+}
+
+test "gemm_f32_small shader matches CPU reference for batched tokens" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemm_f32_small");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 5;
+    const K: usize = 64;
+    const N: usize = 4;
+    const weight_offset: usize = 16;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.? + weight_offset));
+    for (0..M * K) |i| {
+        const raw: i32 = @intCast((i * 11 + 3) % 23);
+        weight_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 7 + 5) % 19);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 9));
+    }
+
+    const push = GemmF32SmallPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .N = @intCast(N),
+        .src0_off = @intCast(weight_offset),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast(M), @intCast(N), 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(GemmF32SmallPush), 0);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        for (0..M) |row| {
+            var expected: f32 = 0;
+            for (0..K) |col| {
+                expected += weight_ptr[row * K + col] * input_ptr[token * K + col];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.001);
+        }
+    }
+}
+
+test "dmmv_f32_dual_small shader matches batched alpha beta CPU references" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_f32_dual_small");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 7;
+    const K: usize = 64;
+    const N: usize = 3;
+    const weight_offset: usize = 16;
+
+    var weight0_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight0_buf);
+    var weight1_buf = try metal_buffer.createBuffer(ctx, weight_offset + M * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight1_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output0_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output0_buf);
+    var output1_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output1_buf);
+
+    @memset(weight0_buf.cpu_ptr.?[0..weight0_buf.size], 0);
+    @memset(weight1_buf.cpu_ptr.?[0..weight1_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
+    @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
+
+    const w0: [*]f32 = @ptrCast(@alignCast(weight0_buf.cpu_ptr.? + weight_offset));
+    const w1: [*]f32 = @ptrCast(@alignCast(weight1_buf.cpu_ptr.? + weight_offset));
+    for (0..M * K) |i| {
+        const raw0: i32 = @intCast((i * 11 + 5) % 31);
+        const raw1: i32 = @intCast((i * 13 + 7) % 29);
+        w0[i] = 0.03125 * @as(f32, @floatFromInt(raw0 - 15));
+        w1[i] = 0.025 * @as(f32, @floatFromInt(raw1 - 14));
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 37);
+        input_ptr[i] = 0.05 * @as(f32, @floatFromInt(raw - 18));
+    }
+
+    const push = DualQ8DmmvPush{
+        .M0 = @intCast(M),
+        .M1 = @intCast(M),
+        .K = @intCast(K),
+        .a0_offset = @intCast(weight_offset),
+        .a1_offset = @intCast(weight_offset),
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &input_buf, &output0_buf, &output1_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 2, @intCast(N) }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const out0: [*]const f32 = @ptrCast(@alignCast(output0_buf.cpu_ptr.?));
+    const out1: [*]const f32 = @ptrCast(@alignCast(output1_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        for (0..M) |row| {
+            var expected0: f32 = 0;
+            var expected1: f32 = 0;
+            for (0..K) |col| {
+                const x = input_ptr[token * K + col];
+                expected0 += w0[row * K + col] * x;
+                expected1 += w1[row * K + col] * x;
+            }
+            try std.testing.expectApproxEqAbs(expected0, out0[token * M + row], 0.0001);
+            try std.testing.expectApproxEqAbs(expected1, out1[token * M + row], 0.0001);
+        }
+    }
+}
+
+test "gemm_q5k shader matches CPU reference for batched tokens" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "gemm_q5k");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 70;
+    const K: usize = 512;
+    const N: usize = 5;
+    const blocks_per_row: usize = K / 256;
+    const row_bytes: usize = blocks_per_row * 176;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, N * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, N * M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 176;
+            const d_mag = 0.015625 * @as(f32, @floatFromInt(1 + (row % 5) + blk));
+            const dmin_mag = 0.00390625 * @as(f32, @floatFromInt(1 + ((row + blk) % 7)));
+            const d_bits = @as(u16, @bitCast(@as(f16, @floatCast(d_mag))));
+            const dmin_bits = @as(u16, @bitCast(@as(f16, @floatCast(dmin_mag))));
+            weight_buf.cpu_ptr.?[base] = @truncate(d_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(d_bits >> 8);
+            weight_buf.cpu_ptr.?[base + 2] = @truncate(dmin_bits);
+            weight_buf.cpu_ptr.?[base + 3] = @truncate(dmin_bits >> 8);
+            for (0..12) |i| {
+                weight_buf.cpu_ptr.?[base + 4 + i] = @intCast((i * 17 + row * 3 + blk * 11) & 0xFF);
+            }
+            for (0..32) |i| {
+                weight_buf.cpu_ptr.?[base + 16 + i] = @intCast((i * 9 + row * 5 + blk * 13) & 0xFF);
+            }
+            for (0..128) |i| {
+                const lo: u8 = @intCast((i + row * 7 + blk * 3) & 0x0F);
+                const hi: u8 = @intCast((15 - ((i * 5 + row + blk) & 0x0F)) & 0x0F);
+                weight_buf.cpu_ptr.?[base + 48 + i] = lo | (hi << 4);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..N * K) |i| {
+        const raw: i32 = @intCast((i * 17 + 9) % 31);
+        input_ptr[i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+    }
+
+    const push = GemmPush{
+        .ne00 = @intCast(K),
+        .ne02 = 1,
+        .nb01 = row_bytes,
+        .nb02 = 0,
+        .ne12 = 1,
+        .nb10 = 4,
+        .nb11 = K * @sizeOf(f32),
+        .nb12 = 0,
+        .ne0 = @intCast(M),
+        .ne1 = @intCast(N),
+        .src0_off = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2WithTgMem(&pipe, .{ @intCast((N + 31) / 32), @intCast((M + 63) / 64), 1 }, .{ 128, 1, 1 }, &bufs, &push, @sizeOf(GemmPush), 0, 8192);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..N) |token| {
+        const token_input = input_ptr[token * K .. (token + 1) * K];
+        for (0..M) |row| {
+            dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q5_k, ref_row);
+            var expected: f32 = 0;
+            for (0..K) |i| expected += ref_row[i] * token_input[i];
+            try std.testing.expectApproxEqAbs(expected, output_ptr[token * M + row], 0.75);
+        }
+    }
+}
+
 test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_down.weight"));
     try std.testing.expect(!shouldUseGlobalQ8Override(.gemma, "blk.0.ffn_up.weight"));
@@ -9273,15 +22066,15 @@ test "global q8 override skips gemma shared expert q8 tensors" {
     try std.testing.expect(shouldUseGlobalQ8Override(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "gemma shared down q8 tensors use CPU fallback" {
-    try std.testing.expect(shouldCpuQ8Fallback(.gemma, "blk.0.ffn_down.weight"));
-    try std.testing.expect(shouldCpuQ8Fallback(.gemma, "blk.0.ffn_down_shexp.weight"));
+test "gemma shared down q8 tensors stay GPU eligible" {
+    try std.testing.expect(!shouldCpuQ8Fallback(.gemma, "blk.0.ffn_down.weight"));
+    try std.testing.expect(!shouldCpuQ8Fallback(.gemma, "blk.0.ffn_down_shexp.weight"));
     try std.testing.expect(!shouldCpuQ8Fallback(.gemma, "blk.0.ffn_up.weight"));
     try std.testing.expect(!shouldCpuQ8Fallback(.qwen35, "blk.0.ffn_down.weight"));
 }
 
-test "gemma q8 lm head uses CPU fallback" {
-    try std.testing.expect(shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
+test "q8 lm head stays on GPU" {
+    try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q8_0));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.gemma, .q4_k));
     try std.testing.expect(!shouldCpuLmHeadFallbackForType(.qwen35, .q8_0));
 }
@@ -9423,6 +22216,183 @@ test "dmmv_q8_0_dual shader matches CPU reference across both outputs" {
     }
 }
 
+test "dmmv_q8_0_pair shader matches CPU reference for equal-shape outputs" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 67;
+    const K: usize = 256;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight0_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight0_buf);
+    var weight1_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight1_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output0_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output0_buf);
+    var output1_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output1_buf);
+
+    @memset(weight0_buf.cpu_ptr.?[0..weight0_buf.size], 0);
+    @memset(weight1_buf.cpu_ptr.?[0..weight1_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output0_buf.cpu_ptr.?[0..output0_buf.size], 0);
+    @memset(output1_buf.cpu_ptr.?[0..output1_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale0 = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 7)))));
+            const scale1 = @as(f16, @floatCast(0.046875 * @as(f32, @floatFromInt(1 + (row % 3) + (blk % 5)))));
+            const bits0 = @as(u16, @bitCast(scale0));
+            const bits1 = @as(u16, @bitCast(scale1));
+            weight0_buf.cpu_ptr.?[base] = @truncate(bits0);
+            weight0_buf.cpu_ptr.?[base + 1] = @truncate(bits0 >> 8);
+            weight1_buf.cpu_ptr.?[base] = @truncate(bits1);
+            weight1_buf.cpu_ptr.?[base + 1] = @truncate(bits1 >> 8);
+            for (0..32) |e| {
+                const q0_raw: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q1_raw: i32 = @intCast((row * 13 + blk * 3 + e * 7) % 61);
+                weight0_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(q0_raw - 31)));
+                weight1_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(q1_raw - 30)));
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 13 + 7) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = DualQ8DmmvPush{
+        .M0 = @intCast(M),
+        .M1 = @intCast(M),
+        .K = @intCast(K),
+        .a0_offset = 0,
+        .a1_offset = 0,
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &input_buf, &output0_buf, &output1_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output0_ptr: [*]const f32 = @ptrCast(@alignCast(output0_buf.cpu_ptr.?));
+    const output1_ptr: [*]const f32 = @ptrCast(@alignCast(output1_buf.cpu_ptr.?));
+
+    for (0..M) |row| {
+        var expected0: f32 = 0;
+        var expected1: f32 = 0;
+        dequantRow(weight0_buf.cpu_ptr.?[0..weight0_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| expected0 += ref_row[i] * input_ptr[i];
+        dequantRow(weight1_buf.cpu_ptr.?[0..weight1_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| expected1 += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected0, output0_ptr[row], 0.05);
+        try std.testing.expectApproxEqAbs(expected1, output1_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_pair_swiglu shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 65;
+    const K: usize = 256;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var gate_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&gate_buf);
+    var up_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&up_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(gate_buf.cpu_ptr.?[0..gate_buf.size], 0);
+    @memset(up_buf.cpu_ptr.?[0..up_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const gate_scale = @as(f16, @floatCast(0.02734375 * @as(f32, @floatFromInt(1 + (row % 7) + (blk % 3)))));
+            const up_scale = @as(f16, @floatCast(0.03515625 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 5)))));
+            const gate_bits = @as(u16, @bitCast(gate_scale));
+            const up_bits = @as(u16, @bitCast(up_scale));
+            gate_buf.cpu_ptr.?[base] = @truncate(gate_bits);
+            gate_buf.cpu_ptr.?[base + 1] = @truncate(gate_bits >> 8);
+            up_buf.cpu_ptr.?[base] = @truncate(up_bits);
+            up_buf.cpu_ptr.?[base + 1] = @truncate(up_bits >> 8);
+            for (0..32) |e| {
+                const gate_raw: i32 = @intCast((row * 17 + blk * 11 + e * 3) % 41);
+                const up_raw: i32 = @intCast((row * 19 + blk * 5 + e * 7) % 43);
+                gate_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(gate_raw - 20)));
+                up_buf.cpu_ptr.?[base + 2 + e] = @bitCast(@as(i8, @intCast(up_raw - 21)));
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 5 + 3) % 23);
+        input_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+    }
+
+    const push = DualQ8DmmvPush{
+        .M0 = @intCast(M),
+        .M1 = @intCast(M),
+        .K = @intCast(K),
+        .a0_offset = 0,
+        .a1_offset = 0,
+        .x_offset = 0,
+        .y0_offset = 0,
+        .y1_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &gate_buf, &up_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        var gate_expected: f32 = 0;
+        var up_expected: f32 = 0;
+        dequantRow(gate_buf.cpu_ptr.?[0..gate_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| gate_expected += ref_row[i] * input_ptr[i];
+        dequantRow(up_buf.cpu_ptr.?[0..up_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        for (0..K) |i| up_expected += ref_row[i] * input_ptr[i];
+        const expected = (gate_expected / (1.0 + @exp(-gate_expected))) * up_expected;
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
 test "dmmv_q4k_k2048 shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -9508,15 +22478,77 @@ test "batched MoE Metal shaders compile" {
 
     var dmmv_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe");
     defer metal_pipeline.freePipeline(&dmmv_pipe);
+    var dmmv_q4k_moe_gate_up_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_pipe);
+    var dmmv_q4k_moe_gate_up_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_pipe);
+    var dmmv_q4k_moe_gate_up_dual_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_dual_k2048");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_dual_k2048_pipe);
+    var dmmv_q4k_moe_gate_up_swiglu_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_gate_up_swiglu_k2048");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_gate_up_swiglu_k2048_pipe);
+    var dmmv_q8_0_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_quad_pipe);
+    var dmmv_q8_0_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k2048_quad_pipe);
+    var dmmv_q8_0_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k4096_pipe);
+    var dmmv_q8_0_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k4096_quad_pipe);
+    var dmmv_q8_0_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_k512_quad_pipe);
+    var dmmv_q8_0_repacked_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_quad_pipe);
+    var dmmv_q8_0_repacked_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_pipe);
+    var dmmv_q8_0_repacked_k4096_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_pipe);
+    var dmmv_q8_0_repacked_k2048_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_nr2_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_nr2_qwen_pipe);
+    var dmmv_q8_0_repacked_k4096_nr2_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_nr2_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_nr2_qwen_pipe);
+    var dmmv_q8_0_repacked_k2048_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_quad_pipe);
+    var dmmv_q8_0_repacked_k4096_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_quad_pipe);
+    var dmmv_q8_0_repacked_k2048_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k2048_qwen_pipe);
+    var dmmv_q8_0_repacked_k4096_qwen_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_qwen");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_repacked_k4096_qwen_pipe);
+    var dmmv_q8_0_pair_swiglu_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_pair_swiglu");
+    defer metal_pipeline.freePipeline(&dmmv_q8_0_pair_swiglu_pipe);
+    var dmmv_q4k_dense_gate_up_geglu_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dense_gate_up_geglu");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_dense_gate_up_geglu_pipe);
+    var dmmv_q4k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_moe_cols_pipe);
+    var dmmv_q5_1_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe");
+    defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_pipe);
+    var dmmv_q5_1_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5_1_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q5_1_moe_cols_pipe);
     var dmmv_q5k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_pipe);
+    var dmmv_q5k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q5k_moe_cols_pipe);
+    var dmmv_q5k_moe_k512_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512");
+    defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k512_pipe);
+    var dmmv_q5k_moe_k512_tri_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_tri");
+    defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k512_tri_pipe);
+    var dmmv_q5k_moe_k512_quad_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k512_quad");
+    defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k512_quad_pipe);
     var dmmv_q5k_moe_k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q5k_moe_k2048");
     defer metal_pipeline.freePipeline(&dmmv_q5k_moe_k2048_pipe);
     var dmmv_q6k_moe_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe");
     defer metal_pipeline.freePipeline(&dmmv_q6k_moe_pipe);
+    var dmmv_q6k_moe_cols_pipe = try loadShaderPipeline(ctx, "dmmv_q6k_moe_cols");
+    defer metal_pipeline.freePipeline(&dmmv_q6k_moe_cols_pipe);
+    var gemm_q5k_pipe = try loadShaderPipeline(ctx, "gemm_q5k");
+    defer metal_pipeline.freePipeline(&gemm_q5k_pipe);
 
     var dmmv_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_k2048");
     defer metal_pipeline.freePipeline(&dmmv_pipe_k2048);
+    var dmmv_q4k_dual_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_dual_pipe);
+    var dmmv_q4k_dual_llama_pipe = try loadShaderPipeline(ctx, "dmmv_q4k_dual_llama");
+    defer metal_pipeline.freePipeline(&dmmv_q4k_dual_llama_pipe);
 
     var dmmv_moe_pipe_k2048 = try loadShaderPipeline(ctx, "dmmv_q4k_moe_k2048");
     defer metal_pipeline.freePipeline(&dmmv_moe_pipe_k2048);
@@ -9525,6 +22557,8 @@ test "batched MoE Metal shaders compile" {
 
     var swiglu_pipe = try loadShaderPipeline(ctx, "swiglu_batched");
     defer metal_pipeline.freePipeline(&swiglu_pipe);
+    var rms_norm_offset_pipe = try loadShaderPipeline(ctx, "rms_norm_mul_offset");
+    defer metal_pipeline.freePipeline(&rms_norm_offset_pipe);
 
     var acc_pipe = try loadShaderPipeline(ctx, "moe_accumulate_batched");
     defer metal_pipeline.freePipeline(&acc_pipe);
@@ -9535,10 +22569,60 @@ test "batched MoE Metal shaders compile" {
     defer metal_pipeline.freePipeline(&lmhead_pipe_1024);
     var topk_pipe = try loadShaderPipeline(ctx, "softmax_topk");
     defer metal_pipeline.freePipeline(&topk_pipe);
+    var topk_scaled_pipe = try loadShaderPipeline(ctx, "softmax_topk_scaled");
+    defer metal_pipeline.freePipeline(&topk_scaled_pipe);
+    var topk_batched_pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
+    defer metal_pipeline.freePipeline(&topk_batched_pipe);
+    var router_q8_repacked_pipe = try loadShaderPipeline(ctx, "router_q8_0_topk_repacked_k2048");
+    defer metal_pipeline.freePipeline(&router_q8_repacked_pipe);
+    var residual_router_q8_repacked_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_q8_0_topk_repacked_k2048");
+    defer metal_pipeline.freePipeline(&residual_router_q8_repacked_pipe);
+    var residual_router_f32_pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
+    defer metal_pipeline.freePipeline(&residual_router_f32_pipe);
+    var route_pack_pipe = try loadShaderPipeline(ctx, "moe_route_pack");
+    defer metal_pipeline.freePipeline(&route_pack_pipe);
+    var route_pack_blocks_pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&route_pack_blocks_pipe);
+    var route_ids_pipe = try loadShaderPipeline(ctx, "moe_route_ids");
+    defer metal_pipeline.freePipeline(&route_ids_pipe);
+    var route_gather_pipe = try loadShaderPipeline(ctx, "moe_route_gather");
+    defer metal_pipeline.freePipeline(&route_gather_pipe);
+    var route_scatter_pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
+    defer metal_pipeline.freePipeline(&route_scatter_pipe);
+    var route_scatter_set_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_set");
+    defer metal_pipeline.freePipeline(&route_scatter_set_pipe);
+    var route_scatter_shared_residual_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
+    defer metal_pipeline.freePipeline(&route_scatter_shared_residual_pipe);
+    var route_scatter_shared_residual_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual_gate_f32");
+    defer metal_pipeline.freePipeline(&route_scatter_shared_residual_gate_f32_pipe);
+    var route_scatter_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
+    defer metal_pipeline.freePipeline(&route_scatter_scaled_pipe);
+    var route_scatter_direct_scaled_pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
+    defer metal_pipeline.freePipeline(&route_scatter_direct_scaled_pipe);
     var sigmoid_scale_acc_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc");
     defer metal_pipeline.freePipeline(&sigmoid_scale_acc_pipe);
+    var sigmoid_scale_acc_batched_pipe = try loadShaderPipeline(ctx, "sigmoid_scale_acc_batched");
+    defer metal_pipeline.freePipeline(&sigmoid_scale_acc_batched_pipe);
     var moe_weighted_acc_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc");
     defer metal_pipeline.freePipeline(&moe_weighted_acc_pipe);
+    var moe_weighted_acc_scaled_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_scaled");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_scaled_pipe);
+    var moe_weighted_acc_shared_gate_f32_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_pipe);
+    var moe_weighted_acc_shared_gate_f32_qwen2048_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_qwen2048_pipe);
+    var moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048_norm");
+    defer metal_pipeline.freePipeline(&moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe);
+    var ssm_delta_net_prefill_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_prefill");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_prefill_pipe);
+    var ssm_delta_net_gated_norm_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_pipe);
+    var ssm_delta_net_gated_norm_qwen_pipe = try loadShaderPipeline(ctx, "ssm_delta_net_gated_norm_qwen");
+    defer metal_pipeline.freePipeline(&ssm_delta_net_gated_norm_qwen_pipe);
+    var ssm_conv1d_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_qwen_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_qwen_d4_pipe);
+    var ssm_conv1d_prefill_qwen_d4_pipe = try loadShaderPipeline(ctx, "ssm_conv1d_prefill_qwen_d4");
+    defer metal_pipeline.freePipeline(&ssm_conv1d_prefill_qwen_d4_pipe);
 
     try std.testing.expect(deinterleave_pipe.handle != null);
     try std.testing.expect(flash_attn_pipe.handle != null);
@@ -9546,19 +22630,75 @@ test "batched MoE Metal shaders compile" {
     try std.testing.expect(rope_pipe.handle != null);
     try std.testing.expect(sigmoid_mul_pipe.handle != null);
     try std.testing.expect(dmmv_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_dual_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_dual_k2048_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_gate_up_swiglu_k2048_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k2048_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k4096_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k4096_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_k512_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_nr2_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_nr2_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_quad_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k2048_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_repacked_k4096_qwen_pipe.handle != null);
+    try std.testing.expect(dmmv_q8_0_pair_swiglu_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_dense_gate_up_geglu_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q5_1_moe_pipe.handle != null);
+    try std.testing.expect(dmmv_q5_1_moe_cols_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_pipe.handle != null);
+    try std.testing.expect(dmmv_q5k_moe_cols_pipe.handle != null);
+    try std.testing.expect(dmmv_q5k_moe_k512_pipe.handle != null);
+    try std.testing.expect(dmmv_q5k_moe_k512_tri_pipe.handle != null);
+    try std.testing.expect(dmmv_q5k_moe_k512_quad_pipe.handle != null);
     try std.testing.expect(dmmv_q5k_moe_k2048_pipe.handle != null);
     try std.testing.expect(dmmv_q6k_moe_pipe.handle != null);
+    try std.testing.expect(dmmv_q6k_moe_cols_pipe.handle != null);
+    try std.testing.expect(gemm_q5k_pipe.handle != null);
     try std.testing.expect(dmmv_pipe_k2048.handle != null);
+    try std.testing.expect(dmmv_q4k_dual_pipe.handle != null);
+    try std.testing.expect(dmmv_q4k_dual_llama_pipe.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048.handle != null);
     try std.testing.expect(dmmv_moe_pipe_k2048_1024.handle != null);
     try std.testing.expect(swiglu_pipe.handle != null);
+    try std.testing.expect(rms_norm_offset_pipe.handle != null);
     try std.testing.expect(acc_pipe.handle != null);
     try std.testing.expect(lmhead_pipe.handle != null);
     try std.testing.expect(lmhead_pipe_1024.handle != null);
     try std.testing.expect(topk_pipe.handle != null);
+    try std.testing.expect(topk_scaled_pipe.handle != null);
+    try std.testing.expect(topk_batched_pipe.handle != null);
+    try std.testing.expect(router_q8_repacked_pipe.handle != null);
+    try std.testing.expect(residual_router_q8_repacked_pipe.handle != null);
+    try std.testing.expect(route_pack_pipe.handle != null);
+    try std.testing.expect(route_pack_blocks_pipe.handle != null);
+    try std.testing.expect(route_ids_pipe.handle != null);
+    try std.testing.expect(route_gather_pipe.handle != null);
+    try std.testing.expect(route_scatter_pipe.handle != null);
+    try std.testing.expect(route_scatter_set_pipe.handle != null);
+    try std.testing.expect(route_scatter_shared_residual_pipe.handle != null);
+    try std.testing.expect(route_scatter_shared_residual_gate_f32_pipe.handle != null);
+    try std.testing.expect(route_scatter_scaled_pipe.handle != null);
+    try std.testing.expect(route_scatter_direct_scaled_pipe.handle != null);
     try std.testing.expect(sigmoid_scale_acc_pipe.handle != null);
+    try std.testing.expect(sigmoid_scale_acc_batched_pipe.handle != null);
     try std.testing.expect(moe_weighted_acc_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_scaled_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_shared_gate_f32_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_shared_gate_f32_qwen2048_pipe.handle != null);
+    try std.testing.expect(moe_weighted_acc_shared_gate_f32_qwen2048_norm_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_prefill_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_gated_norm_pipe.handle != null);
+    try std.testing.expect(ssm_delta_net_gated_norm_qwen_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_qwen_d4_pipe.handle != null);
+    try std.testing.expect(ssm_conv1d_prefill_qwen_d4_pipe.handle != null);
 }
 
 test "deinterleave shader splits block-interleaved Q and gate" {
@@ -9696,6 +22836,933 @@ test "softmax_topk shader selects top experts and normalized weights" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), w0 + w1 + w2, 0.01);
 }
 
+test "softmax_topk_batched shader routes each token independently" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "softmax_topk_batched");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: u32 = 2;
+    const n_experts: u32 = 8;
+    const k: u32 = 3;
+    const output_stride: u32 = k * 2;
+
+    var logits_buf = try metal_buffer.createBuffer(ctx, n_tokens * n_experts * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&logits_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * output_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const logits_ptr: [*]f32 = @ptrCast(@alignCast(logits_buf.cpu_ptr.?));
+    @memcpy(logits_ptr[0 .. n_tokens * n_experts], &[_]f32{
+        0.0, 1.0, 4.0, 2.0, -1.0, 3.0,  0.5, -2.0,
+        7.0, 1.0, 0.0, 6.0, 5.0,  -1.0, 2.0, 3.0,
+    });
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const push = SoftmaxTopkBatchedPush{
+        .n_experts = n_experts,
+        .k = k,
+        .logits_stride = n_experts,
+        .output_stride = output_stride,
+    };
+    const bufs = [_]*const MetalBuffer{ &logits_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ n_tokens, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(SoftmaxTopkBatchedPush), 0);
+    cmd.commitAndWait();
+
+    const out_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    try std.testing.expectEqual(@as(u32, 2), out_ptr[0]);
+    try std.testing.expectEqual(@as(u32, 5), out_ptr[1]);
+    try std.testing.expectEqual(@as(u32, 3), out_ptr[2]);
+
+    const row1 = output_stride;
+    try std.testing.expectEqual(@as(u32, 0), out_ptr[row1 + 0]);
+    try std.testing.expectEqual(@as(u32, 3), out_ptr[row1 + 1]);
+    try std.testing.expectEqual(@as(u32, 4), out_ptr[row1 + 2]);
+
+    const w00: f32 = @bitCast(out_ptr[k + 0]);
+    const w01: f32 = @bitCast(out_ptr[k + 1]);
+    const w02: f32 = @bitCast(out_ptr[k + 2]);
+    const w10: f32 = @bitCast(out_ptr[row1 + k + 0]);
+    const w11: f32 = @bitCast(out_ptr[row1 + k + 1]);
+    const w12: f32 = @bitCast(out_ptr[row1 + k + 2]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), w00 + w01 + w02, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), w10 + w11 + w12, 0.01);
+    try std.testing.expect(w00 > w01 and w01 > w02);
+    try std.testing.expect(w10 > w11 and w11 > w12);
+}
+
+test "moe_route_pack shader groups batched routing by expert" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_pack");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: u32 = 2;
+    const n_experts: u32 = 6;
+    const k: u32 = 3;
+    const routing_stride: u32 = k * 2;
+    const ids_stride: u32 = n_tokens;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 5, 3, 0, 0, 0,
+        0, 3, 4, 0, 0, 0,
+    });
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const push = MoeRoutePackPush{
+        .n_tokens = n_tokens,
+        .n_experts = n_experts,
+        .k = k,
+        .routing_stride = routing_stride,
+        .ids_stride = ids_stride,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.commitAndWait();
+
+    const counts_ptr: [*]const u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]const u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 1, 2, 1, 1 }, counts_ptr[0..n_experts]);
+    var count_sum: u32 = 0;
+    var nonzero_counts: u32 = 0;
+    for (counts_ptr[0..n_experts]) |count| {
+        count_sum += count;
+        if (count > 0) nonzero_counts += 1;
+    }
+    try std.testing.expectEqual(n_tokens * k, count_sum);
+    try std.testing.expect(nonzero_counts > 0);
+    try std.testing.expectEqual(@as(u32, 3), ids_ptr[0 * ids_stride + 0]);
+    try std.testing.expectEqual(@as(u32, 0), ids_ptr[2 * ids_stride + 0]);
+    try std.testing.expectEqual(@as(u32, 2), ids_ptr[3 * ids_stride + 0]);
+    try std.testing.expectEqual(@as(u32, 4), ids_ptr[3 * ids_stride + 1]);
+    try std.testing.expectEqual(@as(u32, 5), ids_ptr[4 * ids_stride + 0]);
+    try std.testing.expectEqual(@as(u32, 1), ids_ptr[5 * ids_stride + 0]);
+}
+
+test "moe_route_pack_blocks shader packs from flattened routes" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_pack_blocks");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 5;
+    const n_experts: usize = 6;
+    const k: usize = 3;
+    const routing_stride: usize = k * 2;
+    const ids_stride: usize = n_tokens;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+    var active_count_buf = try metal_buffer.createBuffer(ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_count_buf);
+    var active_blocks_buf = try metal_buffer.createBuffer(ctx, route_slots * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&active_blocks_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        3, 2, 5, 0, 0, 0,
+        3, 1, 4, 0, 0, 0,
+        3, 0, 2, 0, 0, 0,
+        3, 4, 5, 0, 0, 0,
+        3, 1, 2, 0, 0, 0,
+    });
+    @memset(counts_buf.cpu_ptr.?[0..counts_buf.size], 0xff);
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+    @memset(active_count_buf.cpu_ptr.?[0..active_count_buf.size], 0xff);
+    @memset(active_blocks_buf.cpu_ptr.?[0..active_blocks_buf.size], 0xff);
+
+    const push = MoeRoutePackPush{
+        .n_tokens = @intCast(n_tokens),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .ids_stride = @intCast(ids_stride),
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &counts_buf, &ids_buf, &active_count_buf, &active_blocks_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRoutePackPush), 0);
+    cmd.commitAndWait();
+
+    const counts_ptr: [*]const u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    const ids_ptr: [*]const u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    const active_count_ptr: [*]const u32 = @ptrCast(@alignCast(active_count_buf.cpu_ptr.?));
+    const active_blocks_ptr: [*]const u32 = @ptrCast(@alignCast(active_blocks_buf.cpu_ptr.?));
+
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5, 2, 2 }, counts_ptr[0..n_experts]);
+    try std.testing.expectEqual(@as(u32, 6), active_count_ptr[0]);
+
+    var seen_routes = [_]bool{false} ** route_slots;
+    for (0..n_experts) |expert| {
+        for (0..@as(usize, @intCast(counts_ptr[expert]))) |i| {
+            const route = ids_ptr[expert * ids_stride + i];
+            try std.testing.expect(route < @as(u32, @intCast(route_slots)));
+            const route_index: usize = @intCast(route);
+            try std.testing.expect(!seen_routes[route_index]);
+            seen_routes[route_index] = true;
+
+            const token = route_index / k;
+            const slot = route_index - token * k;
+            try std.testing.expectEqual(@as(u32, @intCast(expert)), routing_ptr[token * routing_stride + slot]);
+        }
+    }
+    for (seen_routes) |seen| try std.testing.expect(seen);
+
+    var seen_blocks = [_][4]bool{[_]bool{false} ** 4} ** n_experts;
+    for (0..active_count_ptr[0]) |i| {
+        const entry = active_blocks_ptr[i];
+        const expert = entry & 0xFFFF;
+        const block_idx = entry >> 16;
+        try std.testing.expect(expert < @as(u32, @intCast(n_experts)));
+        try std.testing.expect(block_idx < 4);
+        seen_blocks[@intCast(expert)][@intCast(block_idx)] = true;
+    }
+    for (0..n_experts) |expert| {
+        const expected_blocks = (counts_ptr[expert] + moe_route_block_cols - 1) / moe_route_block_cols;
+        for (0..@as(usize, @intCast(expected_blocks))) |block_idx| {
+            try std.testing.expect(seen_blocks[expert][block_idx]);
+        }
+    }
+}
+
+test "moe_route_ids shader flattens batched routing in route order" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_ids");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const k: usize = 3;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, route_slots * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 5, 3, 0, 0, 0,
+        0, 3, 4, 0, 0, 0,
+    });
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+
+    const push = MoeRouteIdsPush{
+        .n_tokens = @intCast(n_tokens),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &ids_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteIdsPush), 0);
+    cmd.commitAndWait();
+
+    const ids_ptr: [*]const u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 3, 0, 3, 4 }, ids_ptr[0..route_slots]);
+}
+
+test "moe_route_gather shader expands token inputs into route slots" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_gather");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 5;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var dst_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dst_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, 0, 0, 0,
+        1, 4, 0, 0, 0, 0,
+    });
+
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    @memcpy(src_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0,  2.0,  3.0,  4.0,
+        10.0, 20.0, 30.0, 40.0,
+    });
+    @memset(dst_buf.cpu_ptr.?[0..dst_buf.size], 0);
+
+    const push = MoeRouteGatherPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .debug = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &src_buf, &dst_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((route_slots * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteGatherPush), 0);
+    cmd.commitAndWait();
+
+    const dst_ptr: [*]const f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        const token = route / k;
+        for (0..hidden_dim) |dim| {
+            try std.testing.expectEqual(src_ptr[token * hidden_dim + dim], dst_ptr[route * hidden_dim + dim]);
+        }
+    }
+}
+
+test "moe_route_scatter shader accumulates packed batched routes by token" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const ids_stride: usize = n_tokens;
+    const route_slots: usize = n_tokens * k;
+
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var dst_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dst_buf);
+
+    const w025: u32 = @bitCast(@as(f32, 0.25));
+    const w050: u32 = @bitCast(@as(f32, 0.50));
+    const w060: u32 = @bitCast(@as(f32, 0.60));
+    const w030: u32 = @bitCast(@as(f32, 0.30));
+    const w010: u32 = @bitCast(@as(f32, 0.10));
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, w025, w050, w025,
+        1, 2, 0, w060, w030, w010,
+    });
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    @memcpy(counts_ptr[0..n_experts], &[_]u32{ 1, 2, 2, 1 });
+
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+    ids_ptr[0 * ids_stride + 0] = 5;
+    ids_ptr[1 * ids_stride + 0] = 1;
+    ids_ptr[1 * ids_stride + 1] = 3;
+    ids_ptr[2 * ids_stride + 0] = 0;
+    ids_ptr[2 * ids_stride + 1] = 4;
+    ids_ptr[3 * ids_stride + 0] = 2;
+
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            src_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+        }
+    }
+
+    const dst_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
+    @memcpy(dst_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    });
+
+    const push = MoeRouteScatterPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .ids_stride = @intCast(ids_stride),
+        .debug = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &counts_buf, &ids_buf, &routing_buf, &src_buf, &dst_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
+    cmd.commitAndWait();
+
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * src_ptr[route * hidden_dim + dim];
+            }
+        }
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], dst_ptr[i], 0.001);
+    }
+}
+
+test "moe_route_scatter_shared_residual fuses route shared and residual" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var routed_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&routed_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var gate_buf = try metal_buffer.createBuffer(ctx, n_tokens * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+
+    const w025: u32 = @bitCast(@as(f32, 0.25));
+    const w050: u32 = @bitCast(@as(f32, 0.50));
+    const w060: u32 = @bitCast(@as(f32, 0.60));
+    const w030: u32 = @bitCast(@as(f32, 0.30));
+    const w010: u32 = @bitCast(@as(f32, 0.10));
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, w025, w050, w025,
+        1, 2, 0, w060, w030, w010,
+    });
+
+    const routed_ptr: [*]f32 = @ptrCast(@alignCast(routed_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            routed_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+        }
+    }
+
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    for (0..n_tokens * hidden_dim) |i| {
+        shared_ptr[i] = 0.125 * @as(f32, @floatFromInt(i + 1));
+    }
+
+    const gate_ptr: [*]f32 = @ptrCast(@alignCast(gate_buf.cpu_ptr.?));
+    @memcpy(gate_ptr[0..n_tokens], &[_]f32{ -0.5, 0.75 });
+
+    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    @memcpy(hidden_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    });
+
+    const push = MoeRouteScatterSharedResidualPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .has_gate = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &routed_buf, &shared_buf, &gate_buf, &hidden_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualPush), 0);
+    cmd.commitAndWait();
+
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * routed_ptr[route * hidden_dim + dim];
+            }
+        }
+        const gate = 1.0 / (1.0 + @exp(-gate_ptr[token]));
+        for (0..hidden_dim) |dim| {
+            expected[token * hidden_dim + dim] += gate * shared_ptr[token * hidden_dim + dim];
+        }
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], hidden_ptr[i], 0.001);
+    }
+}
+
+test "moe_route_scatter_shared_residual_gate_f32 computes shared gate dot" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter_shared_residual_gate_f32");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 320;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var routed_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&routed_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+    var hidden_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const route_ids = [_][k]u32{
+        .{ 2, 1, 3 },
+        .{ 1, 2, 0 },
+    };
+    const route_weights = [_][k]f32{
+        .{ 0.25, 0.50, 0.25 },
+        .{ 0.60, 0.30, 0.10 },
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            routing_ptr[row + slot] = route_ids[token][slot];
+            routing_ptr[row + k + slot] = @bitCast(route_weights[token][slot]);
+        }
+    }
+
+    const routed_ptr: [*]f32 = @ptrCast(@alignCast(routed_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            const raw: i32 = @intCast((route * 17 + dim * 5 + 3) % 31);
+            routed_ptr[route * hidden_dim + dim] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+        }
+    }
+
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    for (0..n_tokens * hidden_dim) |i| {
+        const raw: i32 = @intCast((i * 7 + 11) % 29);
+        shared_ptr[i] = 0.0078125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    for (0..n_tokens) |token| {
+        for (0..hidden_dim) |dim| {
+            const raw: i32 = @intCast((token * 13 + dim * 3 + 5) % 37);
+            norm_ptr[token * hidden_dim + dim] = 0.002 * @as(f32, @floatFromInt(raw - 18));
+        }
+    }
+
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+    for (0..hidden_dim) |dim| {
+        const raw: i32 = @intCast((dim * 11 + 7) % 41);
+        gate_weight_ptr[dim] = 0.003 * @as(f32, @floatFromInt(raw - 20));
+    }
+
+    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    var expected = try std.testing.allocator.alloc(f32, n_tokens * hidden_dim);
+    defer std.testing.allocator.free(expected);
+    for (0..n_tokens) |token| {
+        for (0..hidden_dim) |dim| {
+            const i = token * hidden_dim + dim;
+            hidden_ptr[i] = @as(f32, @floatFromInt(token + 1)) + 0.0005 * @as(f32, @floatFromInt(dim % 17));
+            expected[i] = hidden_ptr[i];
+        }
+    }
+
+    const push = MoeRouteScatterSharedResidualGateF32Push{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .gate_weight_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &routed_buf, &shared_buf, &norm_buf, &gate_weight_buf, &hidden_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 256, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterSharedResidualGateF32Push), 0);
+    cmd.commitAndWait();
+
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * routed_ptr[route * hidden_dim + dim];
+            }
+        }
+        var dot: f32 = 0.0;
+        for (0..hidden_dim) |dim| dot += gate_weight_ptr[dim] * norm_ptr[token * hidden_dim + dim];
+        const gate = 1.0 / (1.0 + @exp(-dot));
+        for (0..hidden_dim) |dim| expected[token * hidden_dim + dim] += gate * shared_ptr[token * hidden_dim + dim];
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], hidden_ptr[i], 0.002);
+    }
+}
+
+test "moe_route_scatter_scaled folds per-expert scale into routing weight" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter_scaled");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const ids_stride: usize = n_tokens;
+    const route_slots: usize = n_tokens * k;
+
+    var counts_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, n_experts * ids_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var dst_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dst_buf);
+    var scales_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&scales_buf);
+
+    const w025: u32 = @bitCast(@as(f32, 0.25));
+    const w050: u32 = @bitCast(@as(f32, 0.50));
+    const w060: u32 = @bitCast(@as(f32, 0.60));
+    const w030: u32 = @bitCast(@as(f32, 0.30));
+    const w010: u32 = @bitCast(@as(f32, 0.10));
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, w025, w050, w025,
+        1, 2, 0, w060, w030, w010,
+    });
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    @memcpy(counts_ptr[0..n_experts], &[_]u32{ 1, 2, 2, 1 });
+
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    @memset(ids_buf.cpu_ptr.?[0..ids_buf.size], 0xff);
+    ids_ptr[0 * ids_stride + 0] = 5;
+    ids_ptr[1 * ids_stride + 0] = 1;
+    ids_ptr[1 * ids_stride + 1] = 3;
+    ids_ptr[2 * ids_stride + 0] = 0;
+    ids_ptr[2 * ids_stride + 1] = 4;
+    ids_ptr[3 * ids_stride + 0] = 2;
+
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            src_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+        }
+    }
+
+    const scale_ptr: [*]f32 = @ptrCast(@alignCast(scales_buf.cpu_ptr.?));
+    @memcpy(scale_ptr[0..n_experts], &[_]f32{ 0.5, 1.25, 2.0, 0.75 });
+
+    const dst_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
+    @memcpy(dst_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    });
+
+    const push = MoeRouteScatterScaledPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .ids_stride = @intCast(ids_stride),
+        .debug = 1,
+        .scale_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &counts_buf, &ids_buf, &routing_buf, &src_buf, &dst_buf, &scales_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterScaledPush), 0);
+    cmd.commitAndWait();
+
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const expert = routing_ptr[row + slot];
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * scale_ptr[expert] * src_ptr[route * hidden_dim + dim];
+            }
+        }
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], dst_ptr[i], 0.001);
+    }
+}
+
+test "moe_route_scatter_direct_scaled accumulates route-order outputs" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter_direct_scaled");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_tokens: usize = 2;
+    const n_experts: usize = 4;
+    const k: usize = 3;
+    const hidden_dim: usize = 4;
+    const routing_stride: usize = k * 2;
+    const route_slots: usize = n_tokens * k;
+
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_tokens * routing_stride * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, route_slots * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var dst_buf = try metal_buffer.createBuffer(ctx, n_tokens * hidden_dim * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dst_buf);
+    var scales_buf = try metal_buffer.createBuffer(ctx, n_experts * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&scales_buf);
+
+    const w025: u32 = @bitCast(@as(f32, 0.25));
+    const w050: u32 = @bitCast(@as(f32, 0.50));
+    const w060: u32 = @bitCast(@as(f32, 0.60));
+    const w030: u32 = @bitCast(@as(f32, 0.30));
+    const w010: u32 = @bitCast(@as(f32, 0.10));
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    @memcpy(routing_ptr[0 .. n_tokens * routing_stride], &[_]u32{
+        2, 1, 3, w025, w050, w025,
+        1, 2, 0, w060, w030, w010,
+    });
+
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    for (0..route_slots) |route| {
+        for (0..hidden_dim) |dim| {
+            src_ptr[route * hidden_dim + dim] = @as(f32, @floatFromInt(route * 10 + dim + 1));
+        }
+    }
+
+    const scale_ptr: [*]f32 = @ptrCast(@alignCast(scales_buf.cpu_ptr.?));
+    @memcpy(scale_ptr[0..n_experts], &[_]f32{ 0.5, 1.25, 2.0, 0.75 });
+
+    const dst_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
+    @memcpy(dst_ptr[0 .. n_tokens * hidden_dim], &[_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    });
+
+    const push = MoeRouteScatterDirectScaledPush{
+        .n_tokens = @intCast(n_tokens),
+        .hidden_dim = @intCast(hidden_dim),
+        .n_experts = @intCast(n_experts),
+        .k = @intCast(k),
+        .routing_stride = @intCast(routing_stride),
+        .scale_offset = 0,
+        .debug = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &routing_buf, &src_buf, &dst_buf, &scales_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((n_tokens * hidden_dim + 63) / 64), 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterDirectScaledPush), 0);
+    cmd.commitAndWait();
+
+    var expected = [_]f32{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 2.0, 2.0, 2.0,
+    };
+    for (0..n_tokens) |token| {
+        const row = token * routing_stride;
+        for (0..k) |slot| {
+            const expert = routing_ptr[row + slot];
+            const route = token * k + slot;
+            const weight: f32 = @bitCast(routing_ptr[row + k + slot]);
+            for (0..hidden_dim) |dim| {
+                expected[token * hidden_dim + dim] += weight * scale_ptr[expert] * src_ptr[route * hidden_dim + dim];
+            }
+        }
+    }
+
+    for (0..expected.len) |i| {
+        try std.testing.expectApproxEqAbs(expected[i], dst_ptr[i], 0.001);
+    }
+}
+
+test "moe_route_scatter debug marks invalid packed ids" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_route_scatter");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    var counts_buf = try metal_buffer.createBuffer(ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&counts_buf);
+    var ids_buf = try metal_buffer.createBuffer(ctx, @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&ids_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var dst_buf = try metal_buffer.createBuffer(ctx, @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&dst_buf);
+
+    const counts_ptr: [*]u32 = @ptrCast(@alignCast(counts_buf.cpu_ptr.?));
+    counts_ptr[0] = 2;
+    const ids_ptr: [*]u32 = @ptrCast(@alignCast(ids_buf.cpu_ptr.?));
+    ids_ptr[0] = 0;
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 0;
+    routing_ptr[1] = @bitCast(@as(f32, 1.0));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    src_ptr[0] = 7.0;
+    const dst_ptr: [*]f32 = @ptrCast(@alignCast(dst_buf.cpu_ptr.?));
+    dst_ptr[0] = 0.0;
+
+    const push = MoeRouteScatterPush{
+        .n_tokens = 1,
+        .hidden_dim = 1,
+        .n_experts = 1,
+        .k = 1,
+        .routing_stride = 2,
+        .ids_stride = 1,
+        .debug = 1,
+    };
+    const bufs = [_]*const MetalBuffer{ &counts_buf, &ids_buf, &routing_buf, &src_buf, &dst_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(MoeRouteScatterPush), 0);
+    cmd.commitAndWait();
+
+    try std.testing.expect(std.math.isNan(dst_ptr[0]));
+}
+
+test "BatchedPrefillScratch allocates Gemma MoE route scratch" {
+    var device = try metal_device.MetalDevice.init(std.testing.allocator, 0);
+    defer device.deinit();
+
+    var engine: InferenceEngine = undefined;
+    engine.device = &device;
+    engine.config = .{
+        .architecture = .gemma,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 16,
+        .hidden_dim = 32,
+        .intermediate_dim = 16,
+        .vocab_size = 64,
+        .context_length = 128,
+        .rope_freq_base = 10000.0,
+        .n_experts = 6,
+        .n_experts_used = 3,
+        .rope_dim = 16,
+        .ssm_d_conv = 0,
+        .ssm_d_inner = 0,
+        .ssm_d_state = 0,
+        .ssm_dt_rank = 0,
+        .ssm_n_group = 0,
+        .full_attn_interval = 1,
+        .shared_expert_intermediate_dim = 48,
+    };
+
+    const n_tokens: u32 = 2;
+    const q_dim: u32 = 32;
+    const kv_dim: u32 = 16;
+    const inter_dim: u32 = 16;
+    var scratch = try BatchedPrefillScratch.init(&engine, n_tokens, q_dim, kv_dim, inter_dim);
+    defer scratch.deinit();
+
+    const route_slots = n_tokens * engine.config.n_experts_used;
+    try std.testing.expectEqual(route_slots, scratch.moe_route_slots);
+    try std.testing.expectEqual(@as(usize, n_tokens * engine.config.n_experts_used * 2 * @sizeOf(u32)), scratch.moe_routing.size);
+    try std.testing.expectEqual(@as(usize, engine.config.n_experts * @sizeOf(u32)), scratch.moe_expert_counts.size);
+    try std.testing.expectEqual(@as(usize, engine.config.n_experts * n_tokens * @sizeOf(u32)), scratch.moe_packed_ids.size);
+    try std.testing.expectEqual(@as(usize, route_slots * @sizeOf(u32)), scratch.moe_active_blocks.size);
+    try std.testing.expectEqual(@as(usize, @sizeOf(u32)), scratch.moe_active_block_count.size);
+    try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_route_input.size);
+    try std.testing.expectEqual(@as(usize, route_slots * inter_dim * @sizeOf(f32)), scratch.moe_expert_gate.size);
+    try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_up.size);
+    try std.testing.expectEqual(scratch.moe_expert_gate.size, scratch.moe_expert_swiglu.size);
+    try std.testing.expectEqual(@as(usize, route_slots * engine.config.hidden_dim * @sizeOf(f32)), scratch.moe_expert_down.size);
+}
+
+test "maxPackedMoeRouteBlocks bounds active route block grid" {
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(0, 256));
+    try std.testing.expectEqual(@as(u32, 0), maxPackedMoeRouteBlocks(16, 0));
+    try std.testing.expectEqual(@as(u32, 8), maxPackedMoeRouteBlocks(8, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(257, 256));
+    try std.testing.expectEqual(@as(u32, 256), maxPackedMoeRouteBlocks(260, 256));
+    try std.testing.expectEqual(@as(u32, 358), maxPackedMoeRouteBlocks(134 * 8, 256));
+}
+
 test "kv_cache_write shader writes K and V slices at token offset" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -9807,7 +23874,7 @@ test "flash_attn shader handles contiguous Metal KV cache fast path" {
     const bufs = [_]*const MetalBuffer{ &page_table_buf, &q_buf, &k_cache_buf, &v_cache_buf, &out_buf, &sinks_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
     cmd.commitAndWait();
 
     var expected: [4]f32 = undefined;
@@ -9896,7 +23963,7 @@ test "flash_attn shader respects sliding window mask" {
     const bufs = [_]*const MetalBuffer{ &page_table_buf, &q_buf, &k_cache_buf, &v_cache_buf, &out_buf, &sinks_buf };
 
     var cmd = try metal_command.beginCommand(ctx);
-    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 64, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
+    cmd.dispatchV2(&pipe, .{ n_heads, 1, 1 }, .{ 32, 1, 1 }, &bufs, &push, @sizeOf(FlashAttnPush), 0);
     cmd.commitAndWait();
 
     const out_ptr: [*]const f32 = @ptrCast(@alignCast(out_buf.cpu_ptr.?));
@@ -9954,6 +24021,667 @@ test "moe_weighted_acc shader adds weighted experts into destination" {
     try std.testing.expectApproxEqAbs(@as(f32, 25.0), accum_ptr[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 36.0), accum_ptr[2], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 47.0), accum_ptr[3], 0.001);
+}
+
+test "moe_weighted_acc_shared_gate_f32 computes gate dot and reduce" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n: u32 = 768;
+    const n_used: u32 = 3;
+    const n_usize: usize = @intCast(n);
+    const n_used_usize: usize = @intCast(n_used);
+
+    var accum_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&accum_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_used_usize * n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used_usize * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+
+    const accum_ptr: [*]f32 = @ptrCast(@alignCast(accum_buf.cpu_ptr.?));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+
+    for (0..n_usize) |i| {
+        accum_ptr[i] = @floatFromInt(i);
+        shared_ptr[i] = 0.5 * @as(f32, @floatFromInt(i + 1));
+        norm_ptr[i] = 0.125 * @as(f32, @floatFromInt(i + 1));
+        gate_weight_ptr[i] = if ((i % 2) == 0) 0.25 else -0.125;
+    }
+    for (0..n_used_usize) |expert| {
+        for (0..n_usize) |i| {
+            src_ptr[expert * n_usize + i] = @as(f32, @floatFromInt((expert + 1) * 10 + i));
+        }
+    }
+    routing_ptr[0] = 3;
+    routing_ptr[1] = 7;
+    routing_ptr[2] = 11;
+    routing_ptr[3] = @bitCast(@as(f32, 0.2));
+    routing_ptr[4] = @bitCast(@as(f32, 0.3));
+    routing_ptr[5] = @bitCast(@as(f32, 0.5));
+
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = n,
+        .gate_weight_offset = 0,
+        .norm_offset = 0,
+        .hidden_scale = 0.75,
+    };
+    const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
+
+    const block_size: u32 = if (pipe.max_threads_per_threadgroup >= 512) 512 else 256;
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ (n + block_size - 1) / block_size, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.commitAndWait();
+
+    var dot: f32 = 0.0;
+    for (0..n_usize) |i| dot += norm_ptr[i] * gate_weight_ptr[i];
+    const gate = 1.0 / (1.0 + @exp(-dot));
+
+    for (0..n_usize) |i| {
+        const expected =
+            (@as(f32, @floatFromInt(i)) +
+                0.2 * src_ptr[i] +
+                0.3 * src_ptr[n_usize + i] +
+                0.5 * src_ptr[2 * n_usize + i] +
+                gate * shared_ptr[i]) * 0.75;
+        try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
+    }
+}
+
+test "moe_weighted_acc_shared_gate_f32_qwen2048 computes one-tile gate dot and reduce" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 1024) return error.SkipZigTest;
+
+    const n: u32 = 2048;
+    const n_used: u32 = 8;
+    const n_usize: usize = @intCast(n);
+    const n_used_usize: usize = @intCast(n_used);
+
+    var accum_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&accum_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_used_usize * n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used_usize * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+
+    const accum_ptr: [*]f32 = @ptrCast(@alignCast(accum_buf.cpu_ptr.?));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+
+    for (0..n_usize) |i| {
+        accum_ptr[i] = 0.01 * @as(f32, @floatFromInt(i % 17));
+        shared_ptr[i] = 0.02 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6));
+        norm_ptr[i] = 0.001 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5));
+        gate_weight_ptr[i] = 0.002 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3));
+    }
+    for (0..n_used_usize) |expert| {
+        for (0..n_usize) |i| {
+            src_ptr[expert * n_usize + i] = 0.01 * @as(f32, @floatFromInt(expert + 1)) +
+                0.001 * @as(f32, @floatFromInt(i % 5));
+        }
+    }
+    for (0..n_used_usize) |expert| {
+        routing_ptr[expert] = @intCast(expert * 3);
+        routing_ptr[n_used_usize + expert] = @bitCast(0.0275 * @as(f32, @floatFromInt(expert + 1)));
+    }
+
+    const push = MoeWeightedAccSharedGateF32Push{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = n,
+        .gate_weight_offset = 0,
+        .norm_offset = 0,
+        .hidden_scale = 0.5,
+    };
+    const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32Push), 3);
+    cmd.commitAndWait();
+
+    var dot: f32 = 0.0;
+    for (0..n_usize) |i| dot += norm_ptr[i] * gate_weight_ptr[i];
+    const gate = 1.0 / (1.0 + @exp(-dot));
+
+    for (0..n_usize) |i| {
+        var expert_sum: f32 = 0.0;
+        for (0..n_used_usize) |expert| {
+            const weight: f32 = @bitCast(routing_ptr[n_used_usize + expert]);
+            expert_sum += weight * src_ptr[expert * n_usize + i];
+        }
+        const initial = 0.01 * @as(f32, @floatFromInt(i % 17));
+        const expected = (initial + expert_sum + gate * shared_ptr[i]) * 0.5;
+        try std.testing.expectApproxEqAbs(expected, accum_ptr[i], 0.001);
+    }
+}
+
+test "moe_weighted_acc_shared_gate_f32_qwen2048_norm computes reduce and next norm" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "moe_weighted_acc_shared_gate_f32_qwen2048_norm");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 1024) return error.SkipZigTest;
+
+    const n: u32 = 2048;
+    const n_used: u32 = 8;
+    const n_usize: usize = @intCast(n);
+    const n_used_usize: usize = @intCast(n_used);
+    const eps: f32 = 1e-6;
+
+    var accum_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&accum_buf);
+    var src_buf = try metal_buffer.createBuffer(ctx, n_used_usize * n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&src_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used_usize * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+    var shared_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&shared_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var gate_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&gate_weight_buf);
+    var next_norm_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&next_norm_buf);
+    var next_weight_buf = try metal_buffer.createBuffer(ctx, n_usize * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&next_weight_buf);
+
+    const accum_ptr: [*]f32 = @ptrCast(@alignCast(accum_buf.cpu_ptr.?));
+    const src_ptr: [*]f32 = @ptrCast(@alignCast(src_buf.cpu_ptr.?));
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    const shared_ptr: [*]f32 = @ptrCast(@alignCast(shared_buf.cpu_ptr.?));
+    const norm_ptr: [*]f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    const gate_weight_ptr: [*]f32 = @ptrCast(@alignCast(gate_weight_buf.cpu_ptr.?));
+    const next_norm_ptr: [*]f32 = @ptrCast(@alignCast(next_norm_buf.cpu_ptr.?));
+    const next_weight_ptr: [*]f32 = @ptrCast(@alignCast(next_weight_buf.cpu_ptr.?));
+
+    for (0..n_usize) |i| {
+        accum_ptr[i] = 0.003 * @as(f32, @floatFromInt(i % 19));
+        shared_ptr[i] = 0.004 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8));
+        norm_ptr[i] = 0.001 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6));
+        gate_weight_ptr[i] = 0.002 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2));
+        next_weight_ptr[i] = 0.5 + 0.0001 * @as(f32, @floatFromInt(i % 23));
+        next_norm_ptr[i] = -99.0;
+    }
+    for (0..n_used_usize) |expert| {
+        for (0..n_usize) |i| {
+            src_ptr[expert * n_usize + i] = 0.002 * @as(f32, @floatFromInt(expert + 1)) +
+                0.0005 * @as(f32, @floatFromInt(i % 7));
+        }
+    }
+    for (0..n_used_usize) |expert| {
+        routing_ptr[expert] = @intCast(expert * 5);
+        routing_ptr[n_used_usize + expert] = @bitCast(0.018 * @as(f32, @floatFromInt(expert + 1)));
+    }
+
+    const push = MoeWeightedAccSharedGateF32NormPush{
+        .n = n,
+        .n_used = n_used,
+        .src_stride = n,
+        .gate_weight_offset = 0,
+        .norm_offset = 0,
+        .eps = eps,
+        .hidden_scale = 0.5,
+    };
+    const bufs = [_]*const MetalBuffer{ &accum_buf, &src_buf, &routing_buf, &shared_buf, &norm_buf, &gate_weight_buf, &next_norm_buf, &next_weight_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(MoeWeightedAccSharedGateF32NormPush), 3);
+    cmd.commitAndWait();
+
+    var dot: f32 = 0.0;
+    for (0..n_usize) |i| dot += norm_ptr[i] * gate_weight_ptr[i];
+    const gate = 1.0 / (1.0 + @exp(-dot));
+
+    var sum_sq: f64 = 0.0;
+    var expected_hidden = try std.testing.allocator.alloc(f32, n_usize);
+    defer std.testing.allocator.free(expected_hidden);
+    for (0..n_usize) |i| {
+        var expert_sum: f32 = 0.0;
+        for (0..n_used_usize) |expert| {
+            const weight: f32 = @bitCast(routing_ptr[n_used_usize + expert]);
+            expert_sum += weight * src_ptr[expert * n_usize + i];
+        }
+        const initial = 0.003 * @as(f32, @floatFromInt(i % 19));
+        const h = (initial + expert_sum + gate * shared_ptr[i]) * 0.5;
+        expected_hidden[i] = h;
+        sum_sq += @as(f64, h) * @as(f64, h);
+    }
+    const rms_inv: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(n_usize)) + eps));
+
+    for (0..n_usize) |i| {
+        try std.testing.expectApproxEqAbs(expected_hidden[i], accum_ptr[i], 0.001);
+        try std.testing.expectApproxEqAbs(next_weight_ptr[i] * expected_hidden[i] * rms_inv, next_norm_ptr[i], 0.001);
+    }
+}
+
+test "router_f32_topk_bias shader matches CPU top-k softmax reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "router_f32_topk_bias");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const n_experts: usize = 32;
+    const K: usize = 96;
+    const k: usize = 4;
+    const a_pad: usize = 3;
+    const x_pad: usize = 5;
+    const bias_pad: usize = 2;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, (a_pad + n_experts * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var bias_buf = try metal_buffer.createBuffer(ctx, (bias_pad + n_experts) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&bias_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(bias_buf.cpu_ptr.?[0..bias_buf.size], 0);
+
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    const bias_ptr: [*]f32 = @ptrCast(@alignCast(bias_buf.cpu_ptr.?));
+
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 7 + 3) % 23);
+        input_ptr[x_pad + i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+    }
+    for (0..n_experts) |expert| {
+        bias_ptr[bias_pad + expert] = 0.01 * @as(f32, @floatFromInt(@as(i32, @intCast(expert)) - 15));
+        for (0..K) |i| {
+            const raw: i32 = @intCast((expert * 13 + i * 17 + 5) % 31);
+            weight_ptr[a_pad + expert * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+        }
+    }
+
+    var logits: [n_experts]f32 = undefined;
+    for (0..n_experts) |expert| {
+        var dot: f32 = bias_ptr[bias_pad + expert];
+        for (0..K) |i| dot += weight_ptr[a_pad + expert * K + i] * input_ptr[x_pad + i];
+        logits[expert] = dot;
+    }
+
+    var expected_ids: [k]u32 = undefined;
+    var selected_vals: [k]f32 = undefined;
+    for (0..k) |slot| {
+        var best_val = -std.math.inf(f32);
+        var best_idx: usize = 0;
+        for (0..n_experts) |expert| {
+            if (logits[expert] > best_val) {
+                best_val = logits[expert];
+                best_idx = expert;
+            }
+        }
+        expected_ids[slot] = @intCast(best_idx);
+        selected_vals[slot] = best_val;
+        logits[best_idx] = -std.math.inf(f32);
+    }
+    var max_sel = -std.math.inf(f32);
+    for (selected_vals) |v| max_sel = @max(max_sel, v);
+    var sum: f32 = 0.0;
+    var expected_weights: [k]f32 = undefined;
+    for (0..k) |slot| {
+        expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+        sum += expected_weights[slot];
+    }
+    for (&expected_weights) |*w| w.* /= sum;
+
+    const push = RouterF32TopkBiasPush{
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = @intCast(a_pad * @sizeOf(f32)),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .bias_offset = @intCast(bias_pad * @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &bias_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBiasPush), 1);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..k) |slot| {
+        try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
+        const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
+        try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+    }
+}
+
+test "router_f32_topk_batched shader routes each prompt token" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "router_f32_topk_batched");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 512) return error.SkipZigTest;
+
+    const n_tokens: usize = 3;
+    const n_experts: usize = 96;
+    const K: usize = 64;
+    const k: usize = 4;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, n_tokens * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, n_tokens * k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..n_tokens) |token| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((token * 11 + i * 7 + 3) % 23);
+            input_ptr[token * K + i] = 0.0625 * @as(f32, @floatFromInt(raw - 11));
+        }
+    }
+    for (0..n_experts) |expert| {
+        for (0..K) |i| {
+            const raw: i32 = @intCast((expert * 13 + i * 17 + 5) % 31);
+            weight_ptr[expert * K + i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+        }
+    }
+
+    const push = RouterF32TopkBatchedPush{
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = 0,
+        .input_offset = 0,
+        .input_stride = @intCast(K),
+        .output_stride = @intCast(k * 2),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast(n_tokens), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(RouterF32TopkBatchedPush), 1);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_tokens) |token| {
+        var logits: [n_experts]f32 = undefined;
+        for (0..n_experts) |expert| {
+            var dot: f32 = 0.0;
+            for (0..K) |i| dot += weight_ptr[expert * K + i] * input_ptr[token * K + i];
+            logits[expert] = dot;
+        }
+
+        var expected_ids: [k]u32 = undefined;
+        var selected_vals: [k]f32 = undefined;
+        for (0..k) |slot| {
+            var best_val = -std.math.inf(f32);
+            var best_idx: usize = 0;
+            for (0..n_experts) |expert| {
+                if (logits[expert] > best_val) {
+                    best_val = logits[expert];
+                    best_idx = expert;
+                }
+            }
+            expected_ids[slot] = @intCast(best_idx);
+            selected_vals[slot] = best_val;
+            logits[best_idx] = -std.math.inf(f32);
+        }
+        var max_sel = -std.math.inf(f32);
+        for (selected_vals) |v| max_sel = @max(max_sel, v);
+        var sum: f32 = 0.0;
+        var expected_weights: [k]f32 = undefined;
+        for (0..k) |slot| {
+            expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+            sum += expected_weights[slot];
+        }
+        for (&expected_weights) |*w| w.* /= sum;
+
+        const out = output_ptr[token * k * 2 .. token * k * 2 + k * 2];
+        for (0..k) |slot| {
+            try std.testing.expectEqual(expected_ids[slot], out[slot]);
+            const actual_weight: f32 = @bitCast(out[k + slot]);
+            try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+        }
+    }
+}
+
+test "residual_rms_norm_router_f32_topk shader matches residual norm and CPU top-k" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "residual_rms_norm_router_f32_topk");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 512) return error.SkipZigTest;
+
+    const K: usize = 64;
+    const n_experts: usize = 96;
+    const k: usize = 4;
+    const residual_pad: usize = 8;
+    const scale: f32 = 0.75;
+    const eps: f32 = 1.0e-6;
+
+    var hidden_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&hidden_buf);
+    var residual_buf = try metal_buffer.createBuffer(ctx, (residual_pad + K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&residual_buf);
+    var norm_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_buf);
+    var norm_weight_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&norm_weight_buf);
+    var weight_buf = try metal_buffer.createBuffer(ctx, n_experts * K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    const hidden_ptr: [*]f32 = @ptrCast(@alignCast(hidden_buf.cpu_ptr.?));
+    const residual_ptr: [*]f32 = @ptrCast(@alignCast(residual_buf.cpu_ptr.?));
+    const norm_weight_ptr: [*]f32 = @ptrCast(@alignCast(norm_weight_buf.cpu_ptr.?));
+    const weight_ptr: [*]f32 = @ptrCast(@alignCast(weight_buf.cpu_ptr.?));
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..K) |i| {
+        hidden_ptr[i] = 0.10 + 0.001 * @as(f32, @floatFromInt(i));
+        residual_ptr[residual_pad + i] = 0.02 + 0.0003 * @as(f32, @floatFromInt(i % 17));
+        norm_weight_ptr[i] = 1.0 + 0.0001 * @as(f32, @floatFromInt(i));
+    }
+    for (0..residual_pad) |i| residual_ptr[i] = -99.0;
+    for (0..n_experts) |expert| {
+        for (0..K) |i| {
+            const shape = 1.0 + @as(f32, @floatFromInt(i % 7));
+            weight_ptr[expert * K + i] = 0.00001 * @as(f32, @floatFromInt(expert + 1)) * shape;
+        }
+    }
+
+    var expected_hidden: [K]f32 = undefined;
+    var expected_norm: [K]f32 = undefined;
+    var sq: f32 = 0.0;
+    for (0..K) |i| {
+        const h = hidden_ptr[i] + scale * residual_ptr[residual_pad + i];
+        expected_hidden[i] = h;
+        sq += h * h;
+    }
+    const rms_inv = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(K)) + eps);
+    for (0..K) |i| expected_norm[i] = norm_weight_ptr[i] * expected_hidden[i] * rms_inv;
+
+    var logits: [n_experts]f32 = undefined;
+    for (0..n_experts) |expert| {
+        var dot: f32 = 0.0;
+        for (0..K) |i| dot += weight_ptr[expert * K + i] * expected_norm[i];
+        logits[expert] = dot;
+    }
+
+    var expected_ids: [k]u32 = undefined;
+    var selected_vals: [k]f32 = undefined;
+    for (0..k) |slot| {
+        var best_val = -std.math.inf(f32);
+        var best_idx: usize = 0;
+        for (0..n_experts) |expert| {
+            if (logits[expert] > best_val) {
+                best_val = logits[expert];
+                best_idx = expert;
+            }
+        }
+        expected_ids[slot] = @intCast(best_idx);
+        selected_vals[slot] = best_val;
+        logits[best_idx] = -std.math.inf(f32);
+    }
+    var max_sel = -std.math.inf(f32);
+    for (selected_vals) |v| max_sel = @max(max_sel, v);
+    var sum: f32 = 0.0;
+    var expected_weights: [k]f32 = undefined;
+    for (0..k) |slot| {
+        expected_weights[slot] = @exp(selected_vals[slot] - max_sel);
+        sum += expected_weights[slot];
+    }
+    for (&expected_weights) |*w| w.* /= sum;
+
+    const push = ResidualRmsNormRouterF32TopkPush{
+        .n = @intCast(K),
+        .eps = eps,
+        .scale = scale,
+        .residual_offset = @intCast(residual_pad),
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &hidden_buf, &residual_buf, &norm_buf, &norm_weight_buf, &weight_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(ResidualRmsNormRouterF32TopkPush), 0);
+    cmd.commitAndWait();
+
+    const norm_ptr: [*]const f32 = @ptrCast(@alignCast(norm_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        try std.testing.expectApproxEqAbs(expected_hidden[i], hidden_ptr[i], 0.00001);
+        try std.testing.expectApproxEqAbs(expected_norm[i], norm_ptr[i], 0.00005);
+    }
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..k) |slot| {
+        try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
+        const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
+        try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0001);
+    }
+}
+
+test "router_q8_0_topk shader matches CPU top-k softmax reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "router_q8_0_topk");
+    defer metal_pipeline.freePipeline(&pipe);
+    if (pipe.max_threads_per_threadgroup < 1024) return error.SkipZigTest;
+
+    const n_experts: usize = 256;
+    const K: usize = 64;
+    const k: usize = 8;
+    const blocks_per_row = K / 32;
+    const row_bytes = blocks_per_row * 34;
+    const a_pad: usize = 0;
+    const x_pad: usize = 4;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, a_pad + n_experts * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, k * 2 * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    const raw = weight_buf.cpu_ptr.?[a_pad .. a_pad + n_experts * row_bytes];
+    for (0..n_experts) |expert| {
+        const scale: f32 = 0.001 * @as(f32, @floatFromInt(expert + 1));
+        const scale_half: f16 = @floatCast(scale);
+        const scale_bits: u16 = @bitCast(scale_half);
+        for (0..blocks_per_row) |block| {
+            const bo = expert * row_bytes + block * 34;
+            raw[bo] = @truncate(scale_bits);
+            raw[bo + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |i| {
+                raw[bo + 2 + i] = @bitCast(@as(i8, 4));
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        input_ptr[x_pad + i] = 0.25 + 0.03125 * @as(f32, @floatFromInt((i * 7) % 11));
+    }
+
+    var logits: [n_experts]f32 = undefined;
+    var row_deq: [K]f32 = undefined;
+    for (0..n_experts) |expert| {
+        dequantRow(raw, @intCast(expert), @intCast(K), .q8_0, row_deq[0..]);
+        var dot: f32 = 0.0;
+        for (0..K) |i| dot += row_deq[i] * input_ptr[x_pad + i];
+        logits[expert] = dot;
+    }
+
+    var expected_ids: [k]u32 = undefined;
+    var expected_weights: [k]f32 = undefined;
+    topKSoftmax(logits[0..], @intCast(k), expected_ids[0..], expected_weights[0..]);
+
+    const push = RouterQ8TopkPush{
+        .n_experts = @intCast(n_experts),
+        .K = @intCast(K),
+        .k = @intCast(k),
+        .a_offset = @intCast(a_pad),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, &bufs, &push, @sizeOf(RouterQ8TopkPush), 0);
+    cmd.commitAndWait();
+
+    const output_ptr: [*]const u32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..k) |slot| {
+        try std.testing.expectEqual(expected_ids[slot], output_ptr[slot]);
+        const actual_weight: f32 = @bitCast(output_ptr[k + slot]);
+        try std.testing.expectApproxEqAbs(expected_weights[slot], actual_weight, 0.0005);
+    }
 }
 
 test "dmmv_q5_0 shader matches CPU reference with qh bits and nonzero offset" {
@@ -10193,6 +24921,102 @@ test "dmmv_mxfp4 shader matches CPU reference" {
     }
 }
 
+test "dmmv_mxfp4_moe_sg shader matches CPU reference across selected experts" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_mxfp4_moe_sg");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 37;
+    const K: usize = 96;
+    const n_used: usize = 3;
+    const n_experts: usize = 5;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 17;
+    const expert_stride: usize = M * row_bytes;
+    const a_offset: usize = 13;
+    const x_pad: usize = 5;
+    const y_pad: usize = 7;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, a_offset + n_experts * expert_stride);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, (x_pad + n_used * K) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, (y_pad + n_used * M) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    var routing_buf = try metal_buffer.createBuffer(ctx, n_used * @sizeOf(u32));
+    defer metal_buffer.freeBuffer(&routing_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+    @memset(routing_buf.cpu_ptr.?[0..routing_buf.size], 0);
+
+    const raw = weight_buf.cpu_ptr.?[a_offset..];
+    for (0..n_experts) |expert| {
+        for (0..M) |row| {
+            for (0..blocks_per_row) |blk| {
+                const base = expert * expert_stride + row * row_bytes + blk * 17;
+                raw[base] = @intCast(124 + ((expert + row + blk) % 5));
+                for (0..16) |j| {
+                    const lo: u8 = @intCast((expert * 7 + row * 5 + blk * 3 + j) & 0x0F);
+                    const hi: u8 = @intCast((expert * 11 + row * 13 + blk * 17 + j * 3) & 0x0F);
+                    raw[base + 1 + j] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        for (0..K) |i| {
+            const raw_val: i32 = @intCast((slot * 31 + i * 17 + 9) % 25);
+            input_ptr[x_pad + slot * K + i] = 0.03125 * @as(f32, @floatFromInt(raw_val - 12));
+        }
+    }
+
+    const routing_ptr: [*]u32 = @ptrCast(@alignCast(routing_buf.cpu_ptr.?));
+    routing_ptr[0] = 4;
+    routing_ptr[1] = 1;
+    routing_ptr[2] = 3;
+
+    const push = MoeDmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = @intCast(a_offset),
+        .expert_stride = @intCast(expert_stride),
+        .x_expert_stride = @intCast(K),
+        .x_offset = @intCast(x_pad * @sizeOf(f32)),
+        .y_offset = @intCast(y_pad * @sizeOf(f32)),
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf, &routing_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 15) / 16), @intCast(n_used), 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(MoeDmmvPush), 1);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..n_used) |slot| {
+        const expert_id = routing_ptr[slot];
+        const matrix_raw = raw[@as(usize, expert_id) * expert_stride ..][0..expert_stride];
+        const input_slice = input_ptr[x_pad + slot * K .. x_pad + (slot + 1) * K];
+        for (0..M) |row| {
+            dequantRow(matrix_raw, @intCast(row), @intCast(K), .mxfp4, ref_row);
+            var expected: f32 = 0.0;
+            for (0..K) |i| {
+                expected += ref_row[i] * input_slice[i];
+            }
+            try std.testing.expectApproxEqAbs(expected, output_ptr[y_pad + slot * M + row], 0.05);
+        }
+    }
+}
+
 test "repacked Q8_0 shader matches CPU reference" {
     const ctx = shim.mtl_init();
     try std.testing.expect(ctx != null);
@@ -10350,6 +25174,150 @@ test "dmmv_q8_0_k2048 shader matches CPU reference (nr=2)" {
     const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
     for (0..M) |row| {
         dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q8_0, &ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_k4096 shader matches CPU reference (nr=2)" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: u32 = 19;
+    const K: u32 = 4096;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + (row % 3) + (blk % 7)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 9 + e * 5) % 61);
+                const q: i8 = @intCast(raw_q - 30);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 17 + 1) % 31);
+        input_ptr[i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+    }
+
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+    const simd_w: u32 = if (pipe.thread_execution_width > 0) pipe.thread_execution_width else 32;
+    const block_size: u32 = @min(128, pipe.max_threads_per_threadgroup);
+    const rows_per_wg = (block_size / simd_w) * 2;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    var ref_row: [4096]f32 = undefined;
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), K, .q8_0, &ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_lmhead shader matches Gemma 12B K2816 shape" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_lmhead");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 64;
+    const K: usize = 2816;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale_mag = 0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 7)));
+            const scale = @as(f16, @floatCast(scale_mag));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 7 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 13 + 7) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ @intCast((M + 31) / 32), 1, 1 }, .{ 512, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const allocator = std.testing.allocator;
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
         var expected: f32 = 0;
         for (0..K) |i| expected += ref_row[i] * input_ptr[i];
         try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
@@ -10518,6 +25486,250 @@ test "repacked Q8_0 shader matches CPU reference with multiple groups per row" {
     for (0..M) |row| {
         try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
     }
+}
+
+test "repacked Q8_0 quad shader matches CPU reference with tail rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+    var k2048_nr2_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048");
+    defer metal_pipeline.freePipeline(&k2048_nr2_pipe);
+    var k2048_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k2048_quad");
+    defer metal_pipeline.freePipeline(&k2048_pipe);
+
+    const M: u32 = 9;
+    const K: u32 = 2048;
+    const blocks_per_row: u32 = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var orig_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&orig_buf);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |bi| {
+            const off = row * row_bytes + bi * 34;
+            const scale = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + (row % 5) + (bi % 7)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            orig_buf.cpu_ptr.?[off] = @truncate(scale_bits);
+            orig_buf.cpu_ptr.?[off + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |j| {
+                const raw_q: i32 = @intCast((row * 11 + bi * 13 + j * 3) % 61);
+                const q: i8 = @intCast(raw_q - 30);
+                orig_buf.cpu_ptr.?[off + 2 + j] = @bitCast(q);
+            }
+        }
+    }
+
+    var repacked_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&repacked_buf);
+    repackQ8_0Blocks(orig_buf.cpu_ptr.?, repacked_buf.cpu_ptr.?, M, K);
+
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 17 + 5) % 29);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    var expected: [9]f32 = .{0} ** 9;
+    for (0..M) |row| {
+        var dot: f32 = 0.0;
+        for (0..blocks_per_row) |bi| {
+            const off = row * row_bytes + bi * 34;
+            const scale = @as(f32, @as(f16, @bitCast(@as(u16, orig_buf.cpu_ptr.?[off]) | (@as(u16, orig_buf.cpu_ptr.?[off + 1]) << 8))));
+            for (0..32) |j| {
+                const q: f32 = @floatFromInt(@as(i8, @bitCast(orig_buf.cpu_ptr.?[off + 2 + j])));
+                dot += scale * q * input_ptr[bi * 32 + j];
+            }
+        }
+        expected[row] = dot;
+    }
+
+    var output_buf = try metal_buffer.createBuffer(ctx, (M + 3) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &repacked_buf, &input_buf, &output_buf };
+    const block_size: u32 = @min(512, pipe.max_threads_per_threadgroup);
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
+
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const k2048_block_size: u32 = @min(512, k2048_pipe.max_threads_per_threadgroup);
+    const k2048_rows_per_wg: u32 = (k2048_block_size / 32) * 4;
+    const k2048_wgs = (M + k2048_rows_per_wg - 1) / k2048_rows_per_wg;
+
+    var k2048_cmd = try metal_command.beginCommand(ctx);
+    k2048_cmd.dispatchV2(&k2048_pipe, .{ k2048_wgs, 1, 1 }, .{ k2048_block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    k2048_cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
+
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const k2048_nr2_block_size: u32 = 128;
+    const k2048_nr2_rows_per_wg: u32 = (k2048_nr2_block_size / 32) * 2;
+    const k2048_nr2_wgs = (M + k2048_nr2_rows_per_wg - 1) / k2048_nr2_rows_per_wg;
+
+    var k2048_nr2_cmd = try metal_command.beginCommand(ctx);
+    k2048_nr2_cmd.dispatchV2(&k2048_nr2_pipe, .{ k2048_nr2_wgs, 1, 1 }, .{ k2048_nr2_block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    k2048_nr2_cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
+}
+
+test "repacked Q8_0 K4096 quad shader matches CPU reference with tail rows" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+    var nr2_pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_repacked_k4096");
+    defer metal_pipeline.freePipeline(&nr2_pipe);
+
+    const M: u32 = 7;
+    const K: u32 = 4096;
+    const blocks_per_row: u32 = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+
+    var orig_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&orig_buf);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |bi| {
+            const off = row * row_bytes + bi * 34;
+            const scale = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + (row % 3) + (bi % 11)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            orig_buf.cpu_ptr.?[off] = @truncate(scale_bits);
+            orig_buf.cpu_ptr.?[off + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |j| {
+                const raw_q: i32 = @intCast((row * 19 + bi * 7 + j * 5) % 47);
+                const q: i8 = @intCast(raw_q - 23);
+                orig_buf.cpu_ptr.?[off + 2 + j] = @bitCast(q);
+            }
+        }
+    }
+
+    var repacked_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&repacked_buf);
+    repackQ8_0Blocks(orig_buf.cpu_ptr.?, repacked_buf.cpu_ptr.?, M, K);
+
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 23 + 3) % 31);
+        input_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 15));
+    }
+
+    var expected: [7]f32 = .{0} ** 7;
+    for (0..M) |row| {
+        var dot: f32 = 0.0;
+        for (0..blocks_per_row) |bi| {
+            const off = row * row_bytes + bi * 34;
+            const scale = @as(f32, @as(f16, @bitCast(@as(u16, orig_buf.cpu_ptr.?[off]) | (@as(u16, orig_buf.cpu_ptr.?[off + 1]) << 8))));
+            for (0..32) |j| {
+                const q: f32 = @floatFromInt(@as(i8, @bitCast(orig_buf.cpu_ptr.?[off + 2 + j])));
+                dot += scale * q * input_ptr[bi * 32 + j];
+            }
+        }
+        expected[row] = dot;
+    }
+
+    var output_buf = try metal_buffer.createBuffer(ctx, (M + 3) * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+    const output_ptr: [*]f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const push = DmmvPush{
+        .M = M,
+        .K = K,
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &repacked_buf, &input_buf, &output_buf };
+    const block_size: u32 = @min(512, pipe.max_threads_per_threadgroup);
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs = (M + rows_per_wg - 1) / rows_per_wg;
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
+
+    @memset(output_ptr[0 .. M + 3], 0);
+    output_ptr[M] = -991.0;
+    output_ptr[M + 1] = -992.0;
+    output_ptr[M + 2] = -993.0;
+
+    const nr2_block_size: u32 = 128;
+    const nr2_rows_per_wg: u32 = (nr2_block_size / 32) * 2;
+    const nr2_wgs = (M + nr2_rows_per_wg - 1) / nr2_rows_per_wg;
+
+    var nr2_cmd = try metal_command.beginCommand(ctx);
+    nr2_cmd.dispatchV2(&nr2_pipe, .{ nr2_wgs, 1, 1 }, .{ nr2_block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    nr2_cmd.commitAndWait();
+
+    for (0..M) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], output_ptr[row], 0.5);
+    }
+    try std.testing.expectApproxEqAbs(-991.0, output_ptr[M], 0.0);
+    try std.testing.expectApproxEqAbs(-992.0, output_ptr[M + 1], 0.0);
+    try std.testing.expectApproxEqAbs(-993.0, output_ptr[M + 2], 0.0);
 }
 
 test "canRepackQ8 boundary conditions" {
@@ -10748,7 +25960,7 @@ test "dmmv_q8_0_dual_fused_norm shader matches CPU reference" {
     const bufs = [_]*const MetalBuffer{ &weight0_buf, &weight1_buf, &hidden_buf, &output0_buf, &output1_buf, &norm_weight_buf };
     const total_rows = M0 + M1;
     const block_size: u32 = 256;
-    const rows_per_wg = block_size / 32;
+    const rows_per_wg = (block_size / 32) * 4;
     var cmd = try metal_command.beginCommand(ctx);
     cmd.dispatchV2(&pipe, .{ (total_rows + rows_per_wg - 1) / rows_per_wg, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DualQ8DmmvPush), 0);
     cmd.commitAndWait();
@@ -10835,6 +26047,225 @@ test "dmmv_q8_0_native scalar shader matches CPU reference" {
         var expected: f32 = 0;
         for (0..K) |i| expected += ref_row[i] * input_ptr[i];
         try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.01);
+    }
+}
+
+test "dmmv_q8_0_k512_quad shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k512_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 19;
+    const K: usize = 512;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+    const allocator = std.testing.allocator;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale = @as(f16, @floatCast(0.03125 * @as(f32, @floatFromInt(1 + (row % 7) + (blk % 5)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 11 + blk * 13 + e * 5) % 63);
+                const q: i8 = @intCast(raw_q - 31);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 7 + 3) % 19);
+        input_ptr[i] = 0.125 * @as(f32, @floatFromInt(raw - 9));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+    const block_size: u32 = 512;
+    const rows_per_wg: u32 = (block_size / 32) * 8;
+    const wgs: u32 = @intCast((M + rows_per_wg - 1) / rows_per_wg);
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_k2048_quad shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k2048_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 21;
+    const K: usize = 2048;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+    const allocator = std.testing.allocator;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + (row % 5) + (blk % 11)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 17 + blk * 5 + e * 7) % 57);
+                const q: i8 = @intCast(raw_q - 28);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 13 + 5) % 29);
+        input_ptr[i] = 0.0625 * @as(f32, @floatFromInt(raw - 14));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+    const block_size: u32 = 512;
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs: u32 = @intCast((M + rows_per_wg - 1) / rows_per_wg);
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
+    }
+}
+
+test "dmmv_q8_0_k4096_quad shader matches CPU reference" {
+    const ctx = shim.mtl_init();
+    try std.testing.expect(ctx != null);
+    defer shim.mtl_destroy(ctx);
+
+    var pipe = try loadShaderPipeline(ctx, "dmmv_q8_0_k4096_quad");
+    defer metal_pipeline.freePipeline(&pipe);
+
+    const M: usize = 21;
+    const K: usize = 4096;
+    const blocks_per_row: usize = K / 32;
+    const row_bytes: usize = blocks_per_row * 34;
+    const allocator = std.testing.allocator;
+
+    var weight_buf = try metal_buffer.createBuffer(ctx, M * row_bytes);
+    defer metal_buffer.freeBuffer(&weight_buf);
+    var input_buf = try metal_buffer.createBuffer(ctx, K * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&input_buf);
+    var output_buf = try metal_buffer.createBuffer(ctx, M * @sizeOf(f32));
+    defer metal_buffer.freeBuffer(&output_buf);
+
+    @memset(weight_buf.cpu_ptr.?[0..weight_buf.size], 0);
+    @memset(input_buf.cpu_ptr.?[0..input_buf.size], 0);
+    @memset(output_buf.cpu_ptr.?[0..output_buf.size], 0);
+
+    for (0..M) |row| {
+        for (0..blocks_per_row) |blk| {
+            const base = row * row_bytes + blk * 34;
+            const scale = @as(f16, @floatCast(0.015625 * @as(f32, @floatFromInt(1 + (row % 7) + (blk % 13)))));
+            const scale_bits = @as(u16, @bitCast(scale));
+            weight_buf.cpu_ptr.?[base] = @truncate(scale_bits);
+            weight_buf.cpu_ptr.?[base + 1] = @truncate(scale_bits >> 8);
+            for (0..32) |e| {
+                const raw_q: i32 = @intCast((row * 19 + blk * 7 + e * 11) % 59);
+                const q: i8 = @intCast(raw_q - 29);
+                weight_buf.cpu_ptr.?[base + 2 + e] = @bitCast(q);
+            }
+        }
+    }
+
+    const input_ptr: [*]f32 = @ptrCast(@alignCast(input_buf.cpu_ptr.?));
+    for (0..K) |i| {
+        const raw: i32 = @intCast((i * 17 + 3) % 31);
+        input_ptr[i] = 0.03125 * @as(f32, @floatFromInt(raw - 15));
+    }
+
+    const push = DmmvPush{
+        .M = @intCast(M),
+        .K = @intCast(K),
+        .a_offset = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    };
+    const bufs = [_]*const MetalBuffer{ &weight_buf, &input_buf, &output_buf };
+    const block_size: u32 = 512;
+    const rows_per_wg: u32 = (block_size / 32) * 4;
+    const wgs: u32 = @intCast((M + rows_per_wg - 1) / rows_per_wg);
+
+    var cmd = try metal_command.beginCommand(ctx);
+    cmd.dispatchV2(&pipe, .{ wgs, 1, 1 }, .{ block_size, 1, 1 }, &bufs, &push, @sizeOf(DmmvPush), 0);
+    cmd.commitAndWait();
+
+    const ref_row = try allocator.alloc(f32, K);
+    defer allocator.free(ref_row);
+    const output_ptr: [*]const f32 = @ptrCast(@alignCast(output_buf.cpu_ptr.?));
+    for (0..M) |row| {
+        dequantRow(weight_buf.cpu_ptr.?[0..weight_buf.size], @intCast(row), @intCast(K), .q8_0, ref_row);
+        var expected: f32 = 0;
+        for (0..K) |i| expected += ref_row[i] * input_ptr[i];
+        try std.testing.expectApproxEqAbs(expected, output_ptr[row], 0.05);
     }
 }
 

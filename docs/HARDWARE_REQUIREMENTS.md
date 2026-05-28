@@ -1,13 +1,15 @@
 # ZINC hardware requirements
 
-ZINC runs on AMD GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). This page covers what hardware and OS setup you need for each platform.
+ZINC runs on consumer GPUs (Linux, Vulkan) and Apple Silicon (macOS, Metal). This page covers what hardware and OS setup you need for each platform.
 
 ## Supported platforms
 
 | Platform | GPU | Backend | Status |
 |----------|-----|---------|--------|
-| **Linux** | AMD RDNA4 | Vulkan 1.3 | Primary tuning target |
+| **Linux** | AMD RDNA4 discrete (Navi 48 / Navi 44) | Vulkan 1.3 | Primary tuning target |
+| **Linux** | AMD RDNA4 APU (Strix Halo / gfx1151) | Vulkan 1.3 | Supported with APU-specific bandwidth tuning |
 | **Linux** | AMD RDNA3 | Vulkan 1.3 | Supported, less tuned |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan 1.3+ | Experimental bring-up |
 | **macOS** | Apple Silicon M1 through M5 | Metal | Supported, native MSL shaders |
 
 ## AMD GPUs (Linux)
@@ -16,7 +18,9 @@ ZINC targets AMD consumer and workstation GPUs that the ROCm stack does not supp
 
 | Family | Examples | Notes |
 | --- | --- | --- |
-| RDNA4 | RX 9070, RX 9070 XT, Radeon AI PRO R9700 | Primary tuning target, hand-tuned shaders |
+| RDNA4 discrete (Navi 48 / gfx1201) | RX 9070, RX 9070 XT, RX 9070 GRE, Radeon AI PRO R9700 | Primary tuning target, hand-tuned shaders |
+| RDNA4 discrete (Navi 44 / gfx1200) | RX 9060, RX 9060 XT | Same RDNA4 ISA as Navi 48, smaller die, narrower bus |
+| RDNA4 APU (gfx1151) | Strix Halo: Radeon 8060S, Radeon 8050S | Unified-memory iGPU; ZINC selects an APU bandwidth profile (~256 GB/s) distinct from the discrete 576–640 GB/s default |
 | RDNA3 | RX 7900 XTX, RX 7900 XT, RX 7800 XT, RX 7700 XT, RX 7600 | Supported, less tuned than RDNA4 |
 
 Any AMD GPU with Vulkan 1.3 and a working RADV or AMDVLK driver should work.
@@ -42,15 +46,49 @@ If that command does not show your AMD GPU, ZINC will not work.
 | VRAM | What fits |
 | --- | --- |
 | 16 GB | 2B to 8B class models comfortably |
-| 32 GB | 35B MoE models like Qwen3.5-35B-A3B Q4_K_XL |
+| 32 GB | 27B dense models and 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
 
 Exact fit depends on architecture, quantization, and context length. `--check -m <model>` prints a practical fit estimate.
 
-### Future AMD directions
+## Intel Arc GPUs (Linux)
+
+Intel Arc support is an experimental Vulkan bring-up path. The current target is the Arc B-series / Battlemage line:
+
+| Family | Examples | Notes |
+| --- | --- | --- |
+| Arc B-series desktop | Arc B580, Arc B570 | Best fit for 7B/8B models; B580 is the stronger consumer target |
+| Arc Pro B-series | Arc Pro B70, B65, B60, B50 | Larger VRAM options for local AI; B70/B65 are the 32 GB targets |
+
+### Intel requirements
+
+- **OS**: Linux
+- **API**: Vulkan 1.3 or newer, depending on card and driver
+- **Driver**: Intel ANV / Mesa Vulkan driver
+- **Platform**: UEFI with Resizable BAR enabled for benchmark-quality results
+
+Verify the Vulkan stack:
+
+```bash
+vulkaninfo --summary
+```
+
+If that command does not show your Intel Arc GPU, ZINC will not use it.
+
+### Intel VRAM guide
+
+| VRAM | B-series cards | What fits |
+| --- | --- | --- |
+| 10-12 GB | B570, B580 | 7B/8B class models |
+| 16 GB | B50 | 8B with more context; some 12B experiments |
+| 24 GB | B60 | 20B class and tight larger-model experiments |
+| 32 GB | B65, B70 | 27B dense and 35B MoE targets |
+
+See [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for the full B-series card table, device IDs, memory bandwidth, Xe2 opcode notes, and ZINC tuning guidance.
+
+## Other Vulkan GPUs
 
 | Family | Status |
 | --- | --- |
-| Intel Arc | Possible through Vulkan, not a primary target |
 | NVIDIA via Vulkan | Vulkan works, not primary target |
 
 ## Apple Silicon (macOS)
@@ -80,7 +118,7 @@ Apple Silicon uses unified memory shared between CPU and GPU. There is no separa
 | 8 GB | Too tight for most models |
 | 16 GB | 2B models comfortably |
 | 24 GB | 2B with headroom, 35B might be tight |
-| 32+ GB | 35B MoE models like Qwen3.5-35B-A3B Q4_K_XL |
+| 32+ GB | 27B dense and 35B MoE models like Qwen3.6-35B-A3B Q4_K_XL |
 | 64+ GB (Pro/Max/Ultra) | Large models with generous context |
 
 ZINC uses zero-copy model loading on Metal, so a 1.2 GB model file does not require an additional 1.2 GB of GPU memory. The model weights stay in place and the GPU reads from the mmap'd pages directly.
@@ -139,6 +177,14 @@ vulkaninfo --summary
 ./zig-out/bin/zinc --check
 ```
 
+### Linux (Intel Arc)
+
+```bash
+lspci | grep -i "vga\|display\|intel\|arc"
+vulkaninfo --summary
+./zig-out/bin/zinc --check
+```
+
 ### macOS (Apple Silicon)
 
 ```bash
@@ -159,6 +205,17 @@ zig build -Doptimize=ReleaseFast
 ```
 
 Then see [RDNA4 Tuning](/zinc/docs/rdna4-tuning) for performance work.
+
+### On Linux with an Intel Arc GPU
+
+```bash
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zinc --check
+./zig-out/bin/zinc model pull qwen3-8b-q4k-m
+./zig-out/bin/zinc chat
+```
+
+Then see [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details and current tuning notes.
 
 ### On macOS with Apple Silicon
 

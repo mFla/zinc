@@ -35,6 +35,8 @@ bun loops/optimize_zinc.ts          # rsync → build → run → agent → keep
 bun loops/optimize_llm_tps.ts --agent claude "..."  # iterate on llama.cpp throughput
 bun loops/optimize_perf.ts --effort N               # execute loops/efforts/MULTI_HOUR_EFFORT_N.md
 bun loops/implement_metal.ts        # iteratively build out the Metal backend
+bun loops/zinc_rt_autopilot.ts      # overnight A/B: legacy_vulkan vs ZINC_RT on RDNA4
+                                    # see docs/ZINC_RT_DESIGN.md for the project this drives
 ```
 
 ### Managed models and cache
@@ -78,7 +80,6 @@ Agent policy:
 ### Supported Architectures
 - **Qwen3 / Qwen3.5** — dense and MoE variants
 - **Gemma 4** — with GeGLU activation and Gemma-specific normalization
-- **OpenAI GPT-OSS** — MoE with OAI SwiGLU, MXFP4 experts, attention sinks, ISWA, YaRN RoPE
 
 ## Project Structure
 
@@ -158,27 +159,25 @@ loops/                           # Self-improving optimization loops
 ├── optimize_perf.ts             # Performance optimization loop
 ├── optimize_perf.test.ts        # Tests for optimize_perf
 ├── optimize_zinc.ts             # ZINC loop: rsync → build → run → agent → keep/revert
-└── optimize_zinc.test.ts        # Tests for optimize_zinc
+├── optimize_zinc.test.ts        # Tests for optimize_zinc
+└── zinc_rt_autopilot.ts         # Overnight A/B vs legacy_vulkan; drives docs/ZINC_RT_DESIGN.md
 
 docs/                            # Technical documentation (published to site)
 ├── API.md                       # OpenAI-compatible API spec
 ├── APPLE_METAL_REFERENCE.md     # Metal/MSL kernel reference
 ├── APPLE_SILICON_METAL_ENABLEMENT.md # Metal port implementation notes
 ├── APPLE_SILICON_REFERENCE.md   # Apple Silicon M1–M5 reference
-├── DECODE_THROUGHPUT_PLAN.md    # Decode-performance planning notes
 ├── DEVELOPMENT.md               # Development guide (canonical dev reference)
 ├── GETTING_STARTED.md           # First run guide
-├── GPU_REFERENCE.md             # RDNA3/RDNA4 hardware reference
+├── AMD_GPU_REFERENCE.md         # RDNA3/RDNA4 hardware reference
 ├── HARDWARE_REQUIREMENTS.md     # GPU and host sizing guidance
 ├── METAL_PERFORMANCE_PLAN.md    # Metal performance work plan
-├── PERFORMANCE_GAP_ANALYSIS.md  # ZINC vs llama.cpp gap analysis
-├── RDNA4_PERFORMANCE_JOURNEY.md # RDNA4 optimization log
-├── RDNA4_PERFORMANCE_PLAN.md    # RDNA4 performance work plan
 ├── RDNA4_TUNING.md              # RDNA4-specific optimizations
 ├── ROADMAP.md                   # Project roadmap
 ├── RUNNING_ZINC.md              # CLI usage and server mode
 ├── SPEC.md                      # Architecture overview
-└── TURBOQUANT_SPEC.md           # TurboQuant KV cache compression spec
+├── TURBOQUANT_SPEC.md           # TurboQuant KV cache compression spec
+└── ZINC_RT_DESIGN.md            # ZINC's own GPU runtime — replaces Vulkan; design + milestone plan
 
 site/                            # Astro website + docs frontend (zolotukhin.ai)
 ├── src/components/              # Shared Astro UI components
@@ -279,7 +278,7 @@ An RDNA4 test node (AMD Radeon AI PRO R9700, 32GB, 576 GB/s) is available via SS
 
 The reference baseline is llama.cpp server on the RDNA4 test node with this exact configuration. All ZINC numbers are compared against this.
 
-**Model**: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` (20.7 GiB, MoE 35B/3B active)
+**Model**: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (20.7 GiB, MoE 35B/3B active)
 **Baseline result**: 107 tok/s decode (with reasoning), 223 tok/s prefill
 
 ### Test node setup (critical for reproducing baseline)
@@ -343,7 +342,7 @@ rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_mo
 # Build and run
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "cd /root/zinc && zig build -Doptimize=ReleaseFast && \
   RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-  -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --prompt 'The capital of France is'"
 
 # Key output lines:
@@ -381,7 +380,7 @@ rsync -az --delete --exclude '.zig-cache' --exclude 'zig-out' --exclude 'node_mo
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && zig build -Doptimize=ReleaseFast && \
   nohup env RADV_PERFTEST=coop_matrix ./zig-out/bin/zinc \
-    -m /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    -m /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --port 9090 >/tmp/zinc_9090.log 2>&1 < /dev/null &"
 
 # 3. Wait for health.
@@ -419,7 +418,7 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
 Latest single-stream reference results with `zig build -Doptimize=ReleaseFast`:
 
 **AMD RDNA4** (Radeon AI PRO R9700, 32 GB, 2026-03-31):
-- CLI plain decode on `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`: `37.95 tok/s`, `26.3 ms/tok`
+- CLI plain decode on `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`: `37.95 tok/s`, `26.3 ms/tok`
 
 **Apple Silicon** (M1 Max 32 GB, 2026-04-02):
 - CLI plain decode on `Qwen3-8B-Q4_K_M.gguf`: `~8 tok/s`
@@ -443,7 +442,7 @@ source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --iterations 200 --warmup 25"
 ```
 
@@ -455,19 +454,19 @@ source .env
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case q8_router"
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case q8_shared_gate_up"
 
 ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST "\
   cd /root/zinc && \
   RADV_DEBUG=shaderstats zig build hot-bench -Doptimize=ReleaseFast -- \
-    --model /root/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+    --model /root/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
     --case ssm_delta"
 ```
 

@@ -201,14 +201,13 @@ The current runtime is designed around the model families ZINC is actively valid
 
 - **Qwen3 / Qwen3.5 / Qwen3.6**
 - **Gemma 4**
-- **OpenAI GPT-OSS**
 
 At the execution-model level, that means ZINC handles:
 
 - dense transformer layers
 - MoE feed-forward blocks
 - SSM-hybrid paths used by Qwen3.5-style models and related experimental families
-- model-specific routing rules such as GPT-OSS selected-only softmax weighting
+- model-specific MoE routing rules such as per-expert scale weighting
 
 The architecture-normalization layer is in `src/model/architecture.zig` and `src/model/config.zig`.
 
@@ -583,3 +582,4 @@ Those are active engineering directions, not hidden features.
 - [Apple Silicon Metal Enablement](/zinc/docs/apple-silicon-metal-enablement) for the full Metal port narrative
 - [TurboQuant Spec](/zinc/docs/turboquant-spec) for the forward-looking KV compression design
 - [RDNA4 Tuning Guide](/zinc/docs/rdna4-tuning) for AMD-specific performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware, memory-bandwidth, and opcode notes

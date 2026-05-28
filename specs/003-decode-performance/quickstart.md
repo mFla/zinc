@@ -7,7 +7,7 @@
 
 - AMD Radeon AI PRO R9700 (RDNA4) or similar RDNA3/4 GPU
 - Linux with RADV driver (Mesa 25.0.7+), `amdgpu.ras_enable=0`
-- Qwen3.5-35B-A3B-UD-Q4_K_XL GGUF model files
+- Qwen3.6-35B-A3B-UD-Q4_K_XL GGUF model files
 - ZINC built from source: `zig build -Doptimize=ReleaseFast`
 
 ## Baseline (before optimization)
@@ -20,7 +20,7 @@ ssh -p $ZINC_PORT $ZINC_USER@$ZINC_HOST
 
 # Run baseline
 ./zig-out/bin/zinc \
-  --model /path/to/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  --model /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --prompt "The capital of France is" \
   --max-tokens 32
 

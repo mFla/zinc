@@ -902,7 +902,7 @@ The HTTP benchmark is especially useful because it separates:
 
 ## 39. Current Local Numbers
 
-On 2026-03-31, local Apple Silicon measurements for `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` were:
+On 2026-03-31, local Apple Silicon measurements for `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` were:
 
 ### CLI/plain decode
 

@@ -1,0 +1,388 @@
+<svg viewBox="0 0 1440 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Chunked prefill versus monolithic prefill on two concurrent local chat slots, with TTFT and activation memory plotted against chunk size on a 32 GB Radeon AI PRO R9700</title>
+  <desc id="desc">Left panel: a Gantt-style wall-clock timeline showing two concurrent chat slots on a single local GPU. The top half is the monolithic case, where slot A prefills from 0 to 9 seconds in a long blue bar, then streams green decode ticks; slot B is idle until 9 seconds, then prefills from 9 to 16 seconds in another long blue bar, then decode ticks. A vertical orange dashed line at 16 seconds marks slot B's first decode token. The bottom half is the chunked case, where slot A's prefill is broken into four shorter blue chunks with slot B decode ticks interleaved between chunks; slot B's first decode token lands at 11 seconds, marked with a green dashed line. Right panel: a curve plot with chunk size on a log x axis from 64 to 4096 tokens. A blue TTFT curve descends from 240 seconds at chunk 64 to 142 seconds at chunk 2048, then rises sharply back to 200 seconds at chunk 4096 inside a red shaded OOM zone. An orange activation-memory curve rises monotonically from 0.4 to 14.4 gigabytes across the same chunk-size range, crossing a horizontal 13 GB dashed line at chunk size 3700. A real-measurement dot at chunk size 2048 references the 5800-token prompt TTFT drop on four Tesla T4 cards from llama.cpp discussion 6328. Footer references llama.cpp issue 17578 and Sarathi-Serve OSDI 2024.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #fafaf7; }
+      .title-text { font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+      .subtitle-text { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #555; }
+      .panel-title { font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+      .label { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #333; }
+      .small { font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #555; }
+      .mono { font: 500 11px ui-monospace, "SF Mono", Menlo, monospace; fill: #444; }
+      .axis { stroke: #555; stroke-width: 1.2; }
+      .grid { stroke: #e4e4e0; stroke-width: 1; }
+      .footer { font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #666; }
+      .prefill { fill: #5378a8; stroke: #3a5680; stroke-width: 0.6; }
+      .prefill-chunk { fill: #6a8db8; stroke: #3a5680; stroke-width: 0.6; }
+      .decode-tick { fill: #6aa078; stroke: #487a58; stroke-width: 0.5; }
+      .idle { fill: #ebeae3; stroke: #c8c8c0; stroke-width: 0.5; }
+      .slot-bg { fill: #f3f2ec; stroke: #d4d4ce; stroke-width: 0.8; }
+      .ttft-line-bad { stroke: #c47845; stroke-width: 1.8; stroke-dasharray: 6 4; fill: none; }
+      .ttft-line-good { stroke: #2d6a3e; stroke-width: 1.8; stroke-dasharray: 6 4; fill: none; }
+      .ttft-curve { stroke: #3a6098; stroke-width: 2.5; fill: none; }
+      .mem-curve { stroke: #c8843e; stroke-width: 2.5; fill: none; stroke-dasharray: 1 0; }
+      .oom-band { fill: #d8654a; fill-opacity: 0.16; }
+      .mem-cap { stroke: #a04545; stroke-width: 1.4; stroke-dasharray: 4 4; fill: none; }
+      .dot-real { fill: #c84a4a; stroke: #fff; stroke-width: 1.5; }
+      .annot-good { fill: #2d6a3e; }
+      .annot-bad { fill: #a04545; }
+      .annot-blue { fill: #3a6098; }
+      .annot-orange { fill: #c8843e; }
+      .panel-frame { fill: none; stroke: #d4d4ce; stroke-width: 1; }
+      .slot-label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #2a2a2a; }
+      .case-label { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1440" height="760" />
+
+  <!-- Title -->
+  <text class="title-text" x="40" y="40">Chunk size sets first-token latency on local long-prompt Qwen3</text>
+  <text class="subtitle-text" x="40" y="62">Two concurrent chat slots on one GPU, and the TTFT vs activation Pareto on a 32 GB Radeon AI PRO R9700</text>
+
+  <!-- =================== LEFT PANEL: Gantt timeline =================== -->
+  <text class="panel-title" x="40" y="100">Two-slot wall-clock timeline (illustrative)</text>
+
+  <!-- Monolithic case -->
+  <text class="case-label" x="40" y="130">Monolithic prefill: slot B waits for slot A's prefill to finish</text>
+
+  <!-- timeline axis frame for monolithic -->
+  <rect class="slot-bg" x="40" y="148" width="640" height="44" />
+  <text class="slot-label" x="50" y="172">slot A</text>
+  <rect class="slot-bg" x="40" y="200" width="640" height="44" />
+  <text class="slot-label" x="50" y="224">slot B</text>
+
+  <!-- slot A: prefill 0-9s, decode after -->
+  <!-- scale: 0-20s mapped to x=100 to x=670 → 28.5 px/sec -->
+  <rect class="prefill" x="100" y="156" width="256" height="28" rx="2" />
+  <text class="small" x="228" y="176" text-anchor="middle" fill="#fff" font-weight="600">prefill 9s</text>
+  <!-- decode ticks for A -->
+  <g>
+    <rect class="decode-tick" x="358" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="368" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="378" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="388" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="398" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="408" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="418" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="428" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="438" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="448" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="458" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="468" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="478" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="488" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="498" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="508" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="518" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="528" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="538" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="548" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="558" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="568" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="578" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="588" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="598" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="608" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="618" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="628" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="638" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="648" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="658" y="156" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="668" y="156" width="6" height="28" rx="1" />
+  </g>
+
+  <!-- slot B: idle then prefill 9-16s, decode after -->
+  <rect class="idle" x="100" y="208" width="256" height="28" rx="2" />
+  <text class="small" x="228" y="227" text-anchor="middle">idle (blocked)</text>
+  <rect class="prefill" x="358" y="208" width="200" height="28" rx="2" />
+  <text class="small" x="458" y="227" text-anchor="middle" fill="#fff" font-weight="600">prefill 7s</text>
+  <g>
+    <rect class="decode-tick" x="560" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="570" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="580" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="590" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="600" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="610" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="620" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="630" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="640" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="650" y="208" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="660" y="208" width="6" height="28" rx="1" />
+  </g>
+
+  <!-- TTFT marker for slot B in monolithic -->
+  <line class="ttft-line-bad" x1="560" y1="148" x2="560" y2="252" />
+  <text class="small annot-bad" x="566" y="260">slot B first token @ 16s</text>
+
+  <!-- time axis monolithic -->
+  <line class="axis" x1="100" y1="252" x2="670" y2="252" />
+  <g class="small">
+    <text x="100" y="270" text-anchor="middle">0s</text>
+    <text x="243" y="270" text-anchor="middle">5s</text>
+    <text x="385" y="270" text-anchor="middle">10s</text>
+    <text x="528" y="270" text-anchor="middle">15s</text>
+    <text x="670" y="270" text-anchor="middle">20s</text>
+  </g>
+
+  <!-- Chunked case -->
+  <text class="case-label" x="40" y="310">Chunked prefill: slot A's prefill chunks interleave with slot B's decode</text>
+
+  <rect class="slot-bg" x="40" y="328" width="640" height="44" />
+  <text class="slot-label" x="50" y="352">slot A</text>
+  <rect class="slot-bg" x="40" y="380" width="640" height="44" />
+  <text class="slot-label" x="50" y="404">slot B</text>
+
+  <!-- slot A: four prefill chunks, then decode; the chunks are spread out (with gaps for B's decode) -->
+  <rect class="prefill-chunk" x="100" y="336" width="60" height="28" rx="2" />
+  <rect class="prefill-chunk" x="180" y="336" width="60" height="28" rx="2" />
+  <rect class="prefill-chunk" x="260" y="336" width="60" height="28" rx="2" />
+  <rect class="prefill-chunk" x="340" y="336" width="60" height="28" rx="2" />
+  <text class="small" x="130" y="356" text-anchor="middle" fill="#fff" font-weight="600">c1</text>
+  <text class="small" x="210" y="356" text-anchor="middle" fill="#fff" font-weight="600">c2</text>
+  <text class="small" x="290" y="356" text-anchor="middle" fill="#fff" font-weight="600">c3</text>
+  <text class="small" x="370" y="356" text-anchor="middle" fill="#fff" font-weight="600">c4</text>
+  <!-- decode ticks for A after c4 -->
+  <g>
+    <rect class="decode-tick" x="402" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="412" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="422" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="432" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="442" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="452" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="462" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="472" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="482" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="492" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="502" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="512" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="522" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="532" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="542" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="552" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="562" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="572" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="582" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="592" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="602" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="612" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="622" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="632" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="642" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="652" y="336" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="662" y="336" width="6" height="28" rx="1" />
+  </g>
+
+  <!-- slot B: idle blocks while c chunks run, decode ticks in between -->
+  <rect class="idle" x="100" y="388" width="60" height="28" rx="2" />
+  <!-- decode in gap after c1: 4 ticks -->
+  <g>
+    <rect class="decode-tick" x="162" y="388" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="172" y="388" width="6" height="28" rx="1" />
+  </g>
+  <rect class="idle" x="180" y="388" width="60" height="28" rx="2" />
+  <g>
+    <rect class="decode-tick" x="242" y="388" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="252" y="388" width="6" height="28" rx="1" />
+  </g>
+  <rect class="idle" x="260" y="388" width="60" height="28" rx="2" />
+  <g>
+    <rect class="decode-tick" x="322" y="388" width="6" height="28" rx="1" />
+    <rect class="decode-tick" x="332" y="388" width="6" height="28" rx="1" />
+  </g>
+  <rect class="idle" x="340" y="388" width="60" height="28" rx="2" />
+  <!-- slot B's own prefill is much shorter because it interleaves with A's decode after c4 -->
+  <rect class="prefill-chunk" x="402" y="388" width="40" height="28" rx="2" />
+  <rect class="decode-tick" x="446" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="456" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="466" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="476" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="486" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="496" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="506" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="516" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="526" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="536" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="546" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="556" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="566" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="576" y="388" width="6" height="28" rx="1" />
+  <rect class="decode-tick" x="586" y="388" width="6" height="28" rx="1" />
+
+  <!-- B's first decode token marker -->
+  <line class="ttft-line-good" x1="442" y1="328" x2="442" y2="432" />
+  <text class="small annot-good" x="448" y="440">slot B first token @ 11s</text>
+
+  <!-- time axis chunked -->
+  <line class="axis" x1="100" y1="432" x2="670" y2="432" />
+  <g class="small">
+    <text x="100" y="450" text-anchor="middle">0s</text>
+    <text x="243" y="450" text-anchor="middle">5s</text>
+    <text x="385" y="450" text-anchor="middle">10s</text>
+    <text x="528" y="450" text-anchor="middle">15s</text>
+    <text x="670" y="450" text-anchor="middle">20s</text>
+  </g>
+
+  <!-- legend -->
+  <g transform="translate(40, 480)">
+    <rect class="prefill" x="0" y="0" width="14" height="14" rx="2" />
+    <text class="small" x="20" y="11">monolithic prefill block</text>
+
+    <rect class="prefill-chunk" x="170" y="0" width="14" height="14" rx="2" />
+    <text class="small" x="190" y="11">prefill chunk (one ubatch)</text>
+
+    <rect class="decode-tick" x="370" y="2" width="6" height="10" rx="1" />
+    <text class="small" x="380" y="11">decode token</text>
+
+    <rect class="idle" x="490" y="0" width="14" height="14" rx="2" />
+    <text class="small" x="510" y="11">slot blocked / idle</text>
+  </g>
+
+  <!-- annotation summarizing the win -->
+  <g transform="translate(40, 510)">
+    <rect x="0" y="0" width="640" height="60" rx="4" fill="#fff8ec" stroke="#e0c890" stroke-width="1" />
+    <text class="small" x="14" y="22" font-weight="700" fill="#7a5a20">Cost of chunking on slot A</text>
+    <text class="small" x="14" y="42">Slot A decode pace falls from 117 tok/s to roughly 60 tok/s during prefill window;</text>
+    <text class="small" x="14" y="56">slot B's first token lands 5 seconds sooner because chunks fit alongside decode.</text>
+  </g>
+
+  <!-- =================== RIGHT PANEL: TTFT Pareto =================== -->
+  <text class="panel-title" x="730" y="100">TTFT vs activation memory on R9700 (illustrative, Qwen3.6-35B-A3B)</text>
+
+  <!-- frame -->
+  <rect class="panel-frame" x="730" y="120" width="680" height="500" />
+
+  <!-- chunk size x axis: log scale 64 to 4096, mapped to x=780 to x=1370 -->
+  <!-- log(64)=6, log(4096)=12, range 6 -->
+  <!-- positions: x = 780 + ((log2(c) - 6) / 6) * 590 -->
+  <!-- c=64 → 780, c=128 → 878, c=256 → 976, c=512 → 1074, c=1024 → 1172, c=2048 → 1270, c=4096 → 1370 -->
+
+  <!-- OOM band (chunk 3072 to 4096) -->
+  <!-- log2(3072)=11.585, x = 780 + (5.585/6)*590 = 780 + 549 = 1329 -->
+  <rect class="oom-band" x="1329" y="160" width="41" height="380" />
+  <text class="small annot-bad" x="1350" y="178" text-anchor="middle" font-weight="700">OOM</text>
+  <text class="small annot-bad" x="1350" y="192" text-anchor="middle">zone</text>
+
+  <!-- y axes -->
+  <!-- left y: TTFT 0-260s mapped to y=540 (=0) to y=160 (=260), 1.46 px/s -->
+  <!-- right y: mem 0-16 GB mapped to y=540 (=0) to y=160 (=16) -->
+  <line class="axis" x1="780" y1="540" x2="1370" y2="540" />
+  <line class="axis" x1="780" y1="160" x2="780" y2="540" />
+  <line class="axis" x1="1370" y1="160" x2="1370" y2="540" />
+
+  <!-- x ticks and labels -->
+  <g class="small">
+    <line class="grid" x1="780" y1="540" x2="780" y2="160" />
+    <line class="grid" x1="878" y1="540" x2="878" y2="160" />
+    <line class="grid" x1="976" y1="540" x2="976" y2="160" />
+    <line class="grid" x1="1074" y1="540" x2="1074" y2="160" />
+    <line class="grid" x1="1172" y1="540" x2="1172" y2="160" />
+    <line class="grid" x1="1270" y1="540" x2="1270" y2="160" />
+    <line class="grid" x1="1370" y1="540" x2="1370" y2="160" />
+    <text x="780" y="558" text-anchor="middle">64</text>
+    <text x="878" y="558" text-anchor="middle">128</text>
+    <text x="976" y="558" text-anchor="middle">256</text>
+    <text x="1074" y="558" text-anchor="middle" font-weight="700">512</text>
+    <text x="1172" y="558" text-anchor="middle">1024</text>
+    <text x="1270" y="558" text-anchor="middle">2048</text>
+    <text x="1370" y="558" text-anchor="middle">4096</text>
+    <text x="1075" y="582" text-anchor="middle" font-weight="700">ubatch-size (tokens, log scale)</text>
+  </g>
+
+  <!-- left y axis ticks: TTFT 0..260 -->
+  <g class="small annot-blue">
+    <!-- 240s → y = 540 - 240*1.46 = 540 - 350 = 190 -->
+    <line class="grid" x1="780" y1="190" x2="1370" y2="190" />
+    <line class="grid" x1="780" y1="263" x2="1370" y2="263" />
+    <line class="grid" x1="780" y1="336" x2="1370" y2="336" />
+    <line class="grid" x1="780" y1="409" x2="1370" y2="409" />
+    <line class="grid" x1="780" y1="482" x2="1370" y2="482" />
+    <text x="774" y="194" text-anchor="end">240s</text>
+    <text x="774" y="267" text-anchor="end">190s</text>
+    <text x="774" y="340" text-anchor="end">140s</text>
+    <text x="774" y="413" text-anchor="end">90s</text>
+    <text x="774" y="486" text-anchor="end">40s</text>
+    <text x="774" y="544" text-anchor="end">0s</text>
+    <text x="744" y="335" text-anchor="middle" transform="rotate(-90, 744, 335)" font-weight="700">TTFT, 16k input prompt</text>
+  </g>
+
+  <!-- right y axis ticks: memory 0..16 GB -->
+  <g class="small annot-orange">
+    <!-- 16GB → y = 160; 0 → 540; 2 GB = 47.5 px -->
+    <text x="1376" y="164" text-anchor="start">16</text>
+    <text x="1376" y="259" text-anchor="start">12</text>
+    <text x="1376" y="354" text-anchor="start">8</text>
+    <text x="1376" y="449" text-anchor="start">4</text>
+    <text x="1376" y="544" text-anchor="start">0</text>
+    <text x="1406" y="335" text-anchor="middle" transform="rotate(90, 1406, 335)" font-weight="700">activation memory (GB)</text>
+  </g>
+
+  <!-- 13 GB cap line: y = 540 - (13/16)*380 = 540 - 308.75 = 231.25 -->
+  <line class="mem-cap" x1="780" y1="231" x2="1370" y2="231" />
+  <text class="small annot-bad" x="1325" y="225" text-anchor="end">R9700 free pool ceiling after Qwen3.6-35B-A3B weights + 128k KV</text>
+
+  <!-- TTFT curve -->
+  <!-- data points:
+       c=64 (x=780): 240s → y=190
+       c=128 (x=878): 215s → y=540-215*1.46=540-313.9=226
+       c=256 (x=976): 195s → y=540-285=255
+       c=512 (x=1074): 182s → y=540-265.7=274
+       c=1024 (x=1172): 165s → y=540-241=299
+       c=2048 (x=1270): 142s → y=540-207=333
+       c=3072 (x=1329): 160s → y=540-233.6=306
+       c=4096 (x=1370): 200s → y=540-292=248
+  -->
+  <path class="ttft-curve" d="M 780 190 C 830 200, 850 220, 878 226 S 950 247, 976 255 S 1050 270, 1074 274 S 1140 290, 1172 299 S 1240 325, 1270 333 C 1290 345, 1310 320, 1329 306 S 1360 260, 1370 248" />
+
+  <!-- Mem curve -->
+  <!-- mem data:
+       c=64: 0.4 GB → y = 540 - (0.4/16)*380 = 540 - 9.5 = 530.5
+       c=128: 0.5 → 528
+       c=256: 0.9 → 519
+       c=512: 1.8 → 497
+       c=1024: 3.6 → 454
+       c=2048: 7.2 → 369
+       c=4096: 14.4 → 198
+  -->
+  <path class="mem-curve" d="M 780 530 L 878 528 L 976 519 L 1074 497 L 1172 454 L 1270 369 L 1370 198" />
+
+  <!-- Annotate sweet spot -->
+  <g>
+    <circle cx="1270" cy="333" r="6" class="dot-real" />
+    <line x1="1270" y1="333" x2="1180" y2="375" stroke="#c84a4a" stroke-width="1" stroke-dasharray="3 3" />
+    <rect x="1000" y="375" width="180" height="46" rx="4" fill="#fff" stroke="#c84a4a" stroke-width="0.8" />
+    <text class="small annot-bad" x="1010" y="392" font-weight="700">real measurement</text>
+    <text class="small" x="1010" y="406">4x Tesla T4, 5,800-tok prompt</text>
+    <text class="small" x="1010" y="418">ubatch 512 → 2048: 36s → 26s</text>
+  </g>
+
+  <!-- Default 512 marker -->
+  <g>
+    <circle cx="1074" cy="274" r="5" fill="#3a6098" stroke="#fff" stroke-width="1.5" />
+    <line x1="1074" y1="274" x2="1074" y2="155" stroke="#3a6098" stroke-width="0.8" stroke-dasharray="2 2" />
+    <rect x="980" y="120" width="200" height="38" rx="4" fill="#eaf0fa" stroke="#3a6098" stroke-width="0.8" />
+    <text class="small annot-blue" x="990" y="138" font-weight="700">llama.cpp default ubatch = 512</text>
+    <text class="small" x="990" y="152">safe across all archs, not optimal</text>
+  </g>
+
+  <!-- Sweet spot zone -->
+  <rect x="1172" y="600" width="98" height="14" fill="#5a9468" fill-opacity="0.20" stroke="#3d7350" stroke-width="0.5" />
+  <text class="small annot-good" x="1221" y="611" text-anchor="middle" font-weight="700">sweet spot</text>
+
+  <!-- Legend for curves -->
+  <g transform="translate(800, 596)">
+    <line x1="0" y1="6" x2="20" y2="6" class="ttft-curve" />
+    <text class="small annot-blue" x="26" y="10">TTFT (left axis)</text>
+
+    <line x1="140" y1="6" x2="160" y2="6" class="mem-curve" />
+    <text class="small annot-orange" x="166" y="10">activation memory (right axis)</text>
+  </g>
+
+  <!-- Footer -->
+  <line class="grid" x1="40" y1="710" x2="1400" y2="710" />
+  <text class="footer" x="40" y="734">Sources: Sarathi-Serve, OSDI 2024 (stall-free batching framing). llama.cpp tools/server README (default --batch-size 2048, --ubatch-size 512).</text>
+  <text class="footer" x="40" y="752">llama.cpp issue 17578 (Qwen3-Next memory-pool crash at ubatch ≥ 2048 in build_delta_net_chunking). Real TTFT data point: ggml-org/llama.cpp discussion 6328.</text>
+
+</svg>

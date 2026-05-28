@@ -7,6 +7,7 @@ struct Params {
     uint n;
     float eps;
     float scale;
+    uint residual_offset;
 };
 
 // Fused residual-add + RMS norm: hidden += scale * residual; norm = weights * normalize(hidden)
@@ -42,7 +43,7 @@ kernel void main0(
     float sum_sq = 0.0f;
     uint count = 0;
     for (uint i = tid; i < p.n; i += TG_SIZE) {
-        const float h = fma(scale, residual[base + i], hidden[base + i]);
+        const float h = fma(scale, residual[p.residual_offset + base + i], hidden[base + i]);
         hidden[base + i] = h;
         vals[count++] = h;
         sum_sq += h * h;
@@ -53,16 +54,13 @@ kernel void main0(
     if (lane == 0) partial_sums[sg_idx] = sg_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First simdgroup reduces the partial sums.
-    float total_sq;
-    if (sg_idx == 0) {
-        float v = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
-        total_sq = simd_sum(v);
-        if (lane == 0) partial_sums[0] = total_sq;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const float rms_inv = rsqrt((partial_sums[0] / float(p.n)) + p.eps);
+    // Every simdgroup does the final reduction + rms_inv independently.
+    // Avoids the rms_inv broadcast barrier (saves one barrier per dispatch,
+    // ~36 dispatches/token on Qwen3-8B). Work is duplicated 8× across
+    // simdgroups but executes in parallel on Apple7.
+    float v = (lane < N_SIMDGROUPS) ? partial_sums[lane] : 0.0f;
+    const float total_sq = simd_sum(v);
+    const float rms_inv = fast::rsqrt(fast::divide(total_sq, float(p.n)) + p.eps);
 
     // Pass 2: normalize from registers (avoids re-reading hidden_buf).
     count = 0;

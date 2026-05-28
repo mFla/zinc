@@ -2,10 +2,10 @@
 
 ## Current State (2026-04-05)
 
-- **Decode**: 62.4 tok/s (16.0 ms/tok) — Qwen3.5-35B on RX 9070 RDNA4
+- **Decode**: 62.4 tok/s (16.0 ms/tok) — Qwen3.6-35B on RX 9070 RDNA4
 - **Prefill**: ~62 tok/s (sequential, one token at a time, reads ALL weights per token)
 - **llama.cpp prefill**: ~500+ tok/s (batched, reads weights once for all tokens)
-- **Target**: 200-400 tok/s prefill for Qwen3.5-35B
+- **Target**: 200-400 tok/s prefill for Qwen3.6-35B
 
 ## Why
 
@@ -17,9 +17,9 @@ ZINC processes prompt tokens one at a time — each token reads ALL model weight
 
 This eliminates the multi-second wait before first token for long prompts.
 
-### Model-specific details (Qwen3.5-35B-A3B)
+### Model-specific details (Qwen3.6-35B-A3B)
 
-Per-token weight reads: ~1.28 GB (see RDNA4_PERFORMANCE_PLAN.md).
+Historical per-token weight-read estimate: ~1.28 GB.
 Bytes breakdown:
 - SSM projections (qkv+gate+alpha+beta+out, 30 layers, Q8_0): 420 MB
 - Shared expert (gate+up+down, 40 layers, Q8_0): 240 MB
@@ -67,7 +67,7 @@ self.batch_norm_buf = Buffer.initDeviceLocal(instance, @as(VkDeviceSize, n) * hi
 self.batch_embed_staging = Buffer.initStaging(instance, @as(VkDeviceSize, n) * hidden_size) catch null;
 ```
 
-**Memory cost for Qwen3.5-35B** (hidden=2048, inter=512 MoE, q=256, kv=256, N=256):
+**Memory cost for Qwen3.6-35B** (hidden=2048, inter=512 MoE, q=256, kv=256, N=256):
 - hidden/norm/ffn_norm/o_proj/down/moe_out: 6 × 256 × 2048 × 4 = 12.6 MB
 - gate/up/swiglu: 3 × 256 × 512 × 8_experts × 4 = 12.6 MB (batched MoE)
 - q/attn_out: 2 × 256 × 256 × 4 = 0.5 MB
@@ -171,7 +171,7 @@ self.decode_cmd.computeBarrier();
 
 This is the same cost as sequential prefill for attention, but the DMMV weight reads are batched.
 
-### Step 6: MoE batching (Qwen3.5 specific)
+### Step 6: MoE batching (Qwen3.6 specific)
 
 For MoE layers, each token in the batch may select DIFFERENT experts. This complicates batching:
 
@@ -184,7 +184,7 @@ For MoE layers, each token in the batch may select DIFFERENT experts. This compl
 - Per-expert batch DMMV: expert_weight × gathered_inputs → outputs
 - Scatter outputs back to per-token positions
 
-**Recommendation**: Start with Option A. MoE is 40 of 40 FFN layers for Qwen3.5-35B, so sequential MoE limits the batch speedup. But SSM projections (30 layers, 420 MB/tok) still benefit hugely from batching.
+**Recommendation**: Start with Option A. MoE is 40 of 40 FFN layers for Qwen3.6-35B, so sequential MoE limits the batch speedup. But SSM projections (30 layers, 420 MB/tok) still benefit hugely from batching.
 
 ### Step 7: Implement `prefillBatch` function
 
@@ -332,7 +332,7 @@ fn batchScaleAcc(self: *InferenceEngine, accum: Buffer, src: Buffer, n_elements:
 
 ## Expected Performance
 
-For Qwen3.5-35B with 64-token prompt:
+For Qwen3.6-35B with 64-token prompt:
 
 | Component | Sequential | Batch | Savings |
 |-----------|-----------|-------|---------|
@@ -349,7 +349,7 @@ With attention+MoE sequential bottleneck: **~4-8× overall prefill speedup**.
 
 | Model | Architecture | Test point |
 |-------|-------------|------------|
-| Qwen3.5-35B | MoE + SSM | Primary target |
+| Qwen3.6-35B | MoE + SSM | Primary target |
 | Qwen3-8B | Dense attention | Small-model regression guard |
 | Gemma4-31B | Dense attention | Full batch benefit |
 
@@ -367,7 +367,7 @@ With attention+MoE sequential bottleneck: **~4-8× overall prefill speedup**.
 
 - **High complexity**: ~300-500 lines of new code in `prefillBatch`, mirroring the decode loop
 - **Correctness**: Batch buffer indexing must be exact. KV cache position tracking across batch tokens is error-prone.
-- **Memory**: ~28 MB extra VRAM for Qwen3.5-35B (negligible). For larger models, may need to reduce max_prefill_batch.
+- **Memory**: ~28 MB extra VRAM for Qwen3.6-35B (negligible). For larger models, may need to reduce max_prefill_batch.
 - **Mitigation**: Implement incrementally. Start with batch embedding + batch norms + sequential everything else. Each step independently testable.
 
 ## Files to Create/Modify

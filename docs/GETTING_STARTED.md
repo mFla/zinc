@@ -2,7 +2,7 @@
 
 > **Experimental software**: ZINC is under active development. The CLI path is the best-supported way to start. Server mode, model coverage, and performance tuning are still moving quickly.
 
-ZINC is a local LLM inference engine for AMD GPUs and Apple Silicon. The fastest way to check if it works on your machine:
+ZINC is a local LLM inference engine for consumer GPUs and Apple Silicon. The fastest way to check if it works on your machine:
 
 1. Install Zig.
 2. Build the binary.
@@ -15,6 +15,7 @@ If that works, move on to the [hardware requirements](/zinc/docs/hardware-requir
 ZINC currently targets:
 
 - **Linux** with AMD RDNA3/RDNA4 GPUs through Vulkan 1.3
+- **Linux** with Intel Arc Xe2 / Battlemage GPUs through Vulkan 1.3 (experimental)
 - **macOS** with Apple Silicon (M1 through M5) through Metal
 - **GGUF models** (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, MXFP4, F16, F32 quantizations)
 
@@ -22,12 +23,13 @@ ZINC currently targets:
 
 This list is intentionally narrow. It shows the exact GGUFs that have been validated end-to-end.
 
-| Model | Exact GGUF | Fits on |
-|------|------------|---------|
-| **OpenAI GPT-OSS 20B** | [openai_gpt-oss-20b-Q4_K_M.gguf](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF) | 16+ GB unified (Apple Silicon) |
-| **Qwen3 8B** | [Qwen3-8B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 16+ GB VRAM or unified |
-| **Qwen3.5 35B-A3B UD** | [Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF) | 24+ GB VRAM or unified |
-| **Qwen3.6 35B-A3B UD** | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified |
+| Model | Model ID (`zinc model pull <id>`) | Exact GGUF | Fits on | Status |
+|------|------|------------|---------|--------|
+| **Qwen3 8B** | `qwen3-8b-q4k-m` | [Qwen3-8B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3-8B-GGUF) | 16+ GB VRAM or unified | supported |
+| **Gemma 4 26B-A4B MoE** | `gemma4-26b-a4b-q4k-m` | [gemma-4-26B-A4B-it-UD-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) | 16+ GB VRAM or unified | supported |
+| **Gemma 4 31B** | `gemma4-31b-q4k-m` | [gemma-4-31B-it-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) | 24+ GB VRAM or unified | supported |
+| **Qwen3.6 27B Dense** | `qwen36-27b-q4k-m` | [Qwen3.6-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | 24+ GB VRAM or unified | experimental |
+| **Qwen3.6 35B-A3B UD** | `qwen36-35b-a3b-q4k-xl` | [Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 24+ GB VRAM or unified | supported |
 
 ## Install dependencies
 
@@ -160,4 +162,5 @@ Then open `http://localhost:8080/` in your browser.
 - [Serving HTTP API](/zinc/docs/api) for the full endpoint reference
 - [Development Guide](/zinc/docs/development) for building, testing, and contributing
 - [RDNA4 tuning](/zinc/docs/rdna4-tuning) for AMD performance work
+- [Intel GPU Reference](/zinc/docs/intel-gpu-reference) for Arc B-series hardware details
 - [Apple Silicon Reference](/zinc/docs/apple-silicon-reference) for M1 through M5 platform details

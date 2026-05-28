@@ -8,6 +8,7 @@ struct _17
     uint _m0;
     uint _m1;
     uint _m2;
+    uint _m3;
 };
 
 struct _66
@@ -68,7 +69,7 @@ kernel void main0(constant _17& _19 [[buffer(0)]], device void* spvBufferAliasSe
             }
             else
             {
-                _189 = _105._m0[gl_GlobalInvocationID.x];
+                _189 = _105._m0[_19._m3 + gl_GlobalInvocationID.x];
             }
             _113 = _184 + (_188 * _189);
         }
@@ -82,8 +83,7 @@ kernel void main0(constant _17& _19 [[buffer(0)]], device void* spvBufferAliasSe
                 continue;
             }
         }
-        _92._m0[((_19._m1 - 2u) * _19._m0) + gl_GlobalInvocationID.x] = _105._m0[gl_GlobalInvocationID.x];
+        _92._m0[((_19._m1 - 2u) * _19._m0) + gl_GlobalInvocationID.x] = _105._m0[_19._m3 + gl_GlobalInvocationID.x];
         break;
     } while(false);
 }
-

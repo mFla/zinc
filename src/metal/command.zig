@@ -22,6 +22,7 @@ pub const MetalCommand = struct {
     dispatch_count: u32,
     barrier_count: u32,
     barrier_enabled: bool,
+    last_barrier_dispatch_count: u32 = 0,
 
     /// Encode a compute dispatch binding buffers, push constants, grid, and block sizes.
     pub fn dispatch(
@@ -104,6 +105,7 @@ pub const MetalCommand = struct {
         tg_mem_size: u32,
     ) void {
         if (self.handle == null or pipe.handle == null) return;
+        self.dispatch_count += 1;
 
         var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
         const n_bufs: u32 = @intCast(@min(bufs.len, 32));
@@ -128,9 +130,53 @@ pub const MetalCommand = struct {
     /// Insert a memory barrier ensuring all prior dispatches complete before subsequent ones.
     pub fn barrier(self: *MetalCommand) void {
         if (!self.barrier_enabled) return;
+        if (self.dispatch_count == 0) return;
+        if (self.last_barrier_dispatch_count == self.dispatch_count) return;
         if (self.handle) |h| {
             self.barrier_count += 1;
+            self.last_barrier_dispatch_count = self.dispatch_count;
             shim.mtl_barrier(h);
+        }
+    }
+
+    /// Insert a resource-scoped memory barrier for the listed buffers.
+    pub fn barrierBuffers(self: *MetalCommand, bufs: []const *const MetalBuffer) void {
+        if (!self.barrier_enabled) return;
+        if (self.dispatch_count == 0) return;
+        if (self.last_barrier_dispatch_count == self.dispatch_count) return;
+        if (self.handle) |h| {
+            if (bufs.len == 1) {
+                if (bufs[0].handle != null) {
+                    self.barrier_count += 1;
+                    self.last_barrier_dispatch_count = self.dispatch_count;
+                    // Match llama.cpp's `ggml_metal_op_concurrency_reset`: at
+                    // hot dependency edges, a scope barrier is cheaper to encode
+                    // than constructing a one-resource barrier while preserving
+                    // the same dispatch ordering guarantee.
+                    shim.mtl_barrier(h);
+                }
+                return;
+            }
+            var c_bufs: [32]?*shim.MetalBuf = .{null} ** 32;
+            var n_bufs: u32 = 0;
+            for (bufs) |b| {
+                if (@as(usize, n_bufs) == c_bufs.len) break;
+                if (b.handle) |handle| {
+                    c_bufs[@intCast(n_bufs)] = handle;
+                    n_bufs += 1;
+                }
+            }
+            if (n_bufs == 0) return;
+            self.barrier_count += 1;
+            self.last_barrier_dispatch_count = self.dispatch_count;
+            if (n_bufs >= 2) {
+                // Match llama.cpp's dependency-reset discipline at phase
+                // boundaries: a scoped in-encoder barrier avoids the hot
+                // Objective-C resource-list call while preserving ordering.
+                shim.mtl_barrier(h);
+            } else {
+                shim.mtl_barrier_buffers(h, @ptrCast(&c_bufs), n_bufs);
+            }
         }
     }
 
@@ -173,6 +219,7 @@ pub fn beginCommandWithMode(ctx: ?*shim.MetalCtx, mode: CommandEncoderMode) !Met
         .dispatch_count = 0,
         .barrier_count = 0,
         .barrier_enabled = mode == .concurrent,
+        .last_barrier_dispatch_count = 0,
     };
 }
 

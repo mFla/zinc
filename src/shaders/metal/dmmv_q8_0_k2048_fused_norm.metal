@@ -15,7 +15,7 @@ struct DmmvPush {
 // independently computes the RMSNorm factor from the raw hidden state.  Hidden
 // (8 KiB for K=2048) and norm_weight are L1-cached after the first simdgroup on
 // a core accesses them; subsequent simdgroups get L1 hits.  This removes one
-// barrier and one dispatch per SSM layer (30 per decode step on Qwen3.5-35B-A3B).
+// barrier and one dispatch per SSM layer (30 per decode step on Qwen3.6-35B-A3B).
 //
 // The inline norm adds ~64 FMAs + simd_sum + rsqrt per simdgroup — negligible
 // compared to the weight memory reads that dominate DMMV execution time.
@@ -61,13 +61,12 @@ kernel void main0(
         #pragma unroll
         for (uint vi = 0u; vi < 8u; ++vi) {
             const char4 q = char4(quants[vi]);
-            const half4 q_half = half4(q);
             const uint idx = x_base + (vi << 2);
             // Inline RMSNorm: x[i] = norm_weight[i] * (hidden[i] * rms_inv)
             const float4 h4 = *(device const float4*)(h + idx);
             const float4 nw4 = *(device const float4*)(norm_weight + idx);
-            const half4 x = half4(nw4 * (h4 * rms_inv));
-            acc = fma(scale, float(dot(q_half, x)), acc);
+            const float4 x = nw4 * (h4 * rms_inv);
+            acc = fma(scale, dot(float4(q), x), acc);
         }
     }
 

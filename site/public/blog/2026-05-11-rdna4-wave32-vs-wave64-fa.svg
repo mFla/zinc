@@ -1,0 +1,338 @@
+<svg viewBox="0 0 1440 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">RDNA4 scalar flash attention: wave64 default vs wave32 fix, with measured Vulkan FA throughput on AMD Radeon Pro VII at three context depths</title>
+  <desc id="desc">Left panel shows SIMD lane occupancy for scalar flash attention with Br equal to one. Top half labeled wave64 default has two stacked cycles where each cycle has the first 16 of 32 lanes filled green for useful KQ dot-product work and the remaining 16 lanes filled gray for idle lanes, marked 50 percent SIMD utilization. Bottom half labeled wave32 RDNA4 fix has two stacked wavefronts each running in one cycle, with 28 to 30 of 32 lanes filled green and a small partial-work tail in light yellow, marked greater than 90 percent SIMD utilization. Right panel is a grouped bar chart of measured Vulkan scalar FA throughput on AMD Radeon Pro VII at three context depths: pp512 d0 at 800 versus 828 tok per second plus 3.4 percent; pp512 d8192 at 174 versus 389 tok per second plus 122.9 percent; pp512 d16384 at 84 versus 247 tok per second plus 193.0 percent. A small inset shows tg128 at d16384 going from 41.5 to 57.7 tok per second plus 39.2 percent. Footer credits llama.cpp PR 19625, commit titled use wave32 on AMD RDNA for scalar FA.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #fafaf7; }
+      .title-text { font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+      .subtitle-text { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #555; }
+      .panel-title { font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1a1a1a; }
+      .label { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #333; }
+      .small { font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #555; }
+      .mono { font: 500 11px ui-monospace, "SF Mono", Menlo, monospace; fill: #444; }
+      .util-good { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #2d6a3e; }
+      .util-bad { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #a04545; }
+      .axis { stroke: #999; stroke-width: 1; }
+      .grid { stroke: #e4e4e0; stroke-width: 1; }
+      .footer { font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #666; }
+      .lane-useful { fill: #5a9468; stroke: #3d7350; stroke-width: 0.5; }
+      .lane-idle { fill: #c8c8c0; stroke: #a8a8a0; stroke-width: 0.5; }
+      .lane-partial { fill: #e8c870; stroke: #b8a050; stroke-width: 0.5; }
+      .panel-frame { fill: none; stroke: #d4d4ce; stroke-width: 1; }
+      .cycle-label { font: 600 11px ui-monospace, "SF Mono", Menlo, monospace; fill: #666; }
+      .annot-good { fill: #2d6a3e; }
+      .annot-bad { fill: #a04545; }
+      .bar-before { fill: #c8a878; }
+      .bar-after { fill: #5a9468; }
+      .delta-bad { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #888; }
+      .delta-good { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #2d6a3e; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1440" height="760"/>
+
+  <!-- Top header -->
+  <text class="title-text" x="40" y="40">RDNA4 scalar flash attention: the wave32 default that closes the long-context gap</text>
+  <text class="subtitle-text" x="40" y="62">gfx1201 SIMD occupancy with Br=1, and measured Vulkan FA throughput on a sibling AMD card before and after PR 19625</text>
+
+  <!-- LEFT PANEL: SIMD lane occupancy -->
+  <g transform="translate(40, 100)">
+    <rect class="panel-frame" x="0" y="0" width="640" height="600" rx="6"/>
+    <text class="panel-title" x="20" y="28">SIMD lane occupancy on a single 32-lane gfx1201 SIMD</text>
+    <text class="small" x="20" y="46">Scalar FA tile, Br = 1, head dim 128, one query position per workgroup</text>
+
+    <!-- wave64 section -->
+    <g transform="translate(20, 80)">
+      <text class="label" x="0" y="0" fill="#a04545" font-weight="700">wave64 default (pre-PR)</text>
+      <text class="small" x="0" y="18">Each wave64 dispatch folds onto two cycles of one 32-lane SIMD</text>
+
+      <!-- Cycle 1 -->
+      <text class="cycle-label" x="0" y="50">cycle 0</text>
+      <g transform="translate(60, 36)">
+        <!-- 32 lanes: 16 useful, 16 idle -->
+        <g id="wave64-cycle0">
+          <!-- useful lanes -->
+          <g>
+            <rect class="lane-useful" x="0" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="15" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="30" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="45" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="60" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="75" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="90" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="105" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="120" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="135" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="150" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="165" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="180" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="195" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="210" y="0" width="14" height="22"/>
+            <rect class="lane-useful" x="225" y="0" width="14" height="22"/>
+          </g>
+          <!-- idle lanes -->
+          <g>
+            <rect class="lane-idle" x="240" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="255" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="270" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="285" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="300" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="315" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="330" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="345" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="360" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="375" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="390" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="405" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="420" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="435" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="450" y="0" width="14" height="22"/>
+            <rect class="lane-idle" x="465" y="0" width="14" height="22"/>
+          </g>
+        </g>
+      </g>
+
+      <!-- Cycle 2 -->
+      <text class="cycle-label" x="0" y="80">cycle 1</text>
+      <g transform="translate(60, 66)">
+        <g>
+          <rect class="lane-useful" x="0" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="15" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="30" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="45" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="60" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="75" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="90" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="105" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="120" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="135" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="150" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="165" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="180" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="195" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="210" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="225" y="0" width="14" height="22"/>
+        </g>
+        <g>
+          <rect class="lane-idle" x="240" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="255" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="270" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="285" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="300" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="315" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="330" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="345" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="360" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="375" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="390" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="405" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="420" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="435" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="450" y="0" width="14" height="22"/>
+          <rect class="lane-idle" x="465" y="0" width="14" height="22"/>
+        </g>
+      </g>
+
+      <text class="small" x="540" y="50" text-anchor="end">lane 0</text>
+      <text class="small" x="540" y="50" text-anchor="start" transform="translate(45,0)">lane 31</text>
+
+      <!-- annotation -->
+      <text class="util-bad" x="0" y="120">50% SIMD utilization · 2 cycles per dispatch</text>
+      <text class="mono" x="0" y="140">• static VGPR allocation (worst-case)</text>
+      <text class="mono" x="0" y="158">• 64-lane cross-lane shuffle, two-cycle latency</text>
+      <text class="mono" x="0" y="176">• max 8 wave64 in flight per SIMD</text>
+    </g>
+
+    <!-- Divider -->
+    <line x1="20" y1="310" x2="620" y2="310" stroke="#d4d4ce" stroke-width="1" stroke-dasharray="4,4"/>
+
+    <!-- wave32 section -->
+    <g transform="translate(20, 340)">
+      <text class="label" x="0" y="0" fill="#2d6a3e" font-weight="700">wave32 RDNA4 fix (PR 19625)</text>
+      <text class="small" x="0" y="18">Each wave32 dispatch runs on one 32-lane SIMD in one cycle; two wavefronts interleaved</text>
+
+      <!-- Wavefront A -->
+      <text class="cycle-label" x="0" y="50">wave A</text>
+      <g transform="translate(60, 36)">
+        <g>
+          <rect class="lane-useful" x="0" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="15" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="30" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="45" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="60" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="75" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="90" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="105" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="120" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="135" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="150" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="165" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="180" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="195" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="210" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="225" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="240" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="255" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="270" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="285" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="300" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="315" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="330" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="345" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="360" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="375" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="390" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="405" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="420" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="435" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="450" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="465" y="0" width="14" height="22"/>
+        </g>
+      </g>
+
+      <!-- Wavefront B (interleaved) -->
+      <text class="cycle-label" x="0" y="80">wave B</text>
+      <g transform="translate(60, 66)">
+        <g>
+          <rect class="lane-useful" x="0" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="15" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="30" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="45" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="60" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="75" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="90" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="105" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="120" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="135" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="150" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="165" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="180" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="195" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="210" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="225" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="240" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="255" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="270" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="285" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="300" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="315" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="330" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="345" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="360" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="375" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="390" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="405" y="0" width="14" height="22"/>
+          <rect class="lane-useful" x="420" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="435" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="450" y="0" width="14" height="22"/>
+          <rect class="lane-partial" x="465" y="0" width="14" height="22"/>
+        </g>
+      </g>
+
+      <!-- annotation -->
+      <text class="util-good" x="0" y="120">&gt;90% SIMD utilization · 1 cycle per dispatch</text>
+      <text class="mono" x="0" y="140">• dynamic VGPR allocation (RDNA4-only, wave32-only)</text>
+      <text class="mono" x="0" y="158">• 32-lane cross-lane shuffle, one-cycle latency</text>
+      <text class="mono" x="0" y="176">• max 16 wave32 in flight per SIMD</text>
+    </g>
+
+    <!-- Legend -->
+    <g transform="translate(20, 545)">
+      <rect class="lane-useful" x="0" y="0" width="14" height="14"/>
+      <text class="small" x="20" y="11">useful KQ dot-product lane</text>
+      <rect class="lane-partial" x="180" y="0" width="14" height="14"/>
+      <text class="small" x="200" y="11">partial / tail work</text>
+      <rect class="lane-idle" x="330" y="0" width="14" height="14"/>
+      <text class="small" x="350" y="11">idle lane (masked off)</text>
+    </g>
+  </g>
+
+  <!-- RIGHT PANEL: bar chart -->
+  <g transform="translate(720, 100)">
+    <rect class="panel-frame" x="0" y="0" width="680" height="600" rx="6"/>
+    <text class="panel-title" x="20" y="28">Measured Vulkan scalar FA throughput, Radeon Pro VII</text>
+    <text class="small" x="20" y="46">llama 8B Q4_0, ngl 99, fa 1; before = b8500-era, after = PR 19625</text>
+
+    <!-- chart area -->
+    <g transform="translate(80, 90)">
+      <!-- y-axis -->
+      <line class="axis" x1="0" y1="0" x2="0" y2="380"/>
+      <line class="axis" x1="0" y1="380" x2="560" y2="380"/>
+
+      <!-- y-axis ticks and labels -->
+      <line class="grid" x1="0" y1="0" x2="560" y2="0"/>
+      <line class="grid" x1="0" y1="76" x2="560" y2="76"/>
+      <line class="grid" x1="0" y1="152" x2="560" y2="152"/>
+      <line class="grid" x1="0" y1="228" x2="560" y2="228"/>
+      <line class="grid" x1="0" y1="304" x2="560" y2="304"/>
+
+      <text class="small" x="-8" y="384" text-anchor="end">0</text>
+      <text class="small" x="-8" y="308" text-anchor="end">200</text>
+      <text class="small" x="-8" y="232" text-anchor="end">400</text>
+      <text class="small" x="-8" y="156" text-anchor="end">600</text>
+      <text class="small" x="-8" y="80" text-anchor="end">800</text>
+      <text class="small" x="-8" y="4" text-anchor="end">1000</text>
+
+      <text class="small" x="-50" y="190" transform="rotate(-90, -50, 190)" text-anchor="middle">tok/s (pp512)</text>
+
+      <!-- Bars: scale factor = 380 / 1000 = 0.38 px per tok/s -->
+      <!-- Group 1: pp512 d0 -->
+      <g transform="translate(40, 0)">
+        <rect class="bar-before" x="0" y="76" width="50" height="304"/>
+        <text class="small" x="25" y="70" text-anchor="middle">800</text>
+        <rect class="bar-after" x="56" y="65.4" width="50" height="314.6"/>
+        <text class="small" x="81" y="58" text-anchor="middle">828</text>
+        <text class="delta-bad" x="53" y="400" text-anchor="middle">+3.4%</text>
+        <text class="label" x="53" y="420" text-anchor="middle">pp512 @ d0</text>
+        <text class="small" x="53" y="436" text-anchor="middle">attention not dominant</text>
+      </g>
+
+      <!-- Group 2: pp512 d8192 -->
+      <g transform="translate(220, 0)">
+        <rect class="bar-before" x="0" y="313.9" width="50" height="66.1"/>
+        <text class="small" x="25" y="308" text-anchor="middle">174</text>
+        <rect class="bar-after" x="56" y="232.2" width="50" height="147.8"/>
+        <text class="small" x="81" y="226" text-anchor="middle">389</text>
+        <text class="delta-good" x="53" y="400" text-anchor="middle">+122.9%</text>
+        <text class="label" x="53" y="420" text-anchor="middle">pp512 @ d8192</text>
+        <text class="small" x="53" y="436" text-anchor="middle">FA starts to dominate</text>
+      </g>
+
+      <!-- Group 3: pp512 d16384 -->
+      <g transform="translate(400, 0)">
+        <rect class="bar-before" x="0" y="347.95" width="50" height="32.05"/>
+        <text class="small" x="25" y="342" text-anchor="middle">84</text>
+        <rect class="bar-after" x="56" y="286.13" width="50" height="93.87"/>
+        <text class="small" x="81" y="280" text-anchor="middle">247</text>
+        <text class="delta-good" x="53" y="400" text-anchor="middle">+193.0%</text>
+        <text class="label" x="53" y="420" text-anchor="middle">pp512 @ d16384</text>
+        <text class="small" x="53" y="436" text-anchor="middle">FA dominates dispatch</text>
+      </g>
+
+      <!-- Legend -->
+      <g transform="translate(0, 450)">
+        <rect class="bar-before" x="0" y="0" width="18" height="14"/>
+        <text class="small" x="24" y="11">before PR (wave64 default)</text>
+        <rect class="bar-after" x="200" y="0" width="18" height="14"/>
+        <text class="small" x="224" y="11">after PR (wave32 on RDNA)</text>
+      </g>
+
+      <!-- Inset: tg128 d16384 -->
+      <g transform="translate(330, 30)">
+        <rect x="0" y="0" width="220" height="100" fill="#fff" stroke="#d4d4ce" stroke-width="1" rx="4"/>
+        <text class="small" x="10" y="18" font-weight="600">decode at long context</text>
+        <text class="small" x="10" y="34">tg128 @ d16384</text>
+        <!-- mini bars -->
+        <rect class="bar-before" x="10" y="42" width="100" height="14"/>
+        <text class="small" x="115" y="53">41.5 t/s</text>
+        <rect class="bar-after" x="10" y="62" width="139" height="14"/>
+        <text class="small" x="154" y="73">57.7 t/s</text>
+        <text class="delta-good" x="10" y="92">+39.2% decode at 16k context</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- Footer -->
+  <text class="footer" x="40" y="735">Source: llama.cpp PR 19625, commit "Use wave32 on AMD RDNA for scalar FA" by 0cc4m. Lane diagram is illustrative; the wave64 fold halves throughput on Br=1 scalar FA because the upper 16 lanes have no work for a one-row tile.</text>
+</svg>

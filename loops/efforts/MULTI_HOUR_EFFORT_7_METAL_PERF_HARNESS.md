@@ -19,7 +19,7 @@ llama.cpp asymmetrically:
 ### Why this matters
 
 On Apple Silicon the first GPU access after process start faults in mmap
-pages for the model weights (≈ 21 GiB for Qwen3.5-35B-A3B-UD-Q4_K_XL).
+pages for the model weights (≈ 21 GiB for Qwen3.6-35B-A3B-UD-Q4_K_XL).
 That single first-prefill step costs 3–10 seconds and dominates the
 measured prefill window on short prompts:
 
@@ -36,7 +36,7 @@ it fluctuates with disk cache state, OS page reclamation, and scheduling.
 
 ### The visible symptom
 
-The April 18 suite run published `qwen35-35b-a3b-q4k-xl core prefill
+The April 18 suite run published `qwen36-35b-a3b-q4k-xl core prefill
 median = 1.0 tok/s` vs the April 15 run's `2.1 tok/s`. Both runs are
 tight within themselves (stddev 0.09 and 0.28) because they captured
 three cold-load snapshots at close points in time. The delta between
@@ -71,7 +71,7 @@ above):
 
 ```bash
 bun tools/performance_suite.mjs --target metal --runs 3 --warmup 1 \
-  --models qwen35-35b-a3b-q4k-xl --skip-local-build --no-site-write \
+  --models qwen36-35b-a3b-q4k-xl --skip-local-build --no-site-write \
   --output /tmp/zinc-perf-effort7.json
 ```
 
@@ -81,7 +81,7 @@ Keep rules:
    3 measured runs. (Current observed: 0.09/1.0 = 9 % but with wrong
    median; goal is stability at or above the April 15 range.)
 2. Zinc `core` decode median must not regress vs the April 18 run
-   (≥ 47 tok/s for Qwen3.5-35B).
+   (≥ 47 tok/s for Qwen3.6-35B).
 3. The produced JSON schema must stay identical — site consumers,
    `site/src/data/zinc-performance.json`, and `tools/print_test_summary.ts`
    do not change.
@@ -92,11 +92,11 @@ Supporting measurements (run if a cycle looks unstable):
 
 ```bash
 # Single-model smoke to verify the server path works at all:
-./zig-out/bin/zinc --model-id qwen35-35b-a3b-q4k-xl --port 18840 &
+./zig-out/bin/zinc --model-id qwen36-35b-a3b-q4k-xl --port 18840 &
 sleep 60   # let it finish loading
 curl -sS http://127.0.0.1:18840/v1/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"qwen35-35b-a3b-q4k-xl","prompt":"hi","max_tokens":8}'
+  -d '{"model":"qwen36-35b-a3b-q4k-xl","prompt":"hi","max_tokens":8}'
 ```
 
 ## What The Current Evidence Already Says
@@ -208,7 +208,7 @@ Primary files:
 Tasks:
 
 - Run `bun tools/performance_suite.mjs --target metal --runs 3 --warmup
-  1 --models qwen35-35b-a3b-q4k-xl --skip-local-build --no-site-write
+  1 --models qwen36-35b-a3b-q4k-xl --skip-local-build --no-site-write
   --output /tmp/zinc-perf-effort7.json`.
 - Check that `core.zinc.prefill_tps.stddev / median ≤ 0.10`.
 - Run the same command a second time; check that the two runs' medians
@@ -216,7 +216,7 @@ Tasks:
 
 Done when:
 
-- Both stability checks pass for Qwen3.5-35B. Record the median prefill
+- Both stability checks pass for Qwen3.6-35B. Record the median prefill
   and decode numbers in the effort log.
 
 ### Step 5: Generalise to all six models
@@ -228,7 +228,7 @@ Primary files:
 Tasks:
 
 - Run the full `--target metal --models
-  gemma4-12b-q4k-m,gemma4-31b-q4k-m,gpt-oss-20b-q4k-m,qwen3-8b-q4k-m,qwen35-35b-a3b-q4k-xl,qwen36-35b-a3b-q4k-xl`
+  gemma4-26b-a4b-q4k-m,gemma4-31b-q4k-m,qwen3-8b-q4k-m,qwen36-35b-a3b-q4k-xl,qwen36-35b-a3b-q4k-xl`
   suite.
 - Confirm wall-clock is ≥ 30 minutes shorter than the pre-effort
   baseline (the April 18 run took 3 h 14 min).
@@ -268,7 +268,7 @@ This effort is succeeding when all of these are true:
   per model and runs every scenario from that server.
 - Zinc `core` prefill stddev ≤ 10 % of the median for the primary
   benchmark across two independent suite invocations.
-- Zinc `core` decode on Qwen3.5-35B is ≥ 47 tok/s (no regression vs
+- Zinc `core` decode on Qwen3.6-35B is ≥ 47 tok/s (no regression vs
   the April 18 measurement).
 - Metal suite wall-clock for the six published models drops by ≥ 30
   minutes.
@@ -297,15 +297,15 @@ This effort is succeeding when all of these are true:
 ## Benchmark Focus
 
 - primary metric: zinc `core` prefill tok/s median and stddev on
-  Qwen3.5-35B-A3B-UD-Q4_K_XL
+  Qwen3.6-35B-A3B-UD-Q4_K_XL
 - secondary metric: Metal suite wall-clock for the six published models
 - success is judged on stability and wall-clock, not peak tok/s. This
   is a harness cleanup, not a perf optimisation.
 
 ## Current Checked-Out Code (build on this code)
 
-- zinc `core` prefill on Qwen3.5-35B: April 18 suite median = 1.0 tok/s
+- zinc `core` prefill on Qwen3.6-35B: April 18 suite median = 1.0 tok/s
   (samples `[1.2, 1.0, 1.0]`, stddev 0.09) — unstable measurement, not a
   real throughput number.
-- zinc `core` decode on Qwen3.5-35B: 47.57 tok/s (stable).
+- zinc `core` decode on Qwen3.6-35B: 47.57 tok/s (stable).
 - Metal suite wall-clock for the six published models: ≈ 3 h 14 min.

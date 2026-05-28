@@ -2,7 +2,7 @@
 
 ## Current State (2026-04-09)
 
-Target model: `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` on the RDNA4 node.
+Target model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` on the RDNA4 node.
 
 The current public benchmark artifact in `site/src/data/zinc-performance.json` shows a severe long-context prefill gap on the `context-long` scenario:
 
@@ -140,11 +140,11 @@ Prioritize:
 Acceptance:
 
 - measurable prefill gain on the benchmark prompt
-- no coherence regressions on Qwen, Gemma, or GPT-OSS
+- no coherence regressions on Qwen or Gemma
 
 ### Step 5: Attack the real MoE prefill cost
 
-Qwen 3.5 35B A3B is MoE-heavy. If we batch only non-MoE work, we will still leave a large ceiling in place.
+Qwen 3.6 35B A3B is MoE-heavy. If we batch only non-MoE work, we will still leave a large ceiling in place.
 
 Expected work:
 
@@ -193,7 +193,7 @@ The effort is a success when all of these hold:
 
 - the loop benchmarks prefill correctly
 - the site benchmark and the loop report comparable prefill numbers
-- Qwen3.5-35B `context-long` prefill is materially higher than `73.7 tok/s`
+- Qwen3.6-35B `context-long` prefill is materially higher than `73.7 tok/s`
 - no accepted commit regresses coherence on the supported model set
 - the remaining gap is attributable to a small number of named bottlenecks rather than “prefill is slow”
 

@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 600" role="img" aria-labelledby="title desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial">
+  <title id="title">RDNA4 WMMA throughput by precision and what FP4 weight formats actually use on gfx1201</title>
+  <desc id="desc">A horizontal grouped bar chart for the AMD Radeon AI PRO R9700 (gfx1201, RDNA4). Eight rows, one per quantization or precision format. For each row, a left-side label gives the bytes per stored weight (lower is better for bandwidth), a center horizontal bar shows the dense WMMA matmul throughput on RDNA4 in TFLOPS as published by AMD, and a right-side annotation tells the reader which hardware path is actually taken. The native-WMMA rows for FP16, BF16, FP8 E4M3FN, INT8, and INT4 are filled in green and reach 191, 191, 383, 383, and 766 TFLOPS dense respectively. The K-quant Q4_K_M row, the NVFP4 weight row, and the MXFP4 weight row are filled in red and clipped to 191 TFLOPS effective because gfx1201 has no native FP4 WMMA path and the kernels dequantize the weights to FP16 before the v_wmma instruction. A vertical reference line at 191 TFLOPS marks the dense-FP16 ceiling. A footer notes that the RDNA4 WMMA instruction set lists v_wmma_f32_16x16x16 in fp16, bf16, fp8_e4m3, int8, and iu4 forms but no fp4 form, and that ROCm 7.2.1 silently falls back to FP32 dequantization for FP8 weights on gfx1201 without an AITER patch.</desc>
+
+  <defs>
+    <linearGradient id="bgFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f1729"/>
+      <stop offset="100%" stop-color="#0a1020"/>
+    </linearGradient>
+    <linearGradient id="nativeBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5dbb89"/>
+      <stop offset="100%" stop-color="#3f9b6b"/>
+    </linearGradient>
+    <linearGradient id="fallbackBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e85d75"/>
+      <stop offset="100%" stop-color="#b33950"/>
+    </linearGradient>
+    <linearGradient id="int4Bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5dbb89"/>
+      <stop offset="100%" stop-color="#2d7a4f"/>
+    </linearGradient>
+    <pattern id="hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="#b33950" opacity="0.18"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#e85d75" stroke-width="1" opacity="0.5"/>
+    </pattern>
+  </defs>
+
+  <rect width="940" height="600" fill="url(#bgFade)"/>
+
+  <!-- Header -->
+  <text x="22" y="34" fill="#e8edf5" font-size="19" font-weight="700">RDNA4 WMMA throughput by precision on gfx1201</text>
+  <text x="22" y="54" fill="#8ea0b8" font-size="12.5">Bytes per weight versus dense WMMA TFLOPS on the Radeon AI PRO R9700. Green hits native WMMA. Red dequantizes to FP16 first.</text>
+
+  <!-- Column headers -->
+  <text x="22" y="92" fill="#c8d1e0" font-size="11" font-weight="700" letter-spacing="0.6">FORMAT</text>
+  <text x="140" y="92" fill="#c8d1e0" font-size="11" font-weight="700" letter-spacing="0.6">BYTES / WEIGHT</text>
+  <text x="240" y="92" fill="#c8d1e0" font-size="11" font-weight="700" letter-spacing="0.6">RDNA4 DENSE WMMA (TFLOPS / TOPS)</text>
+  <text x="655" y="92" fill="#c8d1e0" font-size="11" font-weight="700" letter-spacing="0.6">HARDWARE PATH</text>
+
+  <!-- X-axis grid lines (chart area: x=240 to x=640, range 0-800, scale 0.5 px/TFLOP) -->
+  <g stroke="#1d2b48" stroke-width="1">
+    <line x1="240" y1="106" x2="240" y2="498"/>
+    <line x1="340" y1="106" x2="340" y2="498"/>
+    <line x1="440" y1="106" x2="440" y2="498"/>
+    <line x1="540" y1="106" x2="540" y2="498"/>
+    <line x1="640" y1="106" x2="640" y2="498"/>
+  </g>
+
+  <!-- X-axis labels -->
+  <g fill="#5b6b85" font-size="9.5" text-anchor="middle">
+    <text x="240" y="514">0</text>
+    <text x="340" y="514">200</text>
+    <text x="440" y="514">400</text>
+    <text x="540" y="514">600</text>
+    <text x="640" y="514">800</text>
+  </g>
+
+  <!-- Reference line at 191 TFLOPS (dense FP16 ceiling) -->
+  <line x1="336" y1="106" x2="336" y2="498" stroke="#f4a261" stroke-width="1" stroke-dasharray="4,3" opacity="0.7"/>
+  <text x="336" y="100" fill="#f4a261" font-size="9.5" text-anchor="middle">191 · FP16 matrix ceiling</text>
+
+  <!-- ============== ROWS ==============
+       Each row 44 px tall, starting at y=120.
+       Row anatomy:
+         - format label at x=22
+         - bytes/weight at x=140
+         - bar at x=240, width = TFLOPS * 0.5
+         - annotation at x=655
+  -->
+
+  <!-- Row 1: FP16 -->
+  <g transform="translate(0,120)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">FP16</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">native float</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">2.00</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">no metadata</text>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#nativeBar)"/>
+    <text x="340" y="22" fill="#9ddcb6" font-size="11" font-weight="600">191</text>
+    <text x="655" y="20" fill="#c8d1e0" font-size="11">v_wmma_f32_16x16x16_f16</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">native, matrix baseline</text>
+  </g>
+
+  <!-- Row 2: BF16 -->
+  <g transform="translate(0,168)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">BF16</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">native bfloat</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">2.00</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">no metadata</text>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#nativeBar)"/>
+    <text x="340" y="22" fill="#9ddcb6" font-size="11" font-weight="600">191</text>
+    <text x="655" y="20" fill="#c8d1e0" font-size="11">v_wmma_f32_16x16x16_bf16</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">native</text>
+  </g>
+
+  <!-- Row 3: FP8 E4M3FN -->
+  <g transform="translate(0,216)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">FP8 E4M3FN</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">per-channel scale</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">1.05</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">+ 5% scale</text>
+    <rect x="240" y="6" width="192" height="22" rx="3" fill="url(#nativeBar)"/>
+    <text x="436" y="22" fill="#9ddcb6" font-size="11" font-weight="600">383</text>
+    <text x="655" y="20" fill="#c8d1e0" font-size="11">v_wmma_f32_16x16x16_fp8_fp8</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">native, MI350X-shared path</text>
+  </g>
+
+  <!-- Row 4: INT8 -->
+  <g transform="translate(0,264)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">INT8</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">per-block scale</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">1.05</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">+ 5% scale</text>
+    <rect x="240" y="6" width="192" height="22" rx="3" fill="url(#nativeBar)"/>
+    <text x="436" y="22" fill="#9ddcb6" font-size="11" font-weight="600">383</text>
+    <text x="655" y="20" fill="#c8d1e0" font-size="11">v_wmma_i32_16x16x16_iu8</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">native, TOPS</text>
+  </g>
+
+  <!-- Row 5: INT4 (native iu4) -->
+  <g transform="translate(0,312)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">INT4 (iu4)</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">per-block scale</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">0.53</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">+ 5% scale</text>
+    <rect x="240" y="6" width="383" height="22" rx="3" fill="url(#int4Bar)"/>
+    <text x="627" y="22" fill="#9ddcb6" font-size="11" font-weight="600">766</text>
+    <text x="655" y="20" fill="#c8d1e0" font-size="11">v_wmma_i32_16x16x16_iu4</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">native, TOPS, QAT-shaped</text>
+  </g>
+
+  <!-- Row 6: Q4_K_M -->
+  <g transform="translate(0,360)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">Q4_K_M</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">k-quant block</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">0.59</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">4.74 bits/weight</text>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#fallbackBar)"/>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#hatch)"/>
+    <text x="340" y="22" fill="#f7a8b6" font-size="11" font-weight="600">≤ 191</text>
+    <text x="655" y="20" fill="#f7a8b6" font-size="11">dequant → FP16 → wmma_f16</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">no native iu4 fast path in mainline</text>
+  </g>
+
+  <!-- Row 7: NVFP4 -->
+  <g transform="translate(0,408)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">NVFP4</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">E2M1 + FP8 scale</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">0.56</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">block 16, two-level scale</text>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#fallbackBar)"/>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#hatch)"/>
+    <text x="340" y="22" fill="#f7a8b6" font-size="11" font-weight="600">≤ 191</text>
+    <text x="655" y="20" fill="#f7a8b6" font-size="11">no v_wmma_f32_*_fp4 on gfx1201</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">Vulkan path: dequant first</text>
+  </g>
+
+  <!-- Row 8: MXFP4 -->
+  <g transform="translate(0,456)">
+    <text x="22" y="20" fill="#e8edf5" font-size="13" font-weight="600">MXFP4</text>
+    <text x="22" y="34" fill="#5b6b85" font-size="10">E2M1 + E8M0 scale</text>
+    <text x="140" y="20" fill="#c8d1e0" font-size="13" font-weight="600">0.53</text>
+    <text x="140" y="34" fill="#5b6b85" font-size="10">block 32, OCP standard</text>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#fallbackBar)"/>
+    <rect x="240" y="6" width="96" height="22" rx="3" fill="url(#hatch)"/>
+    <text x="340" y="22" fill="#f7a8b6" font-size="11" font-weight="600">≤ 191</text>
+    <text x="655" y="20" fill="#f7a8b6" font-size="11">no MXFP4 WMMA on gfx1201</text>
+    <text x="655" y="34" fill="#5b6b85" font-size="10">awaiting CDNA-class hardware</text>
+  </g>
+
+  <!-- X-axis title -->
+  <text x="440" y="538" fill="#8ea0b8" font-size="11" text-anchor="middle">dense matmul throughput (TFLOPS / TOPS, AMD Radeon AI PRO R9700, gfx1201)</text>
+
+  <!-- Footer -->
+  <text x="22" y="568" fill="#8ea0b8" font-size="11">RDNA4 ISA exposes <tspan fill="#c8d1e0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">v_wmma_f32_16x16x16</tspan> in fp16, bf16, fp8_e4m3, int8, iu4 — no fp4 form. ROCm 7.2.1 still silently dequantizes FP8 to FP32 without an AITER gfx1201 patch.</text>
+  <text x="22" y="586" fill="#8ea0b8" font-size="11">Bandwidth saved by FP4 weights is real on every card. Compute saved is only real where the tensor cores speak FP4. On gfx1201 they do not.</text>
+</svg>

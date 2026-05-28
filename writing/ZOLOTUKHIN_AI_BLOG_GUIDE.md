@@ -58,8 +58,12 @@ Good title patterns:
 - `Why RDNA4 matters for local LLM inference`
 - `How TurboQuant cuts KV cache bandwidth`
 - `What changed in AMD consumer GPU inference this month`
-- `Why Vulkan is the right bet for local AI on AMD`
 - `The bottleneck that still limits local 35B inference`
+- `Vulkan specialization constants unlock RDNA4 dmmv variants`
+- `Attention sinks: the four KV tokens local long context cannot evict`
+- `RDNA4 matrix cores sit out the decode loop`
+
+Vary the opener. Do NOT default to `Why ...` for every post. Across any window of five consecutive posts, no more than two titles should start with `Why`. Before settling on a `Why` title, check the slugs of the previous four or five posts; if two of them already start with `Why`, rewrite this one. Strong alternatives include declarative statements (`RDNA4 matrix cores sit out the decode loop`), `How ...`, `What ...`, `The <noun> that ...`, a colon-anchored framing (`Attention sinks: the four KV tokens local long context cannot evict`), or simply leading with the concrete subject (`Vulkan specialization constants unlock RDNA4 dmmv variants`).
 
 Avoid titles like:
 

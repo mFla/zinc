@@ -18,12 +18,12 @@
   <a href="https://zolotukhin.ai/zinc">
     <img src="https://img.shields.io/badge/web-zolotukhin.ai%2Fzinc-8B5CF6" alt="Website">
   </a>
-  <a href="https://discord.gg/tNDEgTG5s">
+  <a href="https://discord.gg/QRUgWH2aGV">
     <img src="https://img.shields.io/badge/Discord-Join%20ZINC-5865F2?logo=discord&logoColor=white" alt="ZINC Discord">
   </a>
 </p>
 
-> Local LLM inference on AMD GPUs and Apple Silicon — no ROCm, no MLX, one binary.
+> Local LLM inference on consumer GPUs and Apple Silicon — no ROCm, no MLX, one binary.
 
 <p align="center">
   <img src="assets/zinc-chat-demo.gif" alt="ZINC Chat Demo — streaming inference on AMD RDNA4" width="720">
@@ -37,6 +37,7 @@
 |----------|-----|---------|--------|
 | **Linux** | AMD RDNA4 (RX 9070, AI PRO R9700) | Vulkan | Primary — hand-tuned shaders |
 | **Linux** | AMD RDNA3 (RX 7900 XTX, etc.) | Vulkan | Supported |
+| **Linux** | Intel Arc Xe2 / Battlemage | Vulkan | Experimental bring-up |
 | **macOS** | Apple Silicon (M1, M2, M3, M4, M5) | Metal | Supported — native MSL shaders |
 
 ## Start Here
@@ -107,12 +108,11 @@ ZINC builds an inference engine tuned for the hardware you actually have.
 
 The list below matches the current managed model catalog, not a broader wishlist.
 
-- [Qwen3.5 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
-- [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
-- [OpenAI GPT-OSS 20B Q4_K_M](https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF) — supported on Apple Silicon
+- [Qwen3.6 35B-A3B UD Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
+- [Qwen3.6 27B Dense Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
 - [Qwen3 8B Q4_K_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 - [Gemma 4 31B Q4_K_M](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
-- [Gemma 4 12B (26B-A4B MoE) Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — experimental on AMD RDNA4 32 GB and Apple Silicon
+- [Gemma 4 26B-A4B MoE Q4_K_M](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF) — supported on AMD RDNA4 32 GB and Apple Silicon
 
 - Use `zinc model list --json` for machine-readable model metadata
 - Current throughput and latency numbers live on the public benchmarks page: [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks)
@@ -163,7 +163,7 @@ export RADV_PERFTEST=coop_matrix
 ./zig-out/bin/zinc --check -m /path/to/model.gguf
 
 # Check one managed catalog model by id
-./zig-out/bin/zinc --check --model-id qwen35-35b-a3b-q4k-xl
+./zig-out/bin/zinc --check --model-id qwen36-35b-a3b-q4k-xl
 ```
 
 `--check` verifies:
@@ -235,11 +235,36 @@ See also: [CONTRIBUTING.md](./CONTRIBUTING.md) · [Code of Conduct](./CODE_OF_CO
 
 ## Benchmarks
 
-Current throughput and latency numbers live on the public benchmarks page:
+The tables below are pulled directly from the latest published artifact at [zolotukhin.ai/zinc/benchmarks](https://zolotukhin.ai/zinc/benchmarks). Latest refresh: 2026-05-10 (both targets). Numbers are median tok/s across the suite's runs on a fresh boot, ZINC and llama.cpp on the same hardware, weights, and prompt.
 
-- [ZINC Benchmarks](https://zolotukhin.ai/zinc/benchmarks)
+### AMD RDNA4 — Radeon AI PRO R9700 (Vulkan)
 
-For the local benchmark commands, harnesses, and methodology, use the development docs:
+| Model | ZINC prefill | llama.cpp prefill | ZINC % | ZINC decode | llama.cpp decode | ZINC % |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen 3 8B (dense) | **114.64** | 84.01 | **136%** | 59.72 | 108.86 | 55% |
+| Qwen 3.6 35B A3B (MoE+SSM) | 88.08 | 181.95 | 48% | **117.07** | 104.47 | **112%** |
+| Gemma 4 26B A4B (MoE) | 56.21 | 331.65 | 17% | 103.24 | 106.28 | 97% |
+| Gemma 4 31B (dense) | 44.40 | 139.14 | 32% | **44.52** | 32.23 | **138%** |
+
+Qwen 3.6 27B dense is now available in the managed catalog as an experimental target. A single-run RDNA4 ZINC-only validation measured 20.27 tok/s prefill and 22.57 tok/s decode; it is omitted from the comparison table until a same-machine llama.cpp baseline is published.
+
+### Apple Silicon M4 Max (Metal)
+
+| Model | ZINC prefill | llama.cpp prefill | ZINC decode | llama.cpp decode | ZINC % decode |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.6 35B A3B (MoE+SSM) | 25.2 | 130.32 | 38.13 | 79.88 | 48% |
+| Gemma 4 26B A4B (MoE) | 27.4 | 279.51 | 43.68 | 92.17 | 47% |
+| Qwen 3 8B (dense) | 24.7 | 74.67 | 32.74 | 83.67 | 39% |
+| Gemma 4 31B (dense) | 19.5 | 73.28 | 5.16 | 25.14 | 21% |
+
+### Where we stand vs llama.cpp
+
+- **Ahead of llama.cpp**: Qwen 3 8B prefill on RDNA4 (1.36x), Qwen 3.6 35B-A3B decode on RDNA4 (1.12x), Gemma 4 31B dense decode on RDNA4 (1.38x).
+- **Within striking distance (>=90% of llama.cpp)**: Gemma 4 26B A4B decode on RDNA4 (97%).
+- **Active gap**: Qwen 3.6 35B-A3B prefill on RDNA4 sits at ~48% of llama.cpp because the entire batched prefill path is gated off for any model with `n_experts > 0` or `ssm_d_inner > 0`. The wire-up that closes this is documented in the [cycle-50 field report](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
+- **In flight**: Metal prefill is uniformly bottlenecked (20-30 tok/s) because the per-token Metal path doesn't amortize weight reads across prompt tokens. The Gemma 4 31B decode floor at 5.16 tok/s is the active optimization target.
+
+For local benchmark commands, harnesses, and methodology, see:
 
 - [Development Guide](./docs/DEVELOPMENT.md)
 - [Running ZINC](./docs/RUNNING_ZINC.md)
@@ -254,9 +279,10 @@ For the local benchmark commands, harnesses, and methodology, use the developmen
 | Native BPE tokenizer (from GGUF) | Done |
 | GLSL compute shaders (16) | Done |
 | Compute graph + architecture builders | Done |
-| Forward pass (decode loop) | Working — 37.95 tok/s on RDNA4 and 35.61 tok/s on Apple M4 Max for Qwen3.5-35B-A3B-UD |
-| GPU SSM shaders + cmd batching | Done — Metal and Vulkan decode paths are both above 35 tok/s on the validated 35B boxes |
-| HTTP server + OpenAI API | Done — 35B raw API ~33.5 tok/s on RDNA4 and ~34.7 tok/s on Apple M4 Max; reasoning chat still slower |
+| Forward pass (decode loop) | Working — 117.07 tok/s on RDNA4 and 38.13 tok/s on Apple M4 Max for Qwen 3.6 35B-A3B |
+| Forward pass (prefill loop) | Working — 88.08 tok/s on RDNA4 short-context for Qwen 3.6 35B-A3B; Metal prefill in flight |
+| GPU SSM shaders + cmd batching | Done — RDNA decode is 117.07 tok/s on Qwen 3.6 35B |
+| HTTP server + OpenAI API | Done — Qwen 35B-A3B raw API ~100 tok/s on RDNA4 and Metal server path in progress |
 | Continuous batching | Phase 4 |
 | TurboQuant KV compression | Phase 5 |
 
@@ -264,13 +290,15 @@ Validated on AMD Radeon AI PRO R9700 (RDNA4): Vulkan 1.3 init, GGUF parsing, 21 
 
 ## Next Steps
 
-The next push is from "raw decode above 30" to "reasoning workloads above 30 and better aggregate GPU utilization":
+The next push is closing the prefill gap to llama.cpp on hybrid MoE-plus-SSM models:
 
-1. **Close the chat/reasoning gap** — benchmark longer chat prompts, template overhead, stop behavior, and TTFT so `/v1/chat/completions` tracks closer to the raw decode path.
-2. **Make profiling representative** — `--profile` is still too intrusive in `ReleaseFast`, so it is not yet the right leaderboard tool for apples-to-apples throughput claims.
-3. **Reduce hot-path descriptor churn** — reuse bindings and trim per-token Vulkan setup in the decode loop.
-4. **Tune the actual hot shapes** — focus on medium/small decode kernels, not just the vocab projection.
-5. **Increase aggregate throughput with batching** — if the goal is to drive bandwidth utilization much higher, concurrency is the right lever.
+1. **Wire `mul_mm_q4k` into SSM proj prefill** — the tiled Q4_K GEMM is in the tree but only routes the language-model head where N=1 wastes the BN tile. The SSM proj fires 4 DMMVs per layer per token; batching them across the prompt is the deferred cycle-40 refactor.
+2. **Port the `gated_delta_net.cu` block-resident state pattern** — today every prompt token re-reads and re-writes the full 2 MB SSM state per layer. Loading state once per workgroup and walking all tokens inside the kernel collapses 18 GB of state DRAM traffic per prefill to 4 MB.
+3. **Open `canUseBatchedPrefillRdna` for MoE+SSM hybrids** — the entire batched prefill body (`flash_attn_batched`, `rope_batched`, `dmmv_q4k_batch_kpar`) is gated off when `n_experts > 0` or `ssm_d_inner > 0`. Once items 1 and 2 land, dropping the gate activates Br-row attention batching on the same workload.
+4. **Land the cycle-50 micro-restructure pattern on MoE inner loops** — wider threads-per-row plus halved per-thread register slabs lifted ssm_delta_net by 2.7%. The same shape change is untried on `dmmv_q4k_moe_kpar` and `dmmv_q4k_moe_fused_down_acc`.
+5. **Ship batched Metal prefill across the catalog** — the Gemma path landed; Qwen 3.5/3.6 still route through the per-token Metal path that produces the 0.2–10 tok/s prefill numbers above.
+
+The full plan and 50-cycle field report is in the [cycle-50 blog post](https://zolotukhin.ai/blog/2026-04-26-the-gate-that-keeps-qwen-35b-prefill-at-half-of-llama-cpp-on-rdna4).
 
 ## License
 

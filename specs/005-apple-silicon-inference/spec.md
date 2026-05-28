@@ -4,7 +4,7 @@
 **Created**: 2026-03-28
 **Status**: Draft
 **Hardware**: Mac Studio M4 Max, 64 GB, 546 GB/s, 40-core GPU
-**Model**: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf (20.7 GB, MoE 35B/3B active)
+**Model**: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf (20.7 GB, MoE 35B/3B active)
 
 ## Problem Statement
 
@@ -16,7 +16,7 @@ ZINC currently only runs inference on Linux with Vulkan (RDNA4). Apple Silicon h
 
 ## Competitive Analysis
 
-| Engine | Architecture | Single-req tok/s (M4 Max, Qwen3.5-35B-A3B Q4) | Parallel support |
+| Engine | Architecture | Single-req tok/s (M4 Max, Qwen3.6-35B-A3B Q4) | Parallel support |
 |--------|-------------|-----------------------------------------------|------------------|
 | llama.cpp Metal | C → ggml → Metal | ~35 | No batching |
 | mlx-lm | Python → MLX → Metal | ~65 | No (sequential) |
@@ -39,7 +39,7 @@ ZINC currently only runs inference on Linux with Vulkan (RDNA4). Apple Silicon h
 A user runs ZINC on their Mac with a large MoE model and gets fast, responsive text generation — faster than any other local engine.
 
 **Acceptance Criteria**:
-1. **Given** ZINC loaded with Qwen3.5-35B-A3B Q4_K_XL on M4 Max 64 GB, **When** generating 256 tokens, **Then** decode throughput is ≥80 tok/s
+1. **Given** ZINC loaded with Qwen3.6-35B-A3B Q4_K_XL on M4 Max 64 GB, **When** generating 256 tokens, **Then** decode throughput is ≥80 tok/s
 2. **Given** the same setup, **When** generating text, **Then** output is identical to the Vulkan backend (bitwise-identical logits not required, but same greedy-sampled tokens)
 3. **Given** the same setup, **Then** model loads in <2 seconds (mmap, zero-copy)
 
@@ -58,7 +58,7 @@ A developer runs ZINC as a local API server and sends multiple concurrent reques
 The same GGUF model file works on both the RDNA4 Linux node (Vulkan) and the Mac Studio (Metal) with no conversion or re-quantization.
 
 **Acceptance Criteria**:
-1. **Given** `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`, **When** loaded on Metal, **Then** all tensors parse correctly and dequantize to the same values as the Vulkan path
+1. **Given** `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, **When** loaded on Metal, **Then** all tensors parse correctly and dequantize to the same values as the Vulkan path
 
 ## Architecture Overview
 

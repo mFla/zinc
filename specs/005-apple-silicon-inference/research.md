@@ -5,7 +5,7 @@
 
 ## 1. Competitive Landscape
 
-### Current Best Performance (M4 Max, Qwen3.5-35B-A3B, 4-bit)
+### Current Best Performance (M4 Max, Qwen3.6-35B-A3B, 4-bit)
 
 | Engine | Single-request tok/s | Parallel (5 req) | Architecture |
 |--------|---------------------|-------------------|--------------|
@@ -60,7 +60,7 @@ Token generation is **memory-bandwidth bound** at batch size 1. Each token requi
 theoretical_tok/s = bandwidth / active_model_bytes
 ```
 
-For Qwen3.5-35B-A3B (MoE: 35B total, ~3B active per token):
+For Qwen3.6-35B-A3B (MoE: 35B total, ~3B active per token):
 - Active params at Q4: ~1.5 GB reads per token
 - M4 Max (546 GB/s): **theoretical ~364 tok/s** for active params only
 - But router weights, embeddings, norms, KV cache reads add overhead
@@ -262,15 +262,14 @@ Request queue → Scheduler (assigns KV pages)
 
 ---
 
-## 9. Model Availability (Qwen3.5-35B-A3B)
+## 9. Model Availability (Qwen3.6-35B-A3B)
 
 ### GGUF (reuse existing file)
-- `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf` — **20.7 GB**, fits in 64 GB with ~40 GB headroom
+- `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` — **20.7 GB**, fits in 64 GB with ~40 GB headroom
 - Same file works on Vulkan (RDNA4) and Metal (Apple Silicon)
 
 ### MLX (for baseline comparison)
-- `mlx-community/Qwen3.5-35B-A3B-4bit` — 19.0 GB, 51K downloads (most popular)
-- `mlx-community/Qwen3.5-35B-A3B-8bit` — 35.2 GB, fits in 64 GB
+- Use the closest available Qwen3.6 35B-A3B MLX 4-bit or 8-bit export when one is published.
 
 ### Baseline Test Commands
 
@@ -278,9 +277,9 @@ Request queue → Scheduler (assigns KV pages)
 # Install mlx-lm
 pip install -U mlx-lm
 
-# MLX baseline (4-bit)
+# MLX baseline (4-bit, set to the available Qwen3.6 35B-A3B export)
 mlx_lm.generate \
-  --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --model "$MLX_QWEN36_35B_MODEL" \
   --prompt "The capital of France is" \
   --max-tokens 256 --verbose
 
@@ -291,12 +290,12 @@ cd llama.cpp && cmake -B build && cmake --build build --config Release -j16
 
 # Run with the GGUF you already have
 ./build/bin/llama-bench \
-  -m /path/to/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -p 512 -n 128
 
 # Interactive
 ./build/bin/llama-cli \
-  -m /path/to/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
+  -m /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   -ngl 99 -c 4096 --conversation
 ```
 
@@ -314,7 +313,6 @@ cd llama.cpp && cmake -B build && cmake --build build --config Release -j16
 - [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) — SPIR-V to MSL
 - [Apple GPU Microarchitecture](https://github.com/philipturner/metal-benchmarks)
 - [llama.cpp ggml-metal.m](https://github.com/ggml-org/llama.cpp) — ObjC shim pattern
-- [Qwen3.5-35B-A3B GGUF (unsloth)](https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF)
-- [Qwen3.5-35B-A3B MLX (mlx-community)](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit)
+- [Qwen3.6-35B-A3B GGUF (unsloth)](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
 - [Exo distributed inference](https://github.com/exo-explore/exo)
 - [Multi-node expert parallelism (arXiv 2506.23635)](https://arxiv.org/html/2506.23635v1)

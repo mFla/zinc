@@ -31,6 +31,6 @@
 
 ## Notes
 
-- Spec references specific GPU hardware (AI PRO R9700) and model (Qwen3.5-35B-A3B) in success criteria and assumptions. This is appropriate because performance targets are inherently hardware-specific — the spec defines WHAT performance level to achieve on WHAT hardware, not HOW to achieve it.
+- Spec references specific GPU hardware (AI PRO R9700) and model (Qwen3.6-35B-A3B) in success criteria and assumptions. This is appropriate because performance targets are inherently hardware-specific — the spec defines WHAT performance level to achieve on WHAT hardware, not HOW to achieve it.
 - FR-001 through FR-005 mention "GPU compute shader" which borders on implementation detail, but is necessary context since the entire feature is about moving computation between processing units. The spec describes the boundary (CPU→GPU) not the implementation (specific shader code, Vulkan API calls, buffer layouts).
 - All items pass validation. Spec is ready for `/speckit.plan`.

@@ -1,12 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bestKeptCorrectTokPerSec,
   buildPrompt,
+  buildQwen36PrefillPlateauAnalysis,
+  buildQwen36PrefillPostBreakthroughAnalysis,
   buildReflectionSummary,
   buildSelfReview,
+  currentAcceptedTokPerSec,
   decideKeep,
   detectPhase,
   evaluateOutputText,
+  keepBaselinesForCycle,
   mergeUniqueEntries,
+  parseTokPerSec,
+  recentAcceptedProgress,
+  shouldRejectQwen36PlateauNeutralKeep,
   snapshotFromResult,
 } from "./implement_metal";
 import type { BuildRunResult, ControllerState, CycleResult, RunState } from "./implement_metal";
@@ -48,6 +56,7 @@ function makeCycle(overrides: Partial<CycleResult> = {}): CycleResult {
     testExitCode: 0,
     runExitCode: 0,
     outputText: "ĠParis.ĠTheĠcapitalĠof",
+    stepKind: "optimization",
     selfAnalysis: "",
     nextIdeas: [],
     ...overrides,
@@ -100,6 +109,31 @@ describe("evaluateOutputText", () => {
     const result = evaluateOutputText("Paris is the capital");
     expect(result.containsReference).toBe(true);
     expect(result.strongAnswer).toBe(true);
+  });
+});
+
+// ── parseTokPerSec ──────────────────────────────────────────────────
+
+describe("parseTokPerSec", () => {
+  test("prefers generated throughput in decode mode", () => {
+    const output = [
+      "info(forward_metal): Prefill: 122 tokens in 610.0 ms (200.0 tok/s)",
+      "info(forward_metal): Generated 64 tokens in 1280.0 ms - 50.0 tok/s",
+    ].join("\n");
+    expect(parseTokPerSec(output, "decode")).toBe(50);
+  });
+
+  test("parses prefill throughput in prefill mode", () => {
+    const output = [
+      "info(forward_metal): Prefill: 122 tokens in 610.0 ms (200.0 tok/s)",
+      "info(forward_metal): Generated 64 tokens in 1280.0 ms - 50.0 tok/s",
+    ].join("\n");
+    expect(parseTokPerSec(output, "prefill")).toBe(200);
+  });
+
+  test("computes prefill throughput when rate is not printed", () => {
+    const output = "info(forward): Prefill complete: 50 tokens in 250 ms";
+    expect(parseTokPerSec(output, "prefill")).toBe(200);
   });
 });
 
@@ -292,6 +326,71 @@ describe("mergeUniqueEntries", () => {
   });
 });
 
+// ── keep baselines ──────────────────────────────────────────────────
+
+describe("keep baseline helpers", () => {
+  test("recovers stale bestTokPerSec from kept correct cycle history", () => {
+    const state = makeState({
+      bestTokPerSec: 43.4,
+      currentBest: { tokPerSec: 43.2, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 100, kept: true, containsReference: true, tokPerSec: 43.8 }),
+        makeCycle({ cycle: 104, kept: true, containsReference: true, tokPerSec: 44.0 }),
+        makeCycle({ cycle: 106, kept: true, containsReference: true, tokPerSec: 43.2 }),
+      ],
+    });
+    expect(bestKeptCorrectTokPerSec(state)).toBe(44.0);
+  });
+
+  test("anchors neutral keeps to this cycle's measured accepted baseline", () => {
+    const state = makeState({
+      bestTokPerSec: 43.4,
+      currentBest: { tokPerSec: 43.2, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 104, kept: true, containsReference: true, tokPerSec: 44.0 }),
+        makeCycle({ cycle: 107, kept: true, containsReference: true, tokPerSec: 43.2 }),
+      ],
+    });
+    const baselines = keepBaselinesForCycle(
+      state,
+      makeResult({ containsReference: true, strongAnswer: true, tokPerSec: 44.0 }),
+    );
+    expect(baselines.bestTokPerSec).toBe(44.0);
+    expect(baselines.acceptedTokPerSec).toBe(44.0);
+  });
+
+  test("falls back to latest kept correct cycle for current accepted baseline", () => {
+    const state = makeState({
+      bestTokPerSec: 43.8,
+      currentBest: null,
+      cycles: [
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    expect(currentAcceptedTokPerSec(state)).toBe(45.1);
+  });
+
+  test("detects small recent accepted progress separately from a stall", () => {
+    const state = makeState({
+      bestTokPerSec: 44.8,
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 115, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({ cycle: 116 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 124, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const progress = recentAcceptedProgress(state);
+    expect(progress.hasProgress).toBe(true);
+    expect(progress.start).toBe(44.8);
+    expect(progress.end).toBe(45.1);
+  });
+});
+
 // ── buildReflectionSummary ──────────────────────────────────────────
 
 describe("buildReflectionSummary", () => {
@@ -388,12 +487,45 @@ describe("buildSelfReview", () => {
       cycle: i + 1,
       description: "Try random tweak",
       kept: i % 3 === 0,
-      tokPerSec: 36 + (i % 3 === 0 ? 0.1 : -0.2),
+      tokPerSec: 36 + (i % 3 === 0 ? 0.02 : -0.2),
     }));
     const state = makeState({ cycles });
     const review = buildSelfReview(state);
     expect(review).toContain("Low progress");
     expect(review).toContain("strategic pivot");
+  });
+
+  test("labels sub-1 tok/s accepted movement as small progress", () => {
+    const state = makeState({
+      cycles: [
+        makeCycle({ cycle: 1, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 8 }, (_, idx) =>
+          makeCycle({ cycle: 2 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 10, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const review = buildSelfReview(state);
+    expect(review).toContain("Small accepted progress");
+    expect(review).not.toContain("Low progress");
+  });
+
+  test("does not count reverted-cycle movement as accepted progress", () => {
+    const cycles = Array.from({ length: 10 }, (_, i) => makeCycle({
+      cycle: i + 1,
+      description: "Retune Q8 threadgroup",
+      kept: false,
+      tokPerSec: 34 + i * 0.4,
+    }));
+    const state = makeState({
+      cycles,
+      bestTokPerSec: 37.8,
+      currentBest: { tokPerSec: 37.8, containsReference: true },
+    });
+    const review = buildSelfReview(state);
+    expect(review).toContain("No accepted progress");
+    expect(review).toContain("Do NOT treat faster reverted candidates as progress");
+    expect(review).not.toContain("Progress is positive");
   });
 
   test("shows top performing changes", () => {
@@ -492,6 +624,230 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("ggml-metal");
   });
 
+  test("suppresses hard stall warning when accepted baseline moved recently", () => {
+    const state = makeState({
+      stalledCycles: 12,
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      cycles: [
+        makeCycle({ cycle: 115, kept: true, containsReference: true, tokPerSec: 44.8 }),
+        ...Array.from({ length: 9 }, (_, idx) =>
+          makeCycle({ cycle: 116 + idx, kept: true, containsReference: true, tokPerSec: 44.7 }),
+        ),
+        makeCycle({ cycle: 125, kept: true, containsReference: true, tokPerSec: 45.1 }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 45.0,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Limited Progress");
+    expect(prompt).toContain("44.80 → 45.10");
+    expect(prompt).not.toContain("STUDY THE REFERENCES");
+  });
+
+  test("Qwen effort prompt tells the next cycle to use route-pack density evidence", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 45.1, containsReference: true },
+      lastProfileOutput: "Metal profile: Qwen route-pack candidate blocks prompt_tokens=134 route_slots=1072 active_block_upper=358 dense_dispatch_blocks=8704 upper/dense=4.1%",
+      cycles: [
+        makeCycle({
+          cycle: 125,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 45.1,
+          description: "Added Qwen route-pack active-block-density profile counters and candidate blocker logging.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 45.0,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("route-pack candidate blocks");
+    expect(prompt).toContain("do not add another passive counter");
+    expect(prompt).toContain("consume that evidence");
+  });
+
+  test("Qwen effort prompt puts repeated route-pack reverts on cooldown", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 45.8, containsReference: true },
+      cycles: [
+        makeCycle({
+          cycle: 127,
+          kept: false,
+          containsReference: false,
+          tokPerSec: 45.6,
+          description: "Default layer-0 Qwen route-packed prefill materialized the F32 shared-gate scalar.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 128,
+          kept: false,
+          containsReference: true,
+          tokPerSec: 44.7,
+          description: "Added active-block materialized F32 shared-gate route-pack validation.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 44.8,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("ROUTE-PACK COOLDOWN");
+    expect(prompt).toContain("do not edit route-pack/shared-gate validators");
+    expect(prompt).toContain("must not run local Metal model commands");
+  });
+
+  test("Qwen effort prompt adds plateau analysis after many neutral keeps", () => {
+    const cycles = Array.from({ length: 32 }, (_, idx) => makeCycle({
+      cycle: 194 + idx,
+      kept: true,
+      containsReference: true,
+      tokPerSec: idx === 5 ? 51.6 : 51.1,
+      description: idx % 2 === 0
+        ? "Retuned fixed-K TG128 repacked Q8 SSM projection kernel"
+        : "Adjusted Qwen SSM delta threadgroup arithmetic",
+    }));
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 51.6,
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+      cycles,
+    });
+    const result = makeResult({
+      tokPerSec: 51.1,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Qwen3.6 35B Prefill Plateau Analysis");
+    expect(prompt).toContain("PLATEAU MODE");
+    expect(prompt).toContain("Neutral keeps are dominating");
+    expect(prompt).toContain("@@@STEP_KIND:");
+  });
+
+  test("plateau analysis can be generated directly from cycle history", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 51.6,
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+      cycles: Array.from({ length: 32 }, (_, idx) => makeCycle({
+        cycle: idx + 1,
+        kept: true,
+        containsReference: true,
+        tokPerSec: 51.1,
+        description: "Fixed-K TG128 repacked Q8 SSM cleanup",
+      })),
+    });
+    const analysis = buildQwen36PrefillPlateauAnalysis(state).join("\n");
+    expect(analysis).toContain("PLATEAU MODE");
+    expect(analysis).toContain("Cooldown");
+    expect(analysis).toContain("Required pivot");
+  });
+
+  test("Qwen post-breakthrough focus pivots from router to profile-dominant SSM", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 69.9,
+      currentBest: { tokPerSec: 69.9, containsReference: true },
+      lastProfileCycle: 231,
+      lastProfileOutput: [
+        "info(forward):   barriers/step: embed 1.0 attn 75.1 ssm 116.1 router 77.1 gpu-moe 118.7 fallback-moe 0.0 dense 0.0 final 0.0",
+        "info(forward):   path bytes: ssm 132.98 GiB attn 33.38 GiB dense 0.00 GiB moe-expert 75.84 GiB shared 16.52 GiB lm-head 1.51 GiB router 10.37 GiB",
+        "info(forward):   prefill buckets: ssm proj 98.69 GiB recurrent conv/delta/gated 3887/3887/3887 out 32.27 GiB | router 10.21 GiB topk 5227 cpu 0.00 ms",
+      ].join("\n"),
+      cycles: [
+        makeCycle({
+          cycle: 231,
+          kept: true,
+          containsReference: true,
+          tokPerSec: 69.9,
+          description: "Routed Qwen3.6 prompt F32 routers through fused router_f32_topk_batched with input-offset support.",
+        }),
+      ],
+    });
+
+    const analysis = buildQwen36PrefillPostBreakthroughAnalysis(state).join("\n");
+    expect(analysis).toContain("Post-60 Prefill Jump Focus");
+    expect(analysis).toContain("cycle 231");
+    expect(analysis).toContain("ssm=132.98 GiB");
+    expect(analysis).toContain("After the fused F32 router/top-k win, SSM is larger than router");
+    expect(analysis).toContain("gpu-moe=118.70/step");
+  });
+
+  test("Qwen plateau mode rejects neutral optimization churn but allows analysis", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      currentBest: { tokPerSec: 51.1, containsReference: true },
+      stalledCycles: 32,
+    });
+
+    expect(shouldRejectQwen36PlateauNeutralKeep({
+      state,
+      stepKind: "optimization",
+      description: "Retune fixed-K Q8 math",
+      selfAnalysis: "Expected tiny speedup.",
+      verifyTokPerSec: 51.1,
+      acceptedTokPerSec: 51.1,
+      currentProgressBand: 0.15,
+    })).toBe(true);
+
+    expect(shouldRejectQwen36PlateauNeutralKeep({
+      state,
+      stepKind: "analysis",
+      description: "Add profile counter for route-pack validator",
+      selfAnalysis: "Unlocks layer-specific correctness diff.",
+      verifyTokPerSec: 51.1,
+      acceptedTokPerSec: 51.1,
+      currentProgressBand: 0.15,
+    })).toBe(false);
+  });
+
+  test("Gemma effort prompt uses Gemma model facts instead of Qwen facts", () => {
+    const state = makeState({ effortId: 11 });
+    const result = makeResult({
+      tokPerSec: 37.8,
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "The capital of France is Paris.",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Model (Gemma 4 26B-A4B MoE Q4_K_M)");
+    expect(prompt).toContain("hidden_dim=2816");
+  });
+
   test("includes pre-stall warning at 3 cycles", () => {
     const state = makeState({ stalledCycles: 3 });
     const result = makeResult({
@@ -553,6 +909,61 @@ describe("buildPrompt", () => {
     expect(prompt).toContain("shader: 3/5 kept");
   });
 
+  test("Effort 16 prompt includes Qwen prefill target focus and fast-wrong traps", () => {
+    const state = makeState({
+      effortId: 16,
+      effortFile: "MULTI_HOUR_EFFORT_16_METAL_QWEN36_35B_PREFILL_M4.md",
+      effortPlan: "# Effort 16\nQwen 3.6 35B-A3B prefill",
+      bestTokPerSec: 43.8,
+      stalledCycles: 11,
+      cycles: [
+        makeCycle({
+          cycle: 89,
+          kept: true,
+          tokPerSec: 43.4,
+          description: "Adapted vLLM topk_weight_and_reduce with a token-major Qwen F32 shared-gate MoE combine kernel.",
+        }),
+        makeCycle({
+          cycle: 95,
+          kept: false,
+          tokPerSec: 43.5,
+          containsReference: false,
+          description: "Adapted a dual Q8 SSM attn_qkv+attn_gate path.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 96,
+          kept: false,
+          tokPerSec: 44.5,
+          containsReference: false,
+          description: "Enabled Qwen layer-0 F32 shared-gate route-packed prefill.",
+          outputText: "!!!!!!!!!!!!!!!!",
+        }),
+        makeCycle({
+          cycle: 100,
+          kept: true,
+          tokPerSec: 43.8,
+          description: "Adapted early graph submission by committing a 16-token leading prompt chunk.",
+        }),
+      ],
+    });
+    const result = makeResult({
+      tokPerSec: 43.8,
+      tokPerSecSamples: [43.7, 43.8, 43.9],
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "Paris",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Qwen3.6 35B Prefill Target Focus");
+    expect(prompt).toContain("50.0 prefill tok/s");
+    expect(prompt).toContain("token-major Qwen F32 shared-gate");
+    expect(prompt).toContain("ZINC_QWEN36_LAYER0_ROUTE_PACK_PREFILL=1");
+    expect(prompt).toContain("full active-prompt validation");
+    expect(prompt).toContain("dual-Q8 SSM");
+  });
+
   test("correctness regression prompt tells agent to restore output", () => {
     const state = makeState({
       currentBest: { tokPerSec: 36, containsReference: true },
@@ -595,5 +1006,20 @@ describe("buildPrompt", () => {
     const prompt = buildPrompt(state, result);
     expect(prompt).toContain("35.5");
     expect(prompt).toContain("36.5");
+  });
+
+  test("warns when benchmark samples are too noisy for direction", () => {
+    const state = makeState();
+    const result = makeResult({
+      tokPerSec: 30.2,
+      tokPerSecSamples: [37.6, 25.4, 30.2],
+      containsReference: true,
+      strongAnswer: true,
+      outputQualityScore: 4,
+      outputText: "The capital of France is Paris.",
+    });
+    const prompt = buildPrompt(state, result);
+    expect(prompt).toContain("Benchmark variance warning");
+    expect(prompt).toContain("too wide for reliable direction");
   });
 });
